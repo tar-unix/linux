@@ -36,6 +36,8 @@ struct gmem_inode {
 	struct list_head gmem_file_list;
 
 	u64 flags;
+	/* Protected by the mapping's invalidate_lock, see kvm_gmem_freeze(). */
+	bool frozen;
 	/*
 	 * Every index in this inode, whether memory is populated or
 	 * not, is tracked in attributes. The entire range of indices,
@@ -99,6 +101,11 @@ static bool kvm_gmem_is_shared_mem(struct inode *inode, pgoff_t index)
 	return !kvm_gmem_is_private_mem(inode, index);
 }
 
+static bool kvm_gmem_is_frozen(struct inode *inode)
+{
+	return IS_ENABLED(CONFIG_LIVEUPDATE) && GMEM_I(inode)->frozen;
+}
+
 static bool kvm_gmem_range_has_attributes(struct inode *inode,
 					  pgoff_t index, size_t nr_pages,
 					  u64 attributes)
@@ -132,6 +139,8 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 	struct mempolicy *policy;
 	struct folio *folio;
 
+	lockdep_assert_held(&inode->i_mapping->invalidate_lock);
+
 	/*
 	 * Fast-path: See if folio is already present in mapping to avoid
 	 * policy_lookup.
@@ -139,6 +148,9 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 	folio = filemap_lock_folio(inode->i_mapping, index);
 	if (!IS_ERR(folio))
 		return folio;
+
+	if (kvm_gmem_is_frozen(inode))
+		return ERR_PTR(-EPERM);
 
 	policy = mpol_shared_policy_lookup(&GMEM_I(inode)->policy, index);
 	folio = __filemap_get_folio_mpol(inode->i_mapping, index,
@@ -246,6 +258,7 @@ static long kvm_gmem_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	enum kvm_gfn_range_filter filter = kvm_gmem_get_all_gfns_filter(inode);
 	pgoff_t start = offset >> PAGE_SHIFT;
 	pgoff_t end = (offset + len) >> PAGE_SHIFT;
+	long ret = 0;
 
 	/*
 	 * Bindings must be stable across invalidation to ensure the start+end
@@ -253,15 +266,21 @@ static long kvm_gmem_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	 */
 	filemap_invalidate_lock(inode->i_mapping);
 
+	if (kvm_gmem_is_frozen(inode)) {
+		ret = -EPERM;
+		goto out;
+	}
+
 	kvm_gmem_invalidate_start(inode, start, end, filter);
 
 	truncate_inode_pages_range(inode->i_mapping, offset, offset + len - 1);
 
 	kvm_gmem_invalidate_end(inode, start, end);
 
+out:
 	filemap_invalidate_unlock(inode->i_mapping);
 
-	return 0;
+	return ret;
 }
 
 static long kvm_gmem_allocate(struct inode *inode, loff_t offset, loff_t len)
@@ -699,6 +718,12 @@ static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
 
 	filemap_invalidate_lock(mapping);
 
+	if (kvm_gmem_is_frozen(inode)) {
+		*err_index = start;
+		r = -EPERM;
+		goto out;
+	}
+
 	if (kvm_gmem_range_has_attributes(inode, start, nr_pages, attrs))
 		goto out;
 
@@ -1023,6 +1048,20 @@ int kvm_gmem_create(struct kvm *kvm, struct kvm_create_guest_memfd *args)
 
 	return __kvm_gmem_create(kvm, size, flags);
 }
+
+#ifdef CONFIG_LIVEUPDATE
+void kvm_gmem_freeze(struct file *file, bool freeze)
+{
+	struct inode *inode = file_inode(file);
+
+	if (WARN_ON_ONCE(file->f_op != &kvm_gmem_fops))
+		return;
+
+	filemap_invalidate_lock(inode->i_mapping);
+	GMEM_I(inode)->frozen = freeze;
+	filemap_invalidate_unlock(inode->i_mapping);
+}
+#endif
 
 int kvm_gmem_prepare_memory_region(struct kvm *kvm, struct kvm_memory_slot *slot,
 				   unsigned int fd, uoff_t offset)
@@ -1355,6 +1394,7 @@ static struct inode *kvm_gmem_alloc_inode(struct super_block *sb)
 	mt_init_flags(&gi->attributes, MT_FLAGS_LOCK_EXTERN | MT_FLAGS_USE_RCU);
 
 	gi->flags = 0;
+	gi->frozen = false;
 	INIT_LIST_HEAD(&gi->gmem_file_list);
 	return &gi->vfs_inode;
 }
