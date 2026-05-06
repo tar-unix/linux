@@ -245,6 +245,7 @@ int liveupdate_flb_get_outgoing(struct liveupdate_flb *flb, void **objp);
 /* kernel can internally retrieve files */
 int liveupdate_get_file_incoming(struct liveupdate_session *s, u64 token,
 				 struct file **filep);
+struct file *liveupdate_file_get_retrieved(struct liveupdate_session *s, u64 token);
 
 /* Get a token for an outgoing file, or -ENOENT if file is not preserved */
 int liveupdate_get_token_outgoing(struct liveupdate_session *s,
@@ -298,6 +299,12 @@ static inline int liveupdate_get_file_incoming(struct liveupdate_session *s,
 					       u64 token, struct file **filep)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline struct file *liveupdate_file_get_retrieved(struct liveupdate_session *s,
+							u64 token)
+{
+	return NULL;
 }
 
 static inline int liveupdate_get_token_outgoing(struct liveupdate_session *s,

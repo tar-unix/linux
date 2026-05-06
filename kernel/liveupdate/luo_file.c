@@ -993,3 +993,71 @@ int liveupdate_get_file_incoming(struct liveupdate_session *s, u64 token,
 	return luo_retrieve_file(luo_file_set_from_session_locked(s),
 				 token, filep);
 }
+
+/**
+ * liveupdate_file_get_retrieved - Returns the already retrieved file.
+ * @s:     The liveupdate session.
+ * @token: The token identifying the file.
+ *
+ * Returns the struct file pointer if the file exists and has been
+ * successfully retrieved. Returns NULL otherwise.
+ *
+ * This function is necessary for the files that are dependent and need to be
+ * retrieved in proper sequence. For example, userspace should retrieve the
+ * parent file before retrieving the child. To make sure the retrieval order is
+ * is followed correctly.
+ *
+ * Although liveupdate_get_file_incoming auto retrieves the parent file
+ * in case it was not retrieved already from userspace, doing so can affect
+ * the lifecycle of refcount of the file:
+ *
+ * Userspace directly perform IOCTL to retrieve child without retrieving
+ * parent file first. In this case, userspace does not hold the reference
+ * to the parent file.
+ * Child retrieve calls liveupdate_get_file_incoming
+ *          |- Parent is retrieved
+ *          |- Parent file ref count is 2, and retrieved_status is true
+ *             | - child calls fput after parent's file use
+ *             | - refcount is now 1.
+ *                 | - Corrupt userspace triggers luo finish
+ *                 | - refcount is 0 and file is lost
+ *								 | - child is still retrieved
+ *
+ * This can be prevented by implementing can_finish in the parent's
+ * liveupdate_file_ops, but this only stops the userspace after everything is
+ * already finished (child is retrieved and setup with parent file), rather than
+ * enforcing the retrieval order where the parent must be retrieved before the child.
+ *
+ */
+struct file *liveupdate_file_get_retrieved(struct liveupdate_session *s, u64 token)
+{
+	struct luo_file_set *file_set = luo_file_set_from_session_locked(s);
+	struct luo_file *luo_file;
+	struct file *file = NULL;
+
+	if (list_empty(&file_set->files_list))
+		return NULL;
+
+	list_for_each_entry(luo_file, &file_set->files_list, list) {
+		if (luo_file->token == token) {
+			/*
+			 * We are reading retrieve_status locklessly, it transitions
+			 * only once from 0 to 1 or err. It is guaranteed that the file
+			 * pointer stored in luo_file is the same as the one returned
+			 * by the luo_retrieve_file() call. This is because the file
+			 * pointer is only assigned during luo_retrieve_file() and
+			 * never modified afterwards.
+			 */
+			if (READ_ONCE(luo_file->retrieve_status) > 0) {
+				file = READ_ONCE(luo_file->file);
+				if (file)
+					get_file(file);
+			}
+			break;
+		}
+	}
+
+	return file;
+}
+EXPORT_SYMBOL_GPL(liveupdate_file_get_retrieved);
+
