@@ -629,8 +629,9 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token,
 	args.serialized_data = luo_file->serialized_data;
 	err = luo_file->fh->ops->retrieve(&args);
 	if (err) {
-		/* Keep the error code for later use. */
-		luo_file->retrieve_status = err;
+		/* Keep the error code for later use, except EAGAIN which is for retry. */
+		if (err != -EAGAIN)
+			luo_file->retrieve_status = err;
 		return err;
 	}
 
