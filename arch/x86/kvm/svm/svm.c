@@ -54,6 +54,10 @@
 #include "svm.h"
 #include "svm_ops.h"
 
+/* AMD exit telemetry control variables */
+extern bool kvm_vm_exit_sampling_active;
+extern u32 kvm_vm_exit_sampling_percentage;
+
 #include "hyperv.h"
 #include "kvm_onhyperv.h"
 #include "svm_onhyperv.h"
@@ -4651,6 +4655,20 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	 */
 	if (is_guest_mode(vcpu))
 		svm->nested.ctl.next_rip = svm->vmcb->control.next_rip;
+
+	/* Increment Flat-Array Stats Counter (Direct SVM Indexing) */
+	if (READ_ONCE(kvm_vm_exit_sampling_active)) {
+		u32 pct = READ_ONCE(kvm_vm_exit_sampling_percentage);
+		if (pct == 100 || ((vcpu->arch.exit_sample_counter += pct) >= 100)) {
+			u32 idx = (u32)svm->vmcb->control.exit_code;
+			if (unlikely(idx >= KVM_VM_EXIT_STATS_FALLBACK_IDX))
+				idx = KVM_VM_EXIT_STATS_FALLBACK_IDX;
+
+			vcpu->stat.vm_exits_by_reason[idx]++;
+			if (pct != 100)
+				vcpu->arch.exit_sample_counter %= 100;
+		}
+	}
 
 	return svm_exit_handlers_fastpath(vcpu);
 }

@@ -2021,6 +2021,10 @@ struct kvm_stat_data {
 #define STATS_DESC_COUNTER(SCOPE, name)					       \
 	STATS_DESC_CUMULATIVE(SCOPE, name, KVM_STATS_UNIT_NONE,		       \
 		KVM_STATS_BASE_POW10, 0)
+/* Array cumulative counter, read/write */
+#define STATS_DESC_ARRAY_COUNTER(SCOPE, name, sz)                     \
+	STATS_DESC(SCOPE, name, KVM_STATS_TYPE_CUMULATIVE,            \
+		KVM_STATS_UNIT_NONE, KVM_STATS_BASE_POW10, 0, sz, 0)
 /* Instantaneous counter, read only */
 #define STATS_DESC_ICOUNTER(SCOPE, name)				       \
 	STATS_DESC_INSTANT(SCOPE, name, KVM_STATS_UNIT_NONE,		       \
@@ -2076,6 +2080,7 @@ ssize_t kvm_stats_read(char *id, const struct kvm_stats_header *header,
 		       const struct kvm_stats_desc *desc,
 		       void *stats, size_t size_stats,
 		       char __user *user_buffer, size_t size, loff_t *offset);
+const char *kvm_arch_stat_get_array_name(const struct kvm_stats_desc *desc, int idx);
 
 /**
  * kvm_stats_linear_hist_update() - Update bucket value for linear histogram

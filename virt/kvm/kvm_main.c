@@ -22,6 +22,7 @@
 #include <linux/vmalloc.h>
 #include <linux/reboot.h>
 #include <linux/debugfs.h>
+#include <linux/seq_file.h>
 #include <linux/highmem.h>
 #include <linux/file.h>
 #include <linux/syscore_ops.h>
@@ -117,7 +118,15 @@ static DEFINE_PER_CPU(struct kvm_vcpu *, kvm_running_vcpu);
 
 static struct dentry *kvm_debugfs_dir;
 
+/* Global Exit Telemetry Controls */
+bool kvm_vm_exit_sampling_active = true;
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vm_exit_sampling_active);
+
+u32 kvm_vm_exit_sampling_percentage = 100;
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vm_exit_sampling_percentage);
+
 static const struct file_operations stat_fops_per_vm;
+static const struct file_operations stat_array_fops_per_vm;
 
 static long kvm_vcpu_ioctl(struct file *file, unsigned int ioctl,
 			   unsigned long arg);
@@ -1056,7 +1065,7 @@ static int kvm_create_vm_debugfs(struct kvm *kvm, const char *fdname)
 		kvm->debugfs_stat_data[i + kvm_vm_stats_header.num_desc] = stat_data;
 		debugfs_create_file(pdesc->name, kvm_stats_debugfs_mode(pdesc),
 				    kvm->debugfs_dentry, stat_data,
-				    &stat_fops_per_vm);
+				    pdesc->size > 1 ? &stat_array_fops_per_vm : &stat_fops_per_vm);
 	}
 
 	kvm_arch_create_vm_debugfs(kvm);
@@ -6205,6 +6214,46 @@ static int kvm_stat_data_open(struct inode *inode, struct file *file)
 				kvm_stat_data_clear, "%llu\n");
 }
 
+const char * __weak kvm_arch_stat_get_array_name(const struct kvm_stats_desc *desc, int idx)
+{
+	return NULL;
+}
+
+static int kvm_stat_array_show(struct seq_file *m, void *v)
+{
+	struct kvm_stat_data *stat_data = m->private;
+	const struct kvm_stats_desc *desc = stat_data->desc;
+	u64 val;
+	int i;
+
+	for (i = 0; i < desc->size; i++) {
+		if (stat_data->kind == KVM_STAT_VM)
+			kvm_get_stat_per_vm(stat_data->kvm, desc->offset + i * sizeof(u64), &val);
+		else
+			kvm_get_stat_per_vcpu(stat_data->kvm, desc->offset + i * sizeof(u64), &val);
+
+		const char *name = kvm_arch_stat_get_array_name(desc, i);
+		if (name)
+			seq_printf(m, "%-30s %llu\n", name, val);
+		else if (val)
+			seq_printf(m, "UNKNOWN_0x%-22x %llu\n", i, val);
+	}
+	return 0;
+}
+
+static int kvm_stat_array_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, kvm_stat_array_show, inode->i_private);
+}
+
+static const struct file_operations stat_array_fops_per_vm = {
+	.owner = THIS_MODULE,
+	.open = kvm_stat_array_open,
+	.release = single_release,
+	.read = seq_read,
+	.llseek = seq_lseek,
+};
+
 static const struct file_operations stat_fops_per_vm = {
 	.owner = THIS_MODULE,
 	.open = kvm_stat_data_open,
@@ -6286,6 +6335,54 @@ DEFINE_SIMPLE_ATTRIBUTE(vcpu_stat_fops, vcpu_stat_get, vcpu_stat_clear,
 			"%llu\n");
 DEFINE_SIMPLE_ATTRIBUTE(vcpu_stat_readonly_fops, vcpu_stat_get, NULL, "%llu\n");
 
+static int vcpu_stat_array_show(struct seq_file *m, void *v)
+{
+	unsigned long offset = (unsigned long)m->private;
+	const struct kvm_stats_desc *desc = NULL;
+	struct kvm *kvm;
+	u64 val, tmp_val;
+	int i;
+
+	for (i = 0; i < kvm_vcpu_stats_header.num_desc; ++i) {
+		if (kvm_vcpu_stats_desc[i].offset == offset) {
+			desc = &kvm_vcpu_stats_desc[i];
+			break;
+		}
+	}
+	if (!desc)
+		return -ENOENT;
+
+	for (i = 0; i < desc->size; i++) {
+		val = 0;
+		mutex_lock(&kvm_lock);
+		list_for_each_entry(kvm, &vm_list, vm_list) {
+			kvm_get_stat_per_vcpu(kvm, offset + i * sizeof(u64), &tmp_val);
+			val += tmp_val;
+		}
+		mutex_unlock(&kvm_lock);
+
+		const char *name = kvm_arch_stat_get_array_name(desc, i);
+		if (name)
+			seq_printf(m, "%-30s %llu\n", name, val);
+		else if (val)
+			seq_printf(m, "UNKNOWN_0x%-22x %llu\n", i, val);
+	}
+	return 0;
+}
+
+static int vcpu_stat_array_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, vcpu_stat_array_show, inode->i_private);
+}
+
+static const struct file_operations vcpu_stat_array_readonly_fops = {
+	.owner = THIS_MODULE,
+	.open = vcpu_stat_array_open,
+	.release = single_release,
+	.read = seq_read,
+	.llseek = seq_lseek,
+};
+
 static void kvm_uevent_notify_change(unsigned int type, struct kvm *kvm)
 {
 	struct kobj_uevent_env *env;
@@ -6336,6 +6433,26 @@ static void kvm_uevent_notify_change(unsigned int type, struct kvm *kvm)
 	kfree(env);
 }
 
+static int exit_sampling_percentage_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(kvm_vm_exit_sampling_percentage);
+	return 0;
+}
+
+static int exit_sampling_percentage_set(void *data, u64 val)
+{
+	if (val < 1 || val > 100)
+		return -EINVAL;
+
+	WRITE_ONCE(kvm_vm_exit_sampling_percentage, (u32)val);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(exit_sampling_percentage_fops,
+			exit_sampling_percentage_get,
+			exit_sampling_percentage_set,
+			"%llu\n");
+
 static void kvm_init_debug(void)
 {
 	const struct file_operations *fops;
@@ -6343,6 +6460,12 @@ static void kvm_init_debug(void)
 	int i;
 
 	kvm_debugfs_dir = debugfs_create_dir("kvm", NULL);
+
+	/* Global Exit Telemetry Controls */
+	debugfs_create_bool("exit_sampling_active", 0644, kvm_debugfs_dir,
+			    &kvm_vm_exit_sampling_active);
+	debugfs_create_file("exit_sampling_percentage", 0644, kvm_debugfs_dir,
+			    NULL, &exit_sampling_percentage_fops);
 
 	for (i = 0; i < kvm_vm_stats_header.num_desc; ++i) {
 		pdesc = &kvm_vm_stats_desc[i];
@@ -6357,7 +6480,9 @@ static void kvm_init_debug(void)
 
 	for (i = 0; i < kvm_vcpu_stats_header.num_desc; ++i) {
 		pdesc = &kvm_vcpu_stats_desc[i];
-		if (kvm_stats_debugfs_mode(pdesc) & 0222)
+		if (pdesc->size > 1)
+			fops = &vcpu_stat_array_readonly_fops;
+		else if (kvm_stats_debugfs_mode(pdesc) & 0222)
 			fops = &vcpu_stat_fops;
 		else
 			fops = &vcpu_stat_readonly_fops;

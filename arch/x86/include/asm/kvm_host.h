@@ -1138,6 +1138,9 @@ struct kvm_vcpu_arch {
 #if IS_ENABLED(CONFIG_HYPERV)
 	hpa_t hv_root_tdp;
 #endif
+
+	/* Telemetry counters */
+	u32 exit_sample_counter;
 };
 
 struct kvm_lpage_info {
@@ -1713,6 +1716,13 @@ struct kvm_vm_stat {
 	u64 max_mmu_rmap_size;
 };
 
+#include <uapi/asm/svm.h>
+#include <uapi/asm/vmx.h>
+
+#define KVM_VM_EXIT_STATS_MAX_REASON SVM_EXIT_VMGEXIT
+#define KVM_VM_EXIT_STATS_FALLBACK_IDX (KVM_VM_EXIT_STATS_MAX_REASON + 1)
+#define KVM_VM_EXIT_STATS_SIZE (KVM_VM_EXIT_STATS_FALLBACK_IDX + 1)
+
 struct kvm_vcpu_stat {
 	struct kvm_vcpu_stat_generic generic;
 	u64 pf_taken;
@@ -1750,6 +1760,9 @@ struct kvm_vcpu_stat {
 	u64 preemption_other;
 	u64 guest_mode;
 	u64 notify_window_exits;
+
+	/* Flat array for tracking ALL VMX/SVM exit reasons */
+	u64 vm_exits_by_reason[KVM_VM_EXIT_STATS_SIZE];
 };
 
 struct x86_instruction_info;

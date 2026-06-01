@@ -158,6 +158,10 @@ module_param_named(preemption_timer, enable_preemption_timer, bool, S_IRUGO);
 extern bool __read_mostly allow_smaller_maxphyaddr;
 module_param(allow_smaller_maxphyaddr, bool, S_IRUGO);
 
+/* VMX exit telemetry control variables */
+extern bool kvm_vm_exit_sampling_active;
+extern u32 kvm_vm_exit_sampling_percentage;
+
 module_param(enable_mediated_pmu, bool, 0444);
 
 #define KVM_VM_CR0_ALWAYS_OFF (X86_CR0_NW | X86_CR0_CD)
@@ -7651,6 +7655,20 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 
 	vmx_recover_nmi_blocking(vmx);
 	vmx_complete_interrupts(vmx);
+
+	/* Increment Flat-Array Stats Counter (Direct VMX Indexing) */
+	if (READ_ONCE(kvm_vm_exit_sampling_active)) {
+		u32 pct = READ_ONCE(kvm_vm_exit_sampling_percentage);
+		if (pct == 100 || ((vcpu->arch.exit_sample_counter += pct) >= 100)) {
+			u32 idx = (u32)vmx_get_exit_reason(vcpu).basic;
+			if (unlikely(idx >= KVM_VM_EXIT_STATS_FALLBACK_IDX))
+				idx = KVM_VM_EXIT_STATS_FALLBACK_IDX;
+
+			vcpu->stat.vm_exits_by_reason[idx]++;
+			if (pct != 100)
+				vcpu->arch.exit_sample_counter %= 100;
+		}
+	}
 
 	return vmx_exit_handlers_fastpath(vcpu, force_immediate_exit);
 }

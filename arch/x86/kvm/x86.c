@@ -67,6 +67,8 @@
 
 #include <asm/debugreg.h>
 #include <asm/msr.h>
+#include <uapi/asm/vmx.h>
+#include <uapi/asm/svm.h>
 #include <asm/desc.h>
 #include <asm/mce.h>
 #include <asm/pkru.h>
@@ -298,6 +300,7 @@ const struct kvm_stats_desc kvm_vcpu_stats_desc[] = {
 	STATS_DESC_COUNTER(VCPU, preemption_other),
 	STATS_DESC_IBOOLEAN(VCPU, guest_mode),
 	STATS_DESC_COUNTER(VCPU, notify_window_exits),
+	STATS_DESC_ARRAY_COUNTER(VCPU, vm_exits_by_reason, KVM_VM_EXIT_STATS_SIZE),
 };
 
 const struct kvm_stats_header kvm_vcpu_stats_header = {
@@ -308,6 +311,54 @@ const struct kvm_stats_header kvm_vcpu_stats_header = {
 	.data_offset = sizeof(struct kvm_stats_header) + KVM_STATS_NAME_SIZE +
 		       sizeof(kvm_vcpu_stats_desc),
 };
+
+struct kvm_stat_id_name {
+	u64 id;
+	const char *name;
+};
+
+#if IS_ENABLED(CONFIG_KVM_INTEL)
+static const struct kvm_stat_id_name vmx_exit_reason_names[] = {
+	VMX_EXIT_REASONS
+};
+#endif
+
+#if IS_ENABLED(CONFIG_KVM_AMD)
+static const struct kvm_stat_id_name svm_exit_reason_names[] = {
+	SVM_EXIT_REASONS
+};
+#endif
+
+const char *kvm_arch_stat_get_array_name(const struct kvm_stats_desc *desc, int idx)
+{
+	int i;
+
+	if (strcmp(desc->name, "vm_exits_by_reason") == 0) {
+		if (idx == KVM_VM_EXIT_STATS_FALLBACK_IDX)
+			return "FALLBACK_UNLISTED";
+
+#if IS_ENABLED(CONFIG_KVM_INTEL)
+		if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL ||
+		    boot_cpu_data.x86_vendor == X86_VENDOR_CENTAUR ||
+		    boot_cpu_data.x86_vendor == X86_VENDOR_ZHAOXIN) {
+			for (i = 0; i < ARRAY_SIZE(vmx_exit_reason_names); i++) {
+				if (vmx_exit_reason_names[i].id == idx)
+					return vmx_exit_reason_names[i].name;
+			}
+		}
+#endif
+#if IS_ENABLED(CONFIG_KVM_AMD)
+		if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD ||
+		    boot_cpu_data.x86_vendor == X86_VENDOR_HYGON) {
+			for (i = 0; i < ARRAY_SIZE(svm_exit_reason_names); i++) {
+				if (svm_exit_reason_names[i].id == idx)
+					return svm_exit_reason_names[i].name;
+			}
+		}
+#endif
+	}
+	return NULL;
+}
 
 static struct kmem_cache *x86_emulator_cache;
 
