@@ -47,6 +47,42 @@ static bool fw_devlink_drv_reg_done;
 static bool fw_devlink_best_effort;
 static struct workqueue_struct *device_link_wq;
 
+static bool block_device_add;
+static atomic_t device_add_count = ATOMIC_INIT(0);
+static DECLARE_WAIT_QUEUE_HEAD(device_add_waitqueue);
+
+static void device_block_adding(void)
+{
+	block_device_add = true;
+	smp_mb();
+}
+
+static void wait_for_device_add(void)
+{
+	wait_event(device_add_waitqueue, atomic_read(&device_add_count) == 0);
+}
+
+static void device_add_finish(void)
+{
+	if (atomic_dec_and_test(&device_add_count))
+		wake_up_all(&device_add_waitqueue);
+}
+
+static int device_add_start(void)
+{
+	if (unlikely(block_device_add))
+		return -ESHUTDOWN;
+
+	atomic_inc(&device_add_count);
+	smp_mb__after_atomic();
+	if (unlikely(block_device_add)) {
+		device_add_finish();
+		return -ESHUTDOWN;
+	}
+
+	return 0;
+}
+
 /**
  * __fwnode_link_add - Create a link between two fwnode_handles.
  * @con: Consumer end of the link.
@@ -3652,7 +3688,13 @@ int device_add(struct device *dev)
 
 	dev = get_device(dev);
 	if (!dev)
-		goto done;
+		return -EINVAL;
+
+	error = device_add_start();
+	if (error) {
+		put_device(dev);
+		return error;
+	}
 
 	if (!dev->p) {
 		error = device_private_init(dev);
@@ -3802,6 +3844,7 @@ int device_add(struct device *dev)
 		subsys_put(sp);
 	}
 done:
+	device_add_finish();
 	put_device(dev);
 	return error;
  SysEntryError:
@@ -4877,6 +4920,9 @@ void device_shutdown(void)
 
 	wait_for_device_probe();
 	device_block_probing();
+
+	device_block_adding();
+	wait_for_device_add();
 
 	cpufreq_suspend();
 
