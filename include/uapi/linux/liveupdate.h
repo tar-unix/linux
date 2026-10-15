@@ -134,6 +134,8 @@ struct liveupdate_ioctl_retrieve_session {
  *           which registered handler preserves @fd. If empty (all-zero, or
  *           omitted when passing the 16-byte structure), the kernel selects
  *           the first registered handler whose .can_preserve() accepts @fd.
+ * @arg:     Input; User-space pointer to a file-handler-specific argument
+ *           structure starting with a 32-bit size field, or 0 if unused.
  *
  * Holds parameters for preserving a file descriptor.
  *
@@ -158,6 +160,7 @@ struct liveupdate_session_preserve_fd {
 	__s32		fd;
 	__aligned_u64	token;
 	char		handler[LIVEUPDATE_HNDL_NAME_LENGTH];
+	__aligned_u64	arg;
 };
 
 #define LIVEUPDATE_SESSION_PRESERVE_FD					\
@@ -169,6 +172,8 @@ struct liveupdate_session_preserve_fd {
  * @fd:    Output; The new file descriptor representing the fully restored
  *         kernel resource.
  * @token: Input; An opaque, token that was used to preserve the resource.
+ * @arg:   Input; User-space pointer to a file-handler-specific argument
+ *         structure starting with a 32-bit size field, or 0 if unused.
  *
  * Retrieve a previously preserved file descriptor.
  *
@@ -188,6 +193,7 @@ struct liveupdate_session_retrieve_fd {
 	__u32		size;
 	__s32		fd;
 	__aligned_u64	token;
+	__aligned_u64	arg;
 };
 
 #define LIVEUPDATE_SESSION_RETRIEVE_FD					\

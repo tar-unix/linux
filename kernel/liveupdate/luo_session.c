@@ -266,13 +266,17 @@ static int luo_session_preserve_fd(struct luo_session *session,
 	struct liveupdate_session_preserve_fd *argp = ucmd->cmd;
 	int err;
 
+	if (ucmd->user_size > offsetof(struct liveupdate_session_preserve_fd, arg) &&
+	    ucmd->user_size < offsetofend(struct liveupdate_session_preserve_fd, arg))
+		return -EINVAL;
+
 	if (strnlen(argp->handler, sizeof(argp->handler)) ==
 	    sizeof(argp->handler))
 		return -EINVAL;
 
 	guard(mutex)(&session->mutex);
 	err = luo_preserve_file(&session->file_set, argp->token, argp->fd,
-				argp->handler);
+				argp->handler, argp->arg);
 	if (err)
 		return err;
 
@@ -290,12 +294,17 @@ static int luo_session_retrieve_fd(struct luo_session *session,
 	struct file *file;
 	int err;
 
+	if (ucmd->user_size > offsetof(struct liveupdate_session_retrieve_fd, arg) &&
+	    ucmd->user_size < offsetofend(struct liveupdate_session_retrieve_fd, arg))
+		return -EINVAL;
+
 	argp->fd = get_unused_fd_flags(O_CLOEXEC);
 	if (argp->fd < 0)
 		return argp->fd;
 
 	mutex_lock(&session->mutex);
-	err = luo_retrieve_file(&session->file_set, argp->token, &file);
+	err = luo_retrieve_file(&session->file_set, argp->token, argp->arg,
+				&file);
 	mutex_unlock(&session->mutex);
 	if (err < 0)
 		goto err_put_fd;
