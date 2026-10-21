@@ -2969,6 +2969,11 @@ static int snp_decommission_context(struct kvm *kvm)
 	return 0;
 }
 
+bool sev_vm_has_encrypted_memory(struct kvm *kvm)
+{
+	return sev_guest(kvm);
+}
+
 void sev_vm_init(struct kvm *kvm)
 {
 	switch (kvm->arch.vm_type) {

@@ -18,6 +18,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_host.h>
+#include <linux/kho/abi/kvm.h>
 #include "irq.h"
 #include "ioapic.h"
 #include "mmu.h"
@@ -9932,6 +9933,23 @@ void kvm_arch_free_vm(struct kvm *kvm)
 	__kvm_arch_free_vm(kvm);
 }
 
+#ifdef CONFIG_LIVEUPDATE
+int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type)
+{
+	/*
+	 * Only VMs without private memory and protected state can be
+	 * preserved for now. Of the VM types, that is only the default VM,
+	 * but KVM_SEV_INIT and KVM_SEV_ES_INIT turn a default VM into an SEV
+	 * or SEV-ES guest without changing its type.
+	 */
+	if (kvm->arch.vm_type != KVM_X86_DEFAULT_VM ||
+	    kvm_x86_call(vm_has_encrypted_memory)(kvm))
+		return -EOPNOTSUPP;
+
+	*type = KVM_X86_DEFAULT_VM;
+	return KVM_VM_LUO_FEAT_NON_COCO;
+}
+#endif
 
 int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 {
