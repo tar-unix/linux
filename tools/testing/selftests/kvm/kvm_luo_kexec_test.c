@@ -319,6 +319,20 @@ static int retrieve_errors_check(int session_fd, u64 token)
 	return KSFT_PASS;
 }
 
+/* A guest_memfd that is not retrieved is freed when the session finishes. */
+static void not_retrieved_preserve(int session_fd, u64 token)
+{
+	int gmem_fd = create_gmem(token, NULL);
+
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, gmem_fd, token), 0);
+	close(gmem_fd);
+}
+
+static int not_retrieved_check(int session_fd, u64 token)
+{
+	return KSFT_PASS;
+}
+
 #define SCENARIO(_name) { #_name, _name##_preserve, _name##_check }
 
 static const struct scenario scenarios[] = {
@@ -326,6 +340,7 @@ static const struct scenario scenarios[] = {
 	SCENARIO(gmem_only),
 	SCENARIO(vm_and_gmem),
 	SCENARIO(retrieve_errors),
+	SCENARIO(not_retrieved),
 };
 
 /* Every scenario uses up to two tokens, starting at its own base. */
