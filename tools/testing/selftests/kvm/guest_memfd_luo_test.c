@@ -180,4 +180,17 @@ TEST_F(gmem_luo, cancel)
 	EXPECT_EQ(preserve_fd(self->session_fd, self->gmem_fd, 1, NULL, 0), 0);
 }
 
+TEST_F(gmem_luo, private_memory)
+{
+	int fd;
+
+	/*
+	 * A guest_memfd without GUEST_MEMFD_FLAG_INIT_SHARED has private
+	 * memory, which is not supported on a VM without private memory.
+	 */
+	fd = vm_create_guest_memfd(self->vm, GMEM_SIZE, GUEST_MEMFD_FLAG_MMAP);
+	EXPECT_EQ(preserve_fd(self->session_fd, fd, 1, NULL, 0), -EOPNOTSUPP);
+	close(fd);
+}
+
 TEST_HARNESS_MAIN
