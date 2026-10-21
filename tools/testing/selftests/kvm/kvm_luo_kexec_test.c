@@ -12,7 +12,9 @@
  * reboot.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -333,6 +335,66 @@ static int not_retrieved_check(int session_fd, u64 token)
 	return KSFT_PASS;
 }
 
+#define REQUIRE_UNKNOWN_FEATURE \
+	"/sys/module/liveupdate_test/parameters/require_unknown_feature"
+
+static int require_unknown_feature(const char *handler)
+{
+	int fd, ret;
+
+	fd = open(REQUIRE_UNKNOWN_FEATURE, O_WRONLY);
+	if (fd < 0)
+		return -errno;
+
+	ret = write(fd, handler, strlen(handler)) < 0 ? -errno : 0;
+	close(fd);
+	return ret;
+}
+
+/*
+ * A guest_memfd that requires a feature the kernel does not implement, as if
+ * it was preserved by a newer kernel, cannot be retrieved. This needs
+ * CONFIG_LIVEUPDATE_TEST.
+ */
+static void feature_mismatch_preserve(int session_fd, u64 token)
+{
+	int gmem_fd;
+
+	if (require_unknown_feature("guest_memfd"))
+		return;
+
+	gmem_fd = create_gmem(token, NULL);
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, gmem_fd, token), 0);
+	close(gmem_fd);
+
+	TEST_ASSERT_EQ(require_unknown_feature("\n"), 0);
+}
+
+static int feature_mismatch_check(int session_fd, u64 token)
+{
+	u32 size = sizeof(struct kvm_guest_memfd_luo_retrieve);
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	int ret;
+
+	vm = create_vm(-1, &vcpu);
+
+	ret = retrieve_gmem(session_fd, token, size, vm->fd);
+	if (ret == -ENOENT) {
+		kvm_vm_free(vm);
+		return KSFT_SKIP;
+	}
+	TEST_ASSERT_EQ(ret, -EOPNOTSUPP);
+
+	/* The failure is permanent. */
+	TEST_ASSERT_EQ(retrieve_gmem(session_fd, token, size, vm->fd),
+		       -EOPNOTSUPP);
+
+	kvm_vm_free(vm);
+
+	return KSFT_PASS;
+}
+
 #define SCENARIO(_name) { #_name, _name##_preserve, _name##_check }
 
 static const struct scenario scenarios[] = {
@@ -341,6 +403,7 @@ static const struct scenario scenarios[] = {
 	SCENARIO(vm_and_gmem),
 	SCENARIO(retrieve_errors),
 	SCENARIO(not_retrieved),
+	SCENARIO(feature_mismatch),
 };
 
 /* Every scenario uses up to two tokens, starting at its own base. */
