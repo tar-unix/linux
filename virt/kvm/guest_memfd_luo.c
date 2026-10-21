@@ -31,12 +31,13 @@
  *
  * After the reboot, LIVEUPDATE_SESSION_RETRIEVE_FD needs a struct
  * kvm_guest_memfd_luo_retrieve with the file descriptor of a VM, created with
- * KVM_CREATE_VM, that belongs to the calling process and supports the
- * preserved flags. The retrieved guest_memfd is bound to that VM. If the
- * argument is missing or the VM is not suitable, retrieving fails without
- * consuming the preserved guest_memfd and can be retried. The VMM then binds
- * the guest_memfd to memory slots at the same offsets as before. A preserved
- * guest_memfd that is not retrieved is freed when the session is finished.
+ * KVM_CREATE_VM or retrieved with the "kvm-vm" file handler, that belongs to
+ * the calling process and supports the preserved flags. The retrieved
+ * guest_memfd is bound to that VM. If the argument is missing or the VM is
+ * not suitable, retrieving fails without consuming the preserved guest_memfd
+ * and can be retried. The VMM then binds the guest_memfd to memory slots at
+ * the same offsets as before. A preserved guest_memfd that is not retrieved
+ * is freed when the session is finished.
  */
 
 #include <linux/file.h>

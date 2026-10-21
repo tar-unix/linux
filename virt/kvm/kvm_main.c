@@ -57,6 +57,7 @@
 #include "coalesced_mmio.h"
 #include "async_pf.h"
 #include "guest_memfd.h"
+#include "kvm_luo.h"
 #include "kvm_mm.h"
 #include "vfio.h"
 
@@ -5574,7 +5575,7 @@ bool file_is_kvm(struct file *file)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(file_is_kvm);
 
-static struct file *kvm_create_vm_file(unsigned long type, const char *fdname)
+struct file *kvm_create_vm_file(unsigned long type, const char *fdname)
 {
 	struct file *file;
 	struct kvm *kvm;
@@ -6637,6 +6638,10 @@ int kvm_init(unsigned vcpu_size, unsigned vcpu_align, struct module *module)
 	if (r)
 		goto err_virt;
 
+	r = kvm_vm_luo_init(module);
+	if (r)
+		goto err_luo;
+
 	r = kvm_gmem_luo_init(module);
 	if (r)
 		goto err_gmem_luo;
@@ -6656,6 +6661,8 @@ int kvm_init(unsigned vcpu_size, unsigned vcpu_align, struct module *module)
 err_register:
 	kvm_gmem_luo_exit();
 err_gmem_luo:
+	kvm_vm_luo_exit();
+err_luo:
 	kvm_uninit_virtualization();
 err_virt:
 	kvm_gmem_exit();
@@ -6687,6 +6694,7 @@ void kvm_exit(void)
 	misc_deregister(&kvm_dev);
 
 	kvm_gmem_luo_exit();
+	kvm_vm_luo_exit();
 
 	kvm_uninit_virtualization();
 

@@ -1675,6 +1675,8 @@ bool kvm_arch_dy_has_pending_interrupt(struct kvm_vcpu *vcpu);
 bool kvm_arch_vcpu_preempted_in_kernel(struct kvm_vcpu *vcpu);
 void kvm_arch_pre_destroy_vm(struct kvm *kvm);
 void kvm_arch_create_vm_debugfs(struct kvm *kvm);
+/* Called with kvm->lock held. */
+int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type);
 
 #ifndef __KVM_HAVE_ARCH_VM_ALLOC
 /*

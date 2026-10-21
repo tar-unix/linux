@@ -70,4 +70,6 @@ static inline void gfn_to_pfn_cache_invalidate_start(struct kvm *kvm,
 }
 #endif /* HAVE_KVM_PFNCACHE */
 
+struct file *kvm_create_vm_file(unsigned long type, const char *fdname);
+
 #endif /* __KVM_MM_H__ */
