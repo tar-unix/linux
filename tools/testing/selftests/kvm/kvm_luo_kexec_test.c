@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 
 #include <linux/sizes.h>
 
@@ -254,12 +255,77 @@ static int vm_and_gmem_check(int session_fd, u64 token)
 	return KSFT_PASS;
 }
 
+/*
+ * Retrieving a guest_memfd with a missing or unsuitable VM fails without
+ * consuming the preserved guest_memfd.
+ */
+static void retrieve_errors_preserve(int session_fd, u64 token)
+{
+	int gmem_fd = create_gmem(token, NULL);
+
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, gmem_fd, token), 0);
+	close(gmem_fd);
+}
+
+static int retrieve_errors_check(int session_fd, u64 token)
+{
+	u32 size = sizeof(struct kvm_guest_memfd_luo_retrieve);
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	int gmem_fd, status;
+	pid_t pid;
+
+	vm = create_vm(-1, &vcpu);
+
+	/* No VM. */
+	TEST_ASSERT_EQ(luo_session_retrieve_fd(session_fd, token), -EINVAL);
+	TEST_ASSERT_EQ(retrieve_gmem(session_fd, token, sizeof(u32), vm->fd),
+		       -EINVAL);
+
+	/* Not a VM. */
+	TEST_ASSERT_EQ(retrieve_gmem(session_fd, token, size, -1), -EBADF);
+	TEST_ASSERT_EQ(retrieve_gmem(session_fd, token, size, session_fd),
+		       -EINVAL);
+
+#ifdef __x86_64__
+	/* A VM that cannot use the guest_memfd. */
+	if (kvm_check_cap(KVM_CAP_VM_TYPES) & BIT(KVM_X86_SW_PROTECTED_VM)) {
+		struct kvm_vm *private_vm;
+
+		private_vm = vm_create_barebones_type(KVM_X86_SW_PROTECTED_VM);
+		TEST_ASSERT_EQ(retrieve_gmem(session_fd, token, size,
+					     private_vm->fd), -EINVAL);
+		kvm_vm_free(private_vm);
+	}
+#endif
+
+	/* A VM of another process. */
+	pid = fork();
+	TEST_ASSERT(pid >= 0, "fork() failed");
+	if (!pid)
+		_exit(retrieve_gmem(session_fd, token, size, vm->fd) != -EIO);
+	TEST_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	TEST_ASSERT(WIFEXITED(status) && !WEXITSTATUS(status),
+		    "Retrieving with a VM of another process did not fail with EIO");
+
+	gmem_fd = retrieve_gmem(session_fd, token, size, vm->fd);
+	TEST_ASSERT(gmem_fd >= 0, "Retrieving the guest_memfd failed: %d",
+		    gmem_fd);
+
+	check_gmem(vm, vcpu, gmem_fd, token);
+	close(gmem_fd);
+	kvm_vm_free(vm);
+
+	return KSFT_PASS;
+}
+
 #define SCENARIO(_name) { #_name, _name##_preserve, _name##_check }
 
 static const struct scenario scenarios[] = {
 	SCENARIO(vm_only),
 	SCENARIO(gmem_only),
 	SCENARIO(vm_and_gmem),
+	SCENARIO(retrieve_errors),
 };
 
 /* Every scenario uses up to two tokens, starting at its own base. */
