@@ -1231,6 +1231,15 @@ struct kvm_vm *____vm_create(struct vm_shape shape);
 struct kvm_vm *__vm_create(struct vm_shape shape, u32 nr_runnable_vcpus,
 			   u64 nr_extra_pages);
 
+/*
+ * vm_create_from_fd() is __vm_create() for an existing VM file descriptor,
+ * e.g. of a VM that was retrieved after a live update, instead of a new VM.
+ * The VM must have the type that corresponds to @shape. The returned VM owns
+ * @vm_fd.
+ */
+struct kvm_vm *vm_create_from_fd(int vm_fd, struct vm_shape shape,
+				 u32 nr_runnable_vcpus, u64 nr_extra_pages);
+
 static inline struct kvm_vm *vm_create_barebones(void)
 {
 	return ____vm_create(VM_SHAPE_DEFAULT);

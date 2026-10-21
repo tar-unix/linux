@@ -187,14 +187,19 @@ void vm_enable_dirty_ring(struct kvm_vm *vm, u32 ring_size)
 	vm->dirty_ring_size = ring_size;
 }
 
-static void vm_open(struct kvm_vm *vm)
+/* Create a new VM, or use the existing VM @vm_fd if it is not negative. */
+static void vm_open(struct kvm_vm *vm, int vm_fd)
 {
 	vm->kvm_fd = _open_kvm_dev_path_or_exit(O_RDWR);
 
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_IMMEDIATE_EXIT));
 
-	vm->fd = __kvm_ioctl(vm->kvm_fd, KVM_CREATE_VM, (void *)vm->type);
-	TEST_ASSERT(vm->fd >= 0, KVM_IOCTL_ERROR(KVM_CREATE_VM, vm->fd));
+	if (vm_fd >= 0) {
+		vm->fd = vm_fd;
+	} else {
+		vm->fd = __kvm_ioctl(vm->kvm_fd, KVM_CREATE_VM, (void *)vm->type);
+		TEST_ASSERT(vm->fd >= 0, KVM_IOCTL_ERROR(KVM_CREATE_VM, vm->fd));
+	}
 
 	if (kvm_has_cap(KVM_CAP_BINARY_STATS_FD))
 		vm->stats.fd = vm_get_stats_fd(vm);
@@ -293,7 +298,7 @@ __weak void vm_populate_gva_bitmap(struct kvm_vm *vm)
 		(1ULL << (vm->va_bits - 1)) >> vm->page_shift);
 }
 
-struct kvm_vm *____vm_create(struct vm_shape shape)
+static struct kvm_vm *vm_alloc_and_open(struct vm_shape shape, int vm_fd)
 {
 	struct kvm_vm *vm;
 	int i;
@@ -405,7 +410,7 @@ struct kvm_vm *____vm_create(struct vm_shape shape)
 		vm->type = KVM_VM_TYPE_ARM_IPA_SIZE(vm->pa_bits);
 #endif
 
-	vm_open(vm);
+	vm_open(vm, vm_fd);
 
 	/* Limit to VA-bit canonical virtual addresses. */
 	vm->vpages_valid = sparsebit_alloc();
@@ -418,6 +423,11 @@ struct kvm_vm *____vm_create(struct vm_shape shape)
 	vm->vpages_mapped = sparsebit_alloc();
 
 	return vm;
+}
+
+struct kvm_vm *____vm_create(struct vm_shape shape)
+{
+	return vm_alloc_and_open(shape, -1);
 }
 
 static u64 vm_nr_pages_required(enum vm_guest_mode mode,
@@ -500,8 +510,9 @@ static bool is_guest_memfd_required(struct vm_shape shape)
 #endif
 }
 
-struct kvm_vm *__vm_create(struct vm_shape shape, u32 nr_runnable_vcpus,
-			   u64 nr_extra_pages)
+static struct kvm_vm *vm_create_common(int vm_fd, struct vm_shape shape,
+				       u32 nr_runnable_vcpus,
+				       u64 nr_extra_pages)
 {
 	u64 nr_pages = vm_nr_pages_required(shape.mode, nr_runnable_vcpus,
 						 nr_extra_pages);
@@ -515,7 +526,7 @@ struct kvm_vm *__vm_create(struct vm_shape shape, u32 nr_runnable_vcpus,
 	pr_debug("%s: mode='%s' type='%d', pages='%ld'\n", __func__,
 		 vm_guest_mode_string(shape.mode), shape.type, nr_pages);
 
-	vm = ____vm_create(shape);
+	vm = vm_alloc_and_open(shape, vm_fd);
 
 	/*
 	 * Force GUEST_MEMFD for the primary memory region if necessary, e.g.
@@ -561,6 +572,21 @@ struct kvm_vm *__vm_create(struct vm_shape shape, u32 nr_runnable_vcpus,
 	kvm_arch_vm_post_create(vm, nr_runnable_vcpus);
 
 	return vm;
+}
+
+struct kvm_vm *__vm_create(struct vm_shape shape, u32 nr_runnable_vcpus,
+			   u64 nr_extra_pages)
+{
+	return vm_create_common(-1, shape, nr_runnable_vcpus, nr_extra_pages);
+}
+
+struct kvm_vm *vm_create_from_fd(int vm_fd, struct vm_shape shape,
+				 u32 nr_runnable_vcpus, u64 nr_extra_pages)
+{
+	TEST_ASSERT(vm_fd >= 0, "Invalid VM file descriptor %d", vm_fd);
+
+	return vm_create_common(vm_fd, shape, nr_runnable_vcpus,
+				nr_extra_pages);
 }
 
 /*
@@ -631,7 +657,7 @@ void kvm_vm_restart(struct kvm_vm *vmp)
 	int ctr;
 	struct userspace_mem_region *region;
 
-	vm_open(vmp);
+	vm_open(vmp, -1);
 	if (vmp->has_irqchip)
 		vm_create_irqchip(vmp);
 
