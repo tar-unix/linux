@@ -158,4 +158,26 @@ TEST_F(gmem_luo, frozen)
 	kvm_munmap(mem, GMEM_SIZE);
 }
 
+TEST_F(gmem_luo, cancel)
+{
+	ASSERT_EQ(preserve_fd(self->session_fd, self->gmem_fd, 1, NULL, 0), 0);
+	ASSERT_EQ(fallocate(self->gmem_fd, FALLOC_FL_KEEP_SIZE, 0, GMEM_SIZE),
+		  -1);
+
+	/* Closing the session cancels the preservation. */
+	close(self->session_fd);
+	self->session_fd = -1;
+
+	EXPECT_EQ(fallocate(self->gmem_fd, FALLOC_FL_KEEP_SIZE, 0, GMEM_SIZE),
+		  0);
+	EXPECT_EQ(fallocate(self->gmem_fd,
+			    FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, 0,
+			    GMEM_SIZE), 0);
+
+	/* The guest_memfd can be preserved again. */
+	self->session_fd = luo_create_session(self->luo_fd, SESSION_NAME);
+	ASSERT_GE(self->session_fd, 0);
+	EXPECT_EQ(preserve_fd(self->session_fd, self->gmem_fd, 1, NULL, 0), 0);
+}
+
 TEST_HARNESS_MAIN
