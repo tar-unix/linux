@@ -70,6 +70,10 @@ static struct {
 	u64 liveupdate_num;
 } luo_global;
 
+static const u8 luo_core_features[LUO_CORE_FEAT_MAX] = {
+	[LUO_CORE_FEAT_CORE] = LUO_FEAT_REQUIRED,
+};
+
 /*
  * luo_register_rwlock - Protects registration of file handlers and FLBs.
  */
@@ -107,15 +111,21 @@ static int __init luo_early_startup(void)
 		return 0;
 	}
 
-	if (len < sizeof(*luo_ser)) {
-		pr_err("LUO state is too small (%zu < %zu)\n", len, sizeof(*luo_ser));
-		return -EINVAL;
+	luo_ser = phys_to_virt(luo_ser_phys);
+	if (len < sizeof(luo_ser->features) || luo_ser->features.size > len) {
+		pr_err("LUO state size invalid (source kernel header size=%llu, KHO len=%zu)\n",
+		       len >= sizeof(luo_ser->features) ? luo_ser->features.size : 0,
+		       len);
+		err = -EINVAL;
+		goto out_free_ser;
 	}
 
-	luo_ser = phys_to_virt(luo_ser_phys);
-	if (strncmp(luo_ser->compatible, LUO_ABI_COMPATIBLE, LUO_ABI_COMPAT_LEN)) {
-		pr_err("LUO state is incompatible with '%s'\n", LUO_ABI_COMPATIBLE);
-		return -EINVAL;
+	err = luo_feature_hdr_validate(&luo_ser->features, luo_core_features);
+	if (err) {
+		pr_err("LUO state feature header validation failed (size=%llu, flags[0]=%#llx): %pe\n",
+		       luo_ser->features.size, luo_ser->features.flags[0],
+		       ERR_PTR(err));
+		goto out_free_ser;
 	}
 
 	luo_global.liveupdate_num = luo_ser->liveupdate_num;
@@ -162,7 +172,8 @@ static int __init luo_state_setup(void)
 		return PTR_ERR(luo_ser);
 	}
 
-	strscpy(luo_ser->compatible, LUO_ABI_COMPATIBLE, sizeof(luo_ser->compatible));
+	luo_feature_hdr_init(&luo_ser->features, sizeof(*luo_ser),
+			     luo_core_features);
 	luo_ser->liveupdate_num = luo_global.liveupdate_num + 1;
 
 	luo_session_setup_outgoing(&luo_ser->sessions_pa);
