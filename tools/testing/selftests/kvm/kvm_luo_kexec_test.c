@@ -9,7 +9,7 @@
  * keeps the session open until the reboot. Stage 2 (-s 2) runs after the
  * reboot, retrieves the objects and checks them. The test can run as the test
  * binary of tools/testing/selftests/liveupdate/vmtest.sh, which performs the
- * reboot.
+ * reboot, see kvm_luo_vmtest.sh.
  */
 #include <errno.h>
 #include <fcntl.h>
