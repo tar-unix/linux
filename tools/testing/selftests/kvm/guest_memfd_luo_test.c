@@ -122,4 +122,40 @@ TEST_F(gmem_luo, preserve)
 	close(session_fd);
 }
 
+TEST_F(gmem_luo, frozen)
+{
+	size_t page_size = self->page_size;
+	char *mem;
+
+	/* Populate the first page only. */
+	mem = kvm_mmap(GMEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+		       self->gmem_fd);
+	WRITE_ONCE(mem[0], 0x5a);
+	kvm_munmap(mem, GMEM_SIZE);
+
+	ASSERT_EQ(preserve_fd(self->session_fd, self->gmem_fd, 1, NULL, 0), 0);
+
+	/* Memory can neither be allocated nor freed. */
+	EXPECT_EQ(fallocate(self->gmem_fd, FALLOC_FL_KEEP_SIZE, page_size,
+			    page_size), -1);
+	EXPECT_EQ(errno, EPERM);
+	EXPECT_EQ(fallocate(self->gmem_fd,
+			    FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, 0,
+			    page_size), -1);
+	EXPECT_EQ(errno, EPERM);
+
+	/* Allocating memory that is present changes nothing. */
+	EXPECT_EQ(fallocate(self->gmem_fd, FALLOC_FL_KEEP_SIZE, 0, page_size),
+		  0);
+
+	/* Present memory stays accessible, touching a hole raises SIGBUS. */
+	mem = kvm_mmap(GMEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+		       self->gmem_fd);
+	EXPECT_EQ(READ_ONCE(mem[0]), 0x5a);
+	WRITE_ONCE(mem[1], 0xa5);
+	EXPECT_EQ(READ_ONCE(mem[1]), (char)0xa5);
+	TEST_EXPECT_SIGBUS((void)READ_ONCE(mem[page_size]));
+	kvm_munmap(mem, GMEM_SIZE);
+}
+
 TEST_HARNESS_MAIN
