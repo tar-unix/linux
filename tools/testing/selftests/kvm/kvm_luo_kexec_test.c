@@ -216,11 +216,50 @@ static int gmem_only_check(int session_fd, u64 token)
 	return KSFT_PASS;
 }
 
+/* Preserve a VM and its guest_memfd, and bind them again after the reboot. */
+static void vm_and_gmem_preserve(int session_fd, u64 token)
+{
+	struct kvm_vm *vm;
+	int gmem_fd;
+
+	gmem_fd = create_gmem(token, &vm);
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, vm->fd, token), 0);
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, gmem_fd, token + 1),
+		       0);
+}
+
+static int vm_and_gmem_check(int session_fd, u64 token)
+{
+	u32 size = sizeof(struct kvm_guest_memfd_luo_retrieve);
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	int vm_fd, gmem_fd;
+
+	vm_fd = luo_session_retrieve_fd(session_fd, token);
+	TEST_ASSERT(vm_fd >= 0, "Retrieving the VM failed: %d", vm_fd);
+	vm = create_vm(vm_fd, &vcpu);
+
+	gmem_fd = retrieve_gmem(session_fd, token + 1, size, vm->fd);
+	TEST_ASSERT(gmem_fd >= 0, "Retrieving the guest_memfd failed: %d",
+		    gmem_fd);
+
+	/* The argument cannot be applied to a guest_memfd retrieved before. */
+	TEST_ASSERT_EQ(retrieve_gmem(session_fd, token + 1, size, vm->fd),
+		       -EBUSY);
+
+	check_gmem(vm, vcpu, gmem_fd, token);
+	close(gmem_fd);
+	kvm_vm_free(vm);
+
+	return KSFT_PASS;
+}
+
 #define SCENARIO(_name) { #_name, _name##_preserve, _name##_check }
 
 static const struct scenario scenarios[] = {
 	SCENARIO(vm_only),
 	SCENARIO(gmem_only),
+	SCENARIO(vm_and_gmem),
 };
 
 /* Every scenario uses up to two tokens, starting at its own base. */
