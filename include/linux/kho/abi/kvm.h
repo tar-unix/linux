@@ -13,12 +13,12 @@
  * follows the Live Update Orchestrator rules for adding and retiring
  * features and fields.
  *
- * %KVM_VM_LUO_FEAT_CORE covers @type and is required for every VM. In
- * addition, every VM has exactly one "kind" feature, marked required, that
- * states what kind of VM was preserved, and with that which kind specific
- * fields follow. Kinds are mutually exclusive. A kernel that does not
- * implement the kind of a preserved VM refuses to retrieve it, while VMs of
- * the kinds it implements are not affected.
+ * %KVM_VM_LUO_FEAT_CORE covers @type and @arch_state_pa and is required for
+ * every VM. In addition, every VM has exactly one "kind" feature, marked
+ * required, that states what kind of VM was preserved, and with that which
+ * kind specific fields follow. Kinds are mutually exclusive. A kernel that
+ * does not implement the kind of a preserved VM refuses to retrieve it, while
+ * VMs of the kinds it implements are not affected.
  */
 
 #ifndef _LINUX_KHO_ABI_KVM_H
@@ -30,7 +30,8 @@
 
 /**
  * enum kvm_vm_luo_feature - Feature indices for struct kvm_vm_luo_state.
- * @KVM_VM_LUO_FEAT_CORE:     Covers @type. Required for every VM.
+ * @KVM_VM_LUO_FEAT_CORE:     Covers @type and @arch_state_pa. Required for
+ *                            every VM.
  * @KVM_VM_LUO_FEAT_NON_COCO: Kind of VM that has neither private memory nor
  *                            protected guest state. No kind specific fields.
  * @KVM_VM_LUO_FEAT_MAX:      Number of defined features.
@@ -48,16 +49,21 @@ static_assert((int)KVM_VM_LUO_FEAT_MAX <= LUO_FEAT_MAX);
 
 /**
  * struct kvm_vm_luo_state - Preserved state of a KVM VM.
- * @features: Feature header.
- * @type:     Machine type, as passed to KVM_CREATE_VM, that creates a VM
- *            equivalent to the preserved one.
+ * @features:      Feature header.
+ * @type:          Machine type, as passed to KVM_CREATE_VM, that creates a VM
+ *                 equivalent to the preserved one.
+ * @arch_state_pa: Physical address of architecture-specific preserved VM
+ *                 state.
  */
 struct kvm_vm_luo_state {
 	struct luo_feature_hdr features;
 	u64 type;
+	u64 arch_state_pa;
 };
 
 static_assert(offsetof(struct kvm_vm_luo_state, type) == 128);
+static_assert(offsetof(struct kvm_vm_luo_state, arch_state_pa) == 136);
+static_assert(sizeof(struct kvm_vm_luo_state) == 144);
 
 /* The name of the live update file handler for KVM VM files. */
 #define KVM_VM_LUO_FH_NAME	"kvm-vm"

@@ -75,6 +75,30 @@ int __weak kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type)
 	return -EOPNOTSUPP;
 }
 
+int __weak kvm_arch_luo_vm_preserve(struct kvm *kvm, u64 *arch_state_pa)
+{
+	*arch_state_pa = 0;
+	return 0;
+}
+
+int __weak kvm_arch_luo_vm_freeze(struct kvm *kvm, u64 arch_state_pa)
+{
+	return 0;
+}
+
+void __weak kvm_arch_luo_vm_unpreserve(struct kvm *kvm, u64 arch_state_pa)
+{
+}
+
+int __weak kvm_arch_luo_vm_retrieve(struct kvm *kvm, u64 arch_state_pa)
+{
+	return 0;
+}
+
+void __weak kvm_arch_luo_vm_finish(struct kvm *kvm, u64 arch_state_pa)
+{
+}
+
 static int kvm_vm_luo_get_kind(const struct luo_feature_hdr *hdr)
 {
 	int i, kind = -EINVAL;
@@ -103,25 +127,33 @@ static int kvm_vm_luo_preserve(struct liveupdate_file_op_args *args)
 	};
 	struct kvm *kvm = args->file->private_data;
 	struct kvm_vm_luo_state *state;
+	int kind, r;
 	u64 type;
-	int kind;
 
 	if (kvm->vm_dead)
 		return -EIO;
-
-	scoped_guard(mutex, &kvm->lock)
-		kind = kvm_arch_luo_vm_kind(kvm, &type);
-	if (kind < 0)
-		return kind;
-	if (WARN_ON_ONCE(kind <= KVM_VM_LUO_FEAT_CORE ||
-			 kind >= KVM_VM_LUO_FEAT_MAX))
-		return -EINVAL;
-	features[kind] = LUO_FEAT_REQUIRED;
 
 	state = kho_alloc_preserve(sizeof(*state));
 	if (IS_ERR(state))
 		return PTR_ERR(state);
 
+	scoped_guard(mutex, &kvm->lock) {
+		kind = kvm_arch_luo_vm_kind(kvm, &type);
+		if (kind < 0) {
+			r = kind;
+		} else if (WARN_ON_ONCE(kind <= KVM_VM_LUO_FEAT_CORE ||
+					kind >= KVM_VM_LUO_FEAT_MAX)) {
+			r = -EINVAL;
+		} else {
+			r = kvm_arch_luo_vm_preserve(kvm, &state->arch_state_pa);
+		}
+	}
+	if (r) {
+		kho_unpreserve_free(state);
+		return r;
+	}
+
+	features[kind] = LUO_FEAT_REQUIRED;
 	luo_feature_hdr_init(&state->features, sizeof(*state), features);
 	state->type = type;
 
@@ -144,18 +176,25 @@ static int kvm_vm_luo_freeze(struct liveupdate_file_op_args *args)
 	 * preserved, e.g. when SEV is enabled on an x86 default VM. Refuse the
 	 * live update instead of restoring the VM as something it is not.
 	 */
-	scoped_guard(mutex, &kvm->lock)
+	scoped_guard(mutex, &kvm->lock) {
 		kind = kvm_arch_luo_vm_kind(kvm, &type);
-	if (kind < 0 || !luo_feature_is_req(&state->features, kind) ||
-	    type != state->type)
-		return -EOPNOTSUPP;
+		if (kind < 0 || !luo_feature_is_req(&state->features, kind) ||
+		    type != state->type)
+			return -EOPNOTSUPP;
 
-	return 0;
+		return kvm_arch_luo_vm_freeze(kvm, state->arch_state_pa);
+	}
 }
 
 static void kvm_vm_luo_unpreserve(struct liveupdate_file_op_args *args)
 {
-	kho_unpreserve_free(__va(args->serialized_data));
+	struct kvm_vm_luo_state *state = __va(args->serialized_data);
+	struct kvm *kvm = args->file->private_data;
+
+	scoped_guard(mutex, &kvm->lock)
+		kvm_arch_luo_vm_unpreserve(kvm, state->arch_state_pa);
+
+	kho_unpreserve_free(state);
 }
 
 static int kvm_vm_luo_retrieve(struct liveupdate_file_op_args *args)
@@ -167,19 +206,25 @@ static int kvm_vm_luo_retrieve(struct liveupdate_file_op_args *args)
 	int kind, r;
 	u64 type;
 
-	r = luo_feature_hdr_validate(&state->features, kvm_vm_luo_features);
-	if (r)
-		goto out;
-
 	if (state->features.size < sizeof(*state)) {
-		r = -EINVAL;
-		goto out;
+		kho_restore_free(state);
+		return -EINVAL;
+	}
+
+	r = luo_feature_hdr_validate(&state->features, kvm_vm_luo_features);
+	if (r) {
+		if (luo_feature_is_active(&state->features,
+					  KVM_VM_LUO_FEAT_CORE) &&
+		    state->arch_state_pa)
+			kvm_arch_luo_vm_finish(NULL, state->arch_state_pa);
+		kho_restore_free(state);
+		return r;
 	}
 
 	kind = kvm_vm_luo_get_kind(&state->features);
 	if (kind < 0) {
 		r = kind;
-		goto out;
+		goto out_finish_arch;
 	}
 
 	/*
@@ -201,25 +246,41 @@ static int kvm_vm_luo_retrieve(struct liveupdate_file_op_args *args)
 	if (kvm_arch_luo_vm_kind(kvm, &type) != kind ||
 	    type != state->type)
 		r = -EINVAL;
+	else
+		r = kvm_arch_luo_vm_retrieve(kvm, state->arch_state_pa);
 	mutex_unlock(&kvm->lock);
 	if (r) {
 		fput(file);
-		goto out;
+		goto out_finish_arch;
 	}
 
+	if (state->arch_state_pa)
+		kvm_arch_luo_vm_finish(kvm, state->arch_state_pa);
+	kho_restore_free(state);
 	args->file = file;
-out:
+	return 0;
+
+out_finish_arch:
+	if (state->arch_state_pa)
+		kvm_arch_luo_vm_finish(NULL, state->arch_state_pa);
 	kho_restore_free(state);
 	return r;
 }
 
 static void kvm_vm_luo_finish(struct liveupdate_file_op_args *args)
 {
+	struct kvm_vm_luo_state *state;
+
 	/* A non-retryable retrieve attempt has already freed the state. */
 	if (args->retrieve_status)
 		return;
 
-	kho_restore_free(__va(args->serialized_data));
+	state = __va(args->serialized_data);
+	if (state->features.size >= sizeof(*state) &&
+	    luo_feature_is_active(&state->features, KVM_VM_LUO_FEAT_CORE) &&
+	    state->arch_state_pa)
+		kvm_arch_luo_vm_finish(NULL, state->arch_state_pa);
+	kho_restore_free(state);
 }
 
 static struct liveupdate_file_ops kvm_vm_luo_file_ops = {
