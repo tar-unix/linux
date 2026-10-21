@@ -395,6 +395,8 @@ int luo_preserve_file(struct luo_file_set *file_set, u64 token, int fd,
 	if (err)
 		goto err_kfree;
 
+	liveupdate_test_preserve(fh, args.serialized_data);
+
 	kfree(args.arg);
 	luo_file->serialized_data = args.serialized_data;
 	luo_file->private_data = args.private_data;

@@ -126,8 +126,12 @@ void luo_flb_serialize(void);
 
 #ifdef CONFIG_LIVEUPDATE_TEST
 void liveupdate_test_register(struct liveupdate_file_handler *fh);
+void liveupdate_test_preserve(struct liveupdate_file_handler *fh,
+			      u64 serialized_data);
 #else
 static inline void liveupdate_test_register(struct liveupdate_file_handler *fh) { }
+static inline void liveupdate_test_preserve(struct liveupdate_file_handler *fh,
+					    u64 serialized_data) { }
 #endif
 
 #endif /* _LINUX_LUO_INTERNAL_H */

@@ -10,9 +10,14 @@
 #include <linux/cleanup.h>
 #include <linux/errno.h>
 #include <linux/init.h>
+#include <linux/io.h>
 #include <linux/liveupdate.h>
 #include <linux/module.h>
+#include <linux/string.h>
 #include "../../kernel/liveupdate/luo_internal.h"
+
+#undef MODULE_PARAM_PREFIX
+#define MODULE_PARAM_PREFIX "liveupdate_test."
 
 static const struct liveupdate_flb_ops test_flb_ops;
 #define DEFINE_TEST_FLB(i) {						\
@@ -136,6 +141,42 @@ void liveupdate_test_register(struct liveupdate_file_handler *fh)
 
 	pr_info("Registered %d FLBs with file handler: [%s]\n",
 		TEST_NFLBS, fh->name);
+}
+
+/*
+ * Name of a file handler. Files preserved by that handler get an unknown
+ * required feature in the feature header of their serialized state, as if
+ * they had been preserved by a newer kernel. This tests that the next kernel
+ * refuses to retrieve them.
+ */
+static char test_require_unknown_feature[LIVEUPDATE_HNDL_NAME_LENGTH];
+module_param_string(require_unknown_feature, test_require_unknown_feature,
+		    sizeof(test_require_unknown_feature), 0644);
+MODULE_PARM_DESC(require_unknown_feature,
+		 "Handler whose preserved files require an unknown feature");
+
+void liveupdate_test_preserve(struct liveupdate_file_handler *fh,
+			      u64 serialized_data)
+{
+	const unsigned int feat = LUO_FEAT_MAX - 1;
+	struct luo_feature_hdr *hdr;
+	unsigned int idx;
+	bool match;
+
+	kernel_param_lock(THIS_MODULE);
+	match = sysfs_streq(test_require_unknown_feature, fh->name);
+	kernel_param_unlock(THIS_MODULE);
+	if (!match)
+		return;
+
+	/* The serialized state of every file starts with a feature header. */
+	hdr = __va(serialized_data);
+	for (idx = 0; idx < LUO_FEAT_FLAGS_IDX(feat); idx++)
+		hdr->flags[idx] |= LUO_FEAT_EXT_MASK;
+	hdr->flags[idx] |= LUO_FEAT_ACTIVE(feat) | LUO_FEAT_REQ(feat);
+
+	pr_info("Feature %u is required by a file of handler [%s]\n",
+		feat, fh->name);
 }
 
 MODULE_LICENSE("GPL");
