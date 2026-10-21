@@ -56,6 +56,13 @@ be checked with :ref:`KVM_CHECK_EXTENSION <KVM_CHECK_EXTENSION>`.  Some
 capabilities also need to be enabled for VMs or VCPUs where their
 functionality is desired (see :ref:`cap_enable` and :ref:`cap_enable_vm`).
 
+When ``CONFIG_LIVEUPDATE`` is enabled, VM, vCPU, and ``guest_memfd`` file
+descriptors can also be preserved across a kexec-based live update using
+the Live Update Orchestrator (``/dev/liveupdate``) with the ``"kvm-vm"``,
+``"kvm-vcpu"`` (using ``struct kvm_vcpu_luo_retrieve``), and
+``"guest_memfd"`` (using ``struct kvm_guest_memfd_luo_retrieve``) file
+handlers.  See ``Documentation/virt/kvm/live-update.rst`` for details.
+
 
 2. Restrictions
 ===============
