@@ -11,6 +11,9 @@ kernel_dir=$(realpath "$test_dir/../../../..")
 workspace_dir=""
 headers_dir=""
 initrd=""
+test_binary=""
+extra_configs=()
+test_timeout=30
 KEEP_WORKSPACE=0
 
 source "$test_dir/../kselftest/ktap_helpers.sh"
@@ -18,11 +21,15 @@ source "$test_dir/../kselftest/ktap_helpers.sh"
 function get_arch_conf() {
 	local arch=$1
 	if [[ "$arch" == "arm64" ]]; then
-		QEMU_CMD="qemu-system-aarch64 -M virt -cpu max"
+		if [[ -n "$test_binary" ]]; then
+			QEMU_CMD="qemu-system-aarch64 -M virt,virtualization=on,gic-version=3 -cpu max"
+		else
+			QEMU_CMD="qemu-system-aarch64 -M virt -cpu max"
+		fi
 		KERNEL_IMAGE="Image"
 		KERNEL_CMDLINE="console=ttyAMA0"
 	elif [[ "$arch" == "x86" ]]; then
-		QEMU_CMD="qemu-system-x86_64"
+		QEMU_CMD="qemu-system-x86_64 -cpu max"
 		KERNEL_IMAGE="bzImage"
 		KERNEL_CMDLINE="console=ttyS0"
 	else
@@ -33,12 +40,17 @@ function get_arch_conf() {
 
 function usage() {
 	cat <<EOF
-$0 [-d build_dir] [-j jobs] [-t target_arch] [-T test_name] [-w workspace_dir] [-k] [-h]
+$0 [-d build_dir] [-j jobs] [-t target_arch] [-T test_name] [-b test_binary]
+   [-c config] [-x timeout] [-w workspace_dir] [-k] [-h]
 Options:
 	-d)	path to the kernel build directory (default: .luo_test_build.<arch>)
 	-j)	number of jobs for compilation
 	-t)	run test for target_arch (aarch64, x86_64)
 	-T)	test name to run (default: luo_kexec_simple)
+	-b)	run this prebuilt, statically linked test binary instead of
+		building test_name
+	-c)	additional kernel config fragment, can be given more than once
+	-x)	timeout of the test run in seconds (default: 30)
 	-w)	custom workspace directory (default: creates temp dir)
 	-k)	keep workspace directory after successful test
 	-h)	display this help
@@ -110,7 +122,9 @@ function build_kernel() {
 
 	echo "# Building kernel in: $build_dir"
 
-	cat "$arch_conf" "$common_conf" | tee "$kconfig" > "$luo_config"
+	cat "$arch_conf" "$common_conf" \
+		${extra_configs[@]+"${extra_configs[@]}"} | \
+		tee "$kconfig" > "$luo_config"
 	$make_cmd olddefconfig
 
 	# verify that kernel confiration has all necessary options
@@ -128,12 +142,16 @@ function mkinitrd() {
 	local test_name=$3
 
 	# Compile the test binary and the init process
-	"$CROSS_COMPILE"gcc -static -O2 -nostdinc -nostdlib \
-		-I "$headers_dir/include" \
-		-I "$kernel_dir/tools/include/nolibc" \
-		-I "$test_dir/lib/include" \
-		-o "$workspace_dir/test_binary" \
-		"$test_dir/$test_name.c" "$test_dir/lib/lu_utils.c"
+	if [ -n "$test_binary" ]; then
+		cp "$test_binary" "$workspace_dir/test_binary"
+	else
+		"$CROSS_COMPILE"gcc -static -O2 -nostdinc -nostdlib \
+			-I "$headers_dir/include" \
+			-I "$kernel_dir/tools/include/nolibc" \
+			-I "$test_dir/lib/include" \
+			-o "$workspace_dir/test_binary" \
+			"$test_dir/$test_name.c" "$test_dir/lib/lu_utils.c"
+	fi
 
 	"$CROSS_COMPILE"gcc -s -static -Os -nostdinc -nostdlib		\
 			-fno-asynchronous-unwind-tables -fno-ident	\
@@ -145,6 +163,7 @@ function mkinitrd() {
 	cat > "$workspace_dir/cpio_list_inner" <<EOF
 dir /dev 0755 0 0
 dir /proc 0755 0 0
+dir /sys 0755 0 0
 dir /debugfs 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 file /init $workspace_dir/init 0755 0 0
@@ -157,6 +176,7 @@ EOF
 	cat > "$workspace_dir/cpio_list" <<EOF
 dir /dev 0755 0 0
 dir /proc 0755 0 0
+dir /sys 0755 0 0
 dir /debugfs 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 file /init $workspace_dir/init 0755 0 0
@@ -178,7 +198,7 @@ function run_qemu() {
 	cmdline="$cmdline liveupdate=on panic=-1"
 
 	echo "# Serial Log: $serial"
-	timeout 30s \
+	timeout "${test_timeout}s" \
 	$qemu_cmd -m 1G -smp 2 -no-reboot -nographic -nodefaults \
 		  -accel kvm -accel hvf -accel tcg \
 		  -serial file:"$serial" \
@@ -208,12 +228,15 @@ function main() {
 	set -o errtrace
 	trap fail ERR
 
-	while getopts 'hd:j:t:T:w:k' opt; do
+	while getopts 'hd:j:t:T:b:c:x:w:k' opt; do
 		case $opt in
 		d) build_dir="$OPTARG" ;;
 		j) jobs="$OPTARG" ;;
 		t) target="$OPTARG" ;;
 		T) test_name="$OPTARG" ;;
+		b) test_binary="$(realpath -e "$OPTARG")" ;;
+		c) extra_configs+=("$(realpath -e "$OPTARG")") ;;
+		x) test_timeout="$OPTARG" ;;
 		w) workspace_arg="$OPTARG" ;;
 		k) KEEP_WORKSPACE=1 ;;
 		h) usage; exit 0 ;;
