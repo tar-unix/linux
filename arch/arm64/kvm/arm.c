@@ -19,6 +19,7 @@
 #include <linux/kvm.h>
 #include <linux/kvm_irqfd.h>
 #include <linux/irqbypass.h>
+#include <linux/kho/abi/kvm.h>
 #include <linux/sched/stat.h>
 #include <linux/psci.h>
 #include <trace/events/kvm.h>
@@ -247,6 +248,26 @@ static int kvm_arm_default_max_vcpus(void)
 {
 	return vgic_present ? kvm_vgic_get_max_vcpus() : KVM_MAX_VCPUS;
 }
+
+#ifdef CONFIG_LIVEUPDATE
+int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type)
+{
+	/*
+	 * With pKVM or CCA realms, the hypervisor or RMM owns VM state that is
+	 * not preserved yet.
+	 */
+	if (is_protected_kvm_enabled() || kvm_is_realm(kvm))
+		return -EOPNOTSUPP;
+
+	/*
+	 * The IPA size is the only parameter of the machine type. Record the
+	 * size in use rather than the requested one, which may be 0 for the
+	 * default, so that the new VM gets the same stage-2 layout.
+	 */
+	*type = KVM_VM_TYPE_ARM_IPA_SIZE(kvm_phys_shift(&kvm->arch.mmu));
+	return KVM_VM_LUO_FEAT_NON_COCO;
+}
+#endif
 
 /**
  * kvm_arch_init_vm - initializes a VM data structure
