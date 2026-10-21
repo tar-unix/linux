@@ -5574,29 +5574,19 @@ bool file_is_kvm(struct file *file)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(file_is_kvm);
 
-static int kvm_dev_ioctl_create_vm(unsigned long type)
+static struct file *kvm_create_vm_file(unsigned long type, const char *fdname)
 {
-	char fdname[ITOA_MAX_LEN + 1];
-	int r, fd;
-	struct kvm *kvm;
 	struct file *file;
-
-	fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0)
-		return fd;
-
-	snprintf(fdname, sizeof(fdname), "%d", fd);
+	struct kvm *kvm;
 
 	kvm = kvm_create_vm(type, fdname);
-	if (IS_ERR(kvm)) {
-		r = PTR_ERR(kvm);
-		goto put_fd;
-	}
+	if (IS_ERR(kvm))
+		return ERR_CAST(kvm);
 
 	file = anon_inode_getfile("kvm-vm", &kvm_vm_fops, kvm, O_RDWR);
 	if (IS_ERR(file)) {
-		r = PTR_ERR(file);
-		goto put_kvm;
+		kvm_put_kvm(kvm);
+		return file;
 	}
 
 	/*
@@ -5607,14 +5597,29 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
 	 */
 	kvm_uevent_notify_change(KVM_EVENT_CREATE_VM, kvm);
 
+	return file;
+}
+
+static int kvm_dev_ioctl_create_vm(unsigned long type)
+{
+	char fdname[ITOA_MAX_LEN + 1];
+	struct file *file;
+	int fd;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+
+	snprintf(fdname, sizeof(fdname), "%d", fd);
+
+	file = kvm_create_vm_file(type, fdname);
+	if (IS_ERR(file)) {
+		put_unused_fd(fd);
+		return PTR_ERR(file);
+	}
+
 	fd_install(fd, file);
 	return fd;
-
-put_kvm:
-	kvm_put_kvm(kvm);
-put_fd:
-	put_unused_fd(fd);
-	return r;
 }
 
 static long kvm_dev_ioctl(struct file *filp,
