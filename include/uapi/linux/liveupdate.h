@@ -46,6 +46,9 @@
 /* The maximum length of session name including null termination */
 #define LIVEUPDATE_SESSION_NAME_LENGTH 64
 
+/* The maximum length of file handler name including null termination */
+#define LIVEUPDATE_HNDL_NAME_LENGTH 48
+
 /* The /dev/liveupdate ioctl commands */
 enum {
 	LIVEUPDATE_CMD_BASE = 0x00,

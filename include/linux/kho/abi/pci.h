@@ -23,7 +23,7 @@
  * incrementing the version number in the PCI_LUO_FLB_VERSION number.
  */
 
-#define PCI_LUO_FLB_COMPATIBLE "pci"
+#define PCI_LUO_FLB_NAME "pci"
 #define PCI_LUO_FLB_VERSION 2
 
 /**

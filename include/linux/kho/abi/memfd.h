@@ -87,7 +87,7 @@ struct memfd_luo_ser {
 	struct kho_vmalloc folios;
 } __packed;
 
-/* The compatibility string for memfd file handler */
-#define MEMFD_LUO_FH_COMPATIBLE	"memfd-v2"
+/* The name string for memfd file handler */
+#define MEMFD_LUO_FH_NAME	"memfd-v2"
 
 #endif /* _LINUX_KHO_ABI_MEMFD_H */

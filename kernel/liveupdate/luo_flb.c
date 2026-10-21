@@ -178,7 +178,7 @@ static int luo_flb_retrieve_one(struct liveupdate_flb *flb)
 		return -ENODATA;
 
 	for (int i = 0; i < fh->header_ser->count; i++) {
-		if (!strcmp(fh->ser[i].name, flb->compatible)) {
+		if (!strcmp(fh->ser[i].name, flb->name)) {
 			private->incoming.data = fh->ser[i].data;
 			refcount_set(&private->incoming.count, fh->ser[i].count);
 			found = true;
@@ -337,7 +337,7 @@ static void luo_flb_unregister_one(struct liveupdate_file_handler *fh,
 
 	if (!found) {
 		pr_warn("Failed to unregister FLB '%s': not found in file handler '%s'\n",
-			flb->compatible, fh->compatible);
+			flb->name, fh->name);
 		return;
 	}
 
@@ -442,9 +442,9 @@ int liveupdate_register_flb(struct liveupdate_file_handler *fh,
 		if (luo_flb_global.count == LUO_FLB_MAX)
 			return -ENOSPC;
 
-		/* Check that compatible string is unique in global list */
+		/* Check that FLB name is unique in global list */
 		list_private_for_each_entry(gflb, &luo_flb_global.list, private.list) {
-			if (!strcmp(gflb->compatible, flb->compatible))
+			if (!strcmp(gflb->name, flb->name))
 				return -EEXIST;
 		}
 
@@ -596,9 +596,9 @@ void __init luo_flb_setup_incoming(u64 flbs_pa)
  * preserved (i.e., its reference count is greater than zero), it writes its
  * metadata into the memory region designated for Kexec Handover.
  *
- * The serialized data includes the FLB's compatibility string, its opaque
- * data handle, and the final reference count. This allows the new kernel to
- * find the appropriate handler and reconstruct the FLB's state.
+ * The serialized data includes the FLB's name string, its opaque
+ * data handle, and the final reference count. This allows the target
+ * kernel to find the appropriate FLB and reconstruct its state.
  *
  * Context: Called from liveupdate_reboot() just before kho_finalize().
  */
@@ -614,7 +614,7 @@ void luo_flb_serialize(void)
 		long count = refcount_read(&private->outgoing.count);
 
 		if (count > 0) {
-			strscpy(fh->ser[i].name, gflb->compatible,
+			strscpy(fh->ser[i].name, gflb->name,
 				sizeof(fh->ser[i].name));
 			fh->ser[i].data = private->outgoing.data;
 			fh->ser[i].count = count;

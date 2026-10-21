@@ -424,7 +424,7 @@ static struct liveupdate_flb_ops pci_liveupdate_flb_ops = {
 
 static struct liveupdate_flb pci_liveupdate_flb = {
 	.ops = &pci_liveupdate_flb_ops,
-	.compatible = PCI_LUO_FLB_COMPATIBLE,
+	.name = PCI_LUO_FLB_NAME,
 };
 
 static void pci_liveupdate_flb_put_outgoing(void)
@@ -667,13 +667,13 @@ static struct pci_flb_incoming *pci_liveupdate_flb_get_incoming(void)
 
 	/*
 	 * Live Update is enabled and there is incoming FLB data, but none of it
-	 * matches pci_liveupdate_flb.compatible.
+	 * matches pci_liveupdate_flb.name.
 	 */
 	if (ret == -ENOENT)
 		return NULL;
 
 	/*
-	 * There is incoming FLB data that matches pci_liveupdate_flb.compatible
+	 * There is incoming FLB data that matches pci_liveupdate_flb.name
 	 * but retrieve failed (pci_flb_retrieve() returned an error or LUO
 	 * failed to acquire a reference to pci_liveupdate_flb_ops.owner).
 	 */
@@ -998,7 +998,7 @@ EXPORT_SYMBOL_GPL(pci_liveupdate_is_incoming);
  */
 int pci_liveupdate_register_flb(struct liveupdate_file_handler *fh)
 {
-	pr_debug("Registering file handler \"%s\"\n", fh->compatible);
+	pr_debug("Registering file handler \"%s\"\n", fh->name);
 	return liveupdate_register_flb(fh, &pci_liveupdate_flb);
 }
 EXPORT_SYMBOL_GPL(pci_liveupdate_register_flb);
@@ -1009,7 +1009,7 @@ EXPORT_SYMBOL_GPL(pci_liveupdate_register_flb);
  */
 void pci_liveupdate_unregister_flb(struct liveupdate_file_handler *fh)
 {
-	pr_debug("Unregistering file handler \"%s\"\n", fh->compatible);
+	pr_debug("Unregistering file handler \"%s\"\n", fh->name);
 	liveupdate_unregister_flb(fh, &pci_liveupdate_flb);
 }
 EXPORT_SYMBOL_GPL(pci_liveupdate_unregister_flb);

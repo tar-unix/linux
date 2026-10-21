@@ -17,7 +17,7 @@
 static const struct liveupdate_flb_ops test_flb_ops;
 #define DEFINE_TEST_FLB(i) {						\
 	.ops = &test_flb_ops,						\
-	.compatible = LIVEUPDATE_TEST_FLB_COMPATIBLE(i),		\
+	.name = LIVEUPDATE_TEST_FLB_NAME(i),				\
 }
 
 /* Number of Test FLBs to register with every file handler */
@@ -34,7 +34,7 @@ static int test_flb_preserve(struct liveupdate_flb_op_args *argp)
 {
 	ptrdiff_t index = argp->flb - test_flbs;
 
-	pr_info("%s: preserve was triggered\n", argp->flb->compatible);
+	pr_info("%s: preserve was triggered\n", argp->flb->name);
 	argp->data = TEST_FLB_MAGIC_BASE + index;
 
 	return 0;
@@ -42,7 +42,7 @@ static int test_flb_preserve(struct liveupdate_flb_op_args *argp)
 
 static void test_flb_unpreserve(struct liveupdate_flb_op_args *argp)
 {
-	pr_info("%s: unpreserve was triggered\n", argp->flb->compatible);
+	pr_info("%s: unpreserve was triggered\n", argp->flb->name);
 }
 
 static int test_flb_retrieve(struct liveupdate_flb_op_args *argp)
@@ -52,11 +52,11 @@ static int test_flb_retrieve(struct liveupdate_flb_op_args *argp)
 
 	if (argp->data == expected_data) {
 		pr_info("%s: found flb data from the previous boot\n",
-			argp->flb->compatible);
+			argp->flb->name);
 		argp->obj = (void *)argp->data;
 	} else {
 		pr_err("%s: ERROR - incorrect data handle: %llx, expected %llx\n",
-		       argp->flb->compatible, argp->data, expected_data);
+		       argp->flb->name, argp->data, expected_data);
 		return -EINVAL;
 	}
 
@@ -69,10 +69,10 @@ static void test_flb_finish(struct liveupdate_flb_op_args *argp)
 	void *expected_obj = (void *)(TEST_FLB_MAGIC_BASE + index);
 
 	if (argp->obj == expected_obj) {
-		pr_info("%s: finish was triggered\n", argp->flb->compatible);
+		pr_info("%s: finish was triggered\n", argp->flb->name);
 	} else {
 		pr_err("%s: ERROR - finish called with invalid object\n",
-		       argp->flb->compatible);
+		       argp->flb->name);
 	}
 }
 
@@ -103,7 +103,7 @@ static void liveupdate_test_init(void)
 		err = liveupdate_flb_get_incoming(flb, &obj);
 		if (err && err != -ENODATA && err != -ENOENT) {
 			pr_err("liveupdate_flb_get_incoming for %s failed: %pe\n",
-			       flb->compatible, ERR_PTR(err));
+			       flb->name, ERR_PTR(err));
 		}
 
 		if (!err)
@@ -124,18 +124,18 @@ void liveupdate_test_register(struct liveupdate_file_handler *fh)
 		err = liveupdate_register_flb(fh, flb);
 		if (err) {
 			pr_err("Failed to register %s %pe\n",
-			       flb->compatible, ERR_PTR(err));
+			       flb->name, ERR_PTR(err));
 		}
 	}
 
 	err = liveupdate_register_flb(fh, &test_flbs[0]);
 	if (!err || err != -EEXIST) {
 		pr_err("Failed: %s should be already registered, but got err: %pe\n",
-		       test_flbs[0].compatible, ERR_PTR(err));
+		       test_flbs[0].name, ERR_PTR(err));
 	}
 
 	pr_info("Registered %d FLBs with file handler: [%s]\n",
-		TEST_NFLBS, fh->compatible);
+		TEST_NFLBS, fh->name);
 }
 
 MODULE_LICENSE("GPL");

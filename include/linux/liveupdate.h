@@ -90,10 +90,8 @@ struct liveupdate_file_ops {
 /**
  * struct liveupdate_file_handler - Represents a handler for a live-updatable file type.
  * @ops:                Callback functions
- * @compatible:         The compatibility string (e.g., "memfd-v1", "vfiofd-v1")
- *                      that uniquely identifies the file type this handler
- *                      supports. This is matched against the compatible string
- *                      associated with individual &struct file instances.
+ * @name:               Unique handler name string (e.g., "memfd-v2"), matched
+ *                      against &struct luo_file_ser.name in the target kernel.
  *
  * Modules that want to support live update for specific file types should
  * register an instance of this structure. LUO uses this registration to
@@ -102,7 +100,7 @@ struct liveupdate_file_ops {
  */
 struct liveupdate_file_handler {
 	const struct liveupdate_file_ops *ops;
-	const char compatible[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+	const char name[LIVEUPDATE_HNDL_NAME_LENGTH];
 
 	/* private: */
 
@@ -209,11 +207,9 @@ struct luo_flb_private {
 /**
  * struct liveupdate_flb - A global definition for a shared data object.
  * @ops:         Callback functions
- * @compatible:  The compatibility string (e.g., "iommu-core-v1"
- *               that uniquely identifies the FLB type this handler
- *               supports. This is matched against the compatible string
- *               associated with individual &struct liveupdate_flb
- *               instances.
+ * @name:        The FLB name string (e.g., "iommu-core-v1") that uniquely
+ *               identifies this FLB type. In the target kernel, it is
+ *               matched against the name stored in &struct luo_flb_ser.
  *
  * This struct is the "template" that a driver registers to define a shared,
  * file-lifecycle-bound object. The actual runtime state (the live object,
@@ -221,7 +217,7 @@ struct luo_flb_private {
  */
 struct liveupdate_flb {
 	const struct liveupdate_flb_ops *ops;
-	const char compatible[LIVEUPDATE_FLB_COMPAT_LENGTH];
+	const char name[LIVEUPDATE_FLB_NAME_LENGTH];
 
 	/* private: */
 	struct luo_flb_private __private private;

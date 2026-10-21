@@ -39,9 +39,9 @@
  *     Multiple blocks are linked via the `next` field in the header.
  *
  *   - struct luo_file_ser:
- *     Metadata for a single preserved file. Contains the `compatible` string to
- *     find the correct handler in the new kernel, a user-provided `token` for
- *     identification, and an opaque `data` handle for the handler to use.
+ *     Metadata for a single preserved file. Contains the handler `name` string
+ *     to find the correct handler in the new kernel, a user-provided `token`
+ *     for identification, and an opaque `data` handle for the handler to use.
  *
  *   - struct luo_flb_header_ser:
  *     Header for the FLB array. Contains the total page count of the
@@ -49,9 +49,9 @@
  *     that follow.
  *
  *   - struct luo_flb_ser:
- *     Metadata for a single preserved global object. Contains its `name`
- *     (compatible string), an opaque `data` handle, and the `count`
- *     number of files depending on it.
+ *     Metadata for a single preserved global object. Contains its FLB `name`
+ *     string, an opaque `data` handle, and the `count` number of files
+ *     depending on it.
  */
 
 #ifndef _LINUX_KHO_ABI_LUO_H
@@ -84,18 +84,16 @@ struct luo_ser {
 	u64 flbs_pa;
 } __packed;
 
-#define LIVEUPDATE_HNDL_COMPAT_LENGTH	48
-
 /**
  * struct luo_file_ser - Represents the serialized preserves files.
- * @compatible:  File handler compatible string.
+ * @name:        File handler name string.
  * @data:        Private data
  * @token:       User provided token for this file
  *
  * If this structure is modified, `LUO_ABI_COMPATIBLE` must be updated.
  */
 struct luo_file_ser {
-	char compatible[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+	char name[LIVEUPDATE_HNDL_NAME_LENGTH];
 	u64 data;
 	u64 token;
 } __packed;
@@ -134,7 +132,7 @@ struct luo_session_ser {
 } __packed;
 
 /* The max size is set so it can be reliably used during in serialization */
-#define LIVEUPDATE_FLB_COMPAT_LENGTH	48
+#define LIVEUPDATE_FLB_NAME_LENGTH	48
 
 /**
  * struct luo_flb_header_ser - Header for the serialized FLB data block.
@@ -156,7 +154,7 @@ struct luo_flb_header_ser {
 
 /**
  * struct luo_flb_ser - Represents the serialized state of a single FLB object.
- * @name:    The unique compatibility string of the FLB object, used to find the
+ * @name:    The unique name string of the FLB object, used to find the
  *           corresponding &struct liveupdate_flb handler in the new kernel.
  * @data:    The opaque u64 handle returned by the FLB's .preserve() operation
  *           in the old kernel. This handle encapsulates the entire state needed
@@ -172,14 +170,14 @@ struct luo_flb_header_ser {
  * If this structure is modified, `LUO_ABI_COMPATIBLE` must be updated.
  */
 struct luo_flb_ser {
-	char name[LIVEUPDATE_FLB_COMPAT_LENGTH];
+	char name[LIVEUPDATE_FLB_NAME_LENGTH];
 	u64 data;
 	u64 count;
 } __packed;
 
 /* Kernel Live Update Test ABI */
 #ifdef CONFIG_LIVEUPDATE_TEST
-#define LIVEUPDATE_TEST_FLB_COMPATIBLE(i)	"liveupdate-test-flb-v" #i
+#define LIVEUPDATE_TEST_FLB_NAME(i)	"liveupdate-test-flb-v" #i
 #endif
 
 #endif /* _LINUX_KHO_ABI_LUO_H */

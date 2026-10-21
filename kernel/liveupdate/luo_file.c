@@ -50,7 +50,7 @@
  *
  * 2. Freeze (Pre-Reboot): Just before the kexec, luo_file_freeze() is called.
  *    It iterates through all preserved files, calls their respective .freeze()
- *    operation, and serializes their final metadata (compatible string, token,
+ *    operation, and serializes their final metadata (handler name, token,
  *    and data handle) into a contiguous memory block for KHO.
  *
  * 3. Deserialize: After kexec, luo_file_deserialize() runs when session gets
@@ -220,7 +220,7 @@ static bool luo_token_is_used(struct luo_file_set *file_set, u64 token)
  * 1. Validates that the @token is not already in use within the file_set.
  * 2. Ensures the file_set's memory for files serialization is allocated
  *    (allocates if needed).
- * 3. Iterates through registered handlers, calling can_preserve() to find one
+ * 3. Iterates through registered handlers, calling .can_preserve() to find one
  *    compatible with the given @fd.
  * 4. Calls the handler's .preserve() operation, which saves the file's state
  *    and returns an opaque private data handle.
@@ -238,7 +238,7 @@ static bool luo_token_is_used(struct luo_file_set *file_set, u64 token)
  *         -EBUSY if the file descriptor is already preserved by another session.
  *         -EBADF if the file descriptor is invalid.
  *         -ENOSPC if the file_set is full.
- *         -ENOENT if no compatible handler is found.
+ *         -ENOENT if no compatible handler is found for the file type.
  *         -ENOMEM on memory allocation failure.
  *         Other erros might be returned by .preserve().
  */
@@ -456,9 +456,10 @@ static void __luo_file_unfreeze(struct luo_file_set *file_set,
  *    private data handle during this step.
  *
  * 2. Serializes Metadata: After a successful freeze, it copies the final file
- *    metadata—the handler's compatible string, the user token, and the final
- *    private data handle—into the pre-allocated contiguous memory buffer
- *    (file_set->files) that will be handed over to the next kernel via KHO.
+ *    metadata - the handler's name string, the user token, and the final
+ *    private data handle - into the pre-allocated contiguous memory buffer
+ *    (file_set->files) that will be handed over to the target kernel via
+ *    KHO.
  *
  * Error Handling (Rollback):
  * This function is atomic. If any handler's .freeze() operation fails, the
@@ -495,13 +496,13 @@ int luo_file_freeze(struct luo_file_set *file_set,
 		err = luo_file_freeze_one(file_set, luo_file);
 		if (err < 0) {
 			pr_warn("Freeze failed for token[%#0llx] handler[%s] err[%pe]\n",
-				luo_file->token, luo_file->fh->compatible,
+				luo_file->token, luo_file->fh->name,
 				ERR_PTR(err));
 			goto err_unfreeze;
 		}
 
-		strscpy(file_ser->compatible, luo_file->fh->compatible,
-			sizeof(file_ser->compatible));
+		strscpy(file_ser->name, luo_file->fh->name,
+			sizeof(file_ser->name));
 		file_ser->data = luo_file->serialized_data;
 		file_ser->token = luo_file->token;
 	}
@@ -747,7 +748,7 @@ static int luo_file_deserialize_one(struct luo_file_set *file_set,
 
 	down_read(&luo_register_rwlock);
 	list_private_for_each_entry(fh, &luo_file_handler_list, list) {
-		if (!strcmp(fh->compatible, ser->compatible)) {
+		if (!strcmp(fh->name, ser->name)) {
 			if (try_module_get(fh->ops->owner))
 				handler_found = true;
 			break;
@@ -756,9 +757,9 @@ static int luo_file_deserialize_one(struct luo_file_set *file_set,
 	up_read(&luo_register_rwlock);
 
 	if (!handler_found) {
-		pr_warn("No registered handler for compatible '%.*s'\n",
-			(int)sizeof(ser->compatible),
-			ser->compatible);
+		pr_warn("No registered handler for name '%.*s'\n",
+			(int)sizeof(ser->name),
+			ser->name);
 		return -ENOENT;
 	}
 
@@ -789,9 +790,9 @@ static int luo_file_deserialize_one(struct luo_file_set *file_set,
  * in-memory linked list of 'struct luo_file' instances.
  *
  * For each serialized entry, it performs the following steps:
- *   1. Reads the 'compatible' string.
+ *   1. Reads the handler 'name' string.
  *   2. Searches the global list of registered file handlers for one that
- *      matches the compatible string.
+ *      matches the handler name.
  *   3. Allocates a new 'struct luo_file'.
  *   4. Populates the new structure with the deserialized data (token, private
  *      data handle) and links it to the found handler. The 'file' pointer is
@@ -884,9 +885,9 @@ void luo_file_set_destroy(struct luo_file_set *file_set)
 /**
  * liveupdate_register_file_handler - Register a file handler with LUO.
  * @fh: Pointer to a caller-allocated &struct liveupdate_file_handler.
- * The caller must initialize this structure, including a unique
- * 'compatible' string and a valid 'fh' callbacks. This function adds the
- * handler to the global list of supported file handlers.
+ * The caller must initialize this structure, including a unique 'name'
+ * string and valid 'fh' callbacks. This function adds the handler to the
+ * global list of supported file handlers.
  *
  * Context: Typically called during module initialization for file types that
  * support live update preservation.
@@ -908,11 +909,11 @@ int liveupdate_register_file_handler(struct liveupdate_file_handler *fh)
 	}
 
 	down_write(&luo_register_rwlock);
-	/* Check for duplicate compatible strings */
+	/* Check for duplicate handler names */
 	list_private_for_each_entry(fh_iter, &luo_file_handler_list, list) {
-		if (!strcmp(fh_iter->compatible, fh->compatible)) {
-			pr_err("File handler registration failed: Compatible string '%s' already registered.\n",
-			       fh->compatible);
+		if (!strcmp(fh_iter->name, fh->name)) {
+			pr_err("File handler registration failed: Handler name '%s' already registered.\n",
+			       fh->name);
 			err = -EEXIST;
 			goto err_unlock;
 		}
