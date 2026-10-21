@@ -962,8 +962,7 @@ static int kvm_gmem_init_inode(struct inode *inode, loff_t size, u64 flags)
 	return r;
 }
 
-static struct file *kvm_gmem_create_file(struct kvm *kvm, loff_t size,
-					 u64 flags)
+struct file *kvm_gmem_create_file(struct kvm *kvm, loff_t size, u64 flags)
 {
 	static const char *name = "[kvm-gmem]";
 	struct gmem_file *f;
@@ -1061,7 +1060,19 @@ void kvm_gmem_freeze(struct file *file, bool freeze)
 	GMEM_I(inode)->frozen = freeze;
 	filemap_invalidate_unlock(inode->i_mapping);
 }
-#endif
+
+struct kvm *kvm_gmem_file_kvm(struct file *file)
+{
+	struct gmem_file *f = file->private_data;
+
+	return f->kvm;
+}
+
+u64 kvm_gmem_file_flags(struct file *file)
+{
+	return GMEM_I(file_inode(file))->flags;
+}
+#endif /* CONFIG_LIVEUPDATE */
 
 int kvm_gmem_prepare_memory_region(struct kvm *kvm, struct kvm_memory_slot *slot,
 				   unsigned int fd, uoff_t offset)

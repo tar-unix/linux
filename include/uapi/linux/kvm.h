@@ -1687,6 +1687,20 @@ struct kvm_create_guest_memfd {
 	__u64 reserved[6];
 };
 
+/**
+ * struct kvm_guest_memfd_luo_retrieve - Argument for retrieving a guest_memfd
+ *                                       after a live update.
+ * @size:  sizeof(struct kvm_guest_memfd_luo_retrieve).
+ * @vm_fd: File descriptor of the VM to bind the retrieved guest_memfd to.
+ *
+ * Passed in &liveupdate_session_retrieve_fd.arg when retrieving a guest_memfd
+ * that was preserved with the "guest_memfd" live update file handler.
+ */
+struct kvm_guest_memfd_luo_retrieve {
+	__u32 size;
+	__u32 vm_fd;
+};
+
 #define KVM_PRE_FAULT_MEMORY	_IOWR(KVMIO, 0xd5, struct kvm_pre_fault_memory)
 
 struct kvm_pre_fault_memory {
