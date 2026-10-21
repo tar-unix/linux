@@ -19,4 +19,5 @@ KVM
    locking
    vcpu-requests
    halt-polling
+   live-update
    review-checklist
