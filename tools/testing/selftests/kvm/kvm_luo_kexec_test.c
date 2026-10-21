@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (c) 2026, Google LLC.
+ *
+ * Live update of KVM VMs and guest_memfd across a kexec reboot.
+ *
+ * Stage 1 (-s 1) runs before the reboot. It preserves the objects of every
+ * scenario in a live update session and leaves a child process behind that
+ * keeps the session open until the reboot. Stage 2 (-s 2) runs after the
+ * reboot, retrieves the objects and checks them. The test can run as the test
+ * binary of tools/testing/selftests/liveupdate/vmtest.sh, which performs the
+ * reboot.
+ */
+#include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include <linux/sizes.h>
+
+#include "kvm_util.h"
+#include "test_util.h"
+#include "ucall_common.h"
+
+#include <libliveupdate.h>
+
+#define SESSION_NAME		"kvm_luo_kexec_test"
+#define STATE_SESSION_NAME	"kvm_luo_kexec_test_state"
+#define STATE_TOKEN		1
+
+#define GMEM_GPA		SZ_4G
+#define GMEM_SIZE		SZ_2M
+
+struct scenario {
+	const char *name;
+	void (*preserve)(int session_fd, u64 token);
+	/* Return KSFT_PASS or KSFT_SKIP, failures abort the test. */
+	int (*check)(int session_fd, u64 token);
+};
+
+/* Fill or check the first @size bytes of the guest_memfd with a pattern. */
+static void guest_code(u64 gpa, u64 size, u64 seed, u64 check)
+{
+	u64 *mem = (u64 *)gpa;
+	u64 i;
+
+	for (i = 0; i < size / sizeof(*mem); i++) {
+		if (check)
+			__GUEST_ASSERT(mem[i] == (seed ^ i),
+				       "mem[%lu] = 0x%lx, expected 0x%lx",
+				       i, mem[i], seed ^ i);
+		else
+			mem[i] = seed ^ i;
+	}
+
+	GUEST_DONE();
+}
+
+/* Create a VM with one vCPU, or set one up around the VM @vm_fd. */
+static struct kvm_vm *create_vm(int vm_fd, struct kvm_vcpu **vcpu)
+{
+	/* Room for the page tables that map a guest_memfd. */
+	u64 extra_pages = GMEM_SIZE / SZ_4K;
+	struct kvm_vm *vm;
+
+	if (vm_fd < 0)
+		vm = __vm_create(VM_SHAPE_DEFAULT, 1, extra_pages);
+	else
+		vm = vm_create_from_fd(vm_fd, VM_SHAPE_DEFAULT, 1, extra_pages);
+
+	*vcpu = vm_vcpu_add(vm, 0, guest_code);
+	kvm_arch_vm_finalize_vcpus(vm);
+
+	return vm;
+}
+
+static void run_guest(struct kvm_vcpu *vcpu, u64 size, u64 seed, bool check)
+{
+	struct ucall uc;
+
+	vcpu_args_set(vcpu, 4, GMEM_GPA, size, seed, (uint64_t)check);
+	vcpu_run(vcpu);
+
+	switch (get_ucall(vcpu, &uc)) {
+	case UCALL_DONE:
+		break;
+	case UCALL_ABORT:
+		REPORT_GUEST_ASSERT(uc);
+		break;
+	default:
+		TEST_FAIL("Unexpected exit: %s",
+			  exit_reason_str(vcpu->run->exit_reason));
+	}
+}
+
+/* Preserve the VM only. Its memory is not preserved. */
+static void vm_only_preserve(int session_fd, u64 token)
+{
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+
+	vm = create_vm(-1, &vcpu);
+	run_guest(vcpu, 0, 0, false);
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, vm->fd, token), 0);
+}
+
+static int vm_only_check(int session_fd, u64 token)
+{
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	int vm_fd;
+
+	/* The VM handler takes no argument, and refusing it consumes nothing. */
+	TEST_ASSERT_EQ(luo_session_retrieve_fd_arg(session_fd, token, 1),
+		       -EOPNOTSUPP);
+
+	vm_fd = luo_session_retrieve_fd(session_fd, token);
+	TEST_ASSERT(vm_fd >= 0, "Retrieving the VM failed: %d", vm_fd);
+
+	vm = create_vm(vm_fd, &vcpu);
+	run_guest(vcpu, 0, 0, false);
+	kvm_vm_free(vm);
+
+	return KSFT_PASS;
+}
+
+#define SCENARIO(_name) { #_name, _name##_preserve, _name##_check }
+
+static const struct scenario scenarios[] = {
+	SCENARIO(vm_only),
+};
+
+/* Every scenario uses up to two tokens, starting at its own base. */
+static u64 scenario_token(int i)
+{
+	return 0x100 * (i + 1);
+}
+
+static void stage1(int luo_fd)
+{
+	int session_fd, i;
+
+	create_state_file(luo_fd, STATE_SESSION_NAME, STATE_TOKEN, 2);
+
+	session_fd = luo_create_session(luo_fd, SESSION_NAME);
+	TEST_ASSERT(session_fd >= 0, "Creating the session failed: %d",
+		    session_fd);
+
+	for (i = 0; i < ARRAY_SIZE(scenarios); i++) {
+		scenarios[i].preserve(session_fd, scenario_token(i));
+		ksft_print_msg("%s: preserved\n", scenarios[i].name);
+	}
+
+	close(luo_fd);
+	daemonize_and_wait();
+}
+
+static void stage2(int luo_fd, int state_session_fd)
+{
+	int session_fd, stage, i;
+
+	restore_and_read_stage(state_session_fd, STATE_TOKEN, &stage);
+	TEST_ASSERT_EQ(stage, 2);
+
+	session_fd = luo_retrieve_session(luo_fd, SESSION_NAME);
+	TEST_ASSERT(session_fd >= 0, "Retrieving the session failed: %d",
+		    session_fd);
+
+	ksft_print_header();
+	ksft_set_plan(ARRAY_SIZE(scenarios));
+
+	for (i = 0; i < ARRAY_SIZE(scenarios); i++) {
+		if (scenarios[i].check(session_fd, scenario_token(i)) == KSFT_SKIP)
+			ksft_test_result_skip("%s\n", scenarios[i].name);
+		else
+			ksft_test_result_pass("%s\n", scenarios[i].name);
+	}
+
+	TEST_ASSERT_EQ(luo_session_finish(session_fd), 0);
+	close(session_fd);
+	TEST_ASSERT_EQ(luo_session_finish(state_session_fd), 0);
+	close(state_session_fd);
+
+	ksft_print_msg("KVM LIVE UPDATE TEST PASSED\n");
+	ksft_finished();
+}
+
+int main(int argc, char *argv[])
+{
+	return luo_test(argc, argv, STATE_SESSION_NAME, stage1, stage2);
+}
