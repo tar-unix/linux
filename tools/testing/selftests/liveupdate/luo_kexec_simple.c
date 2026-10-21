@@ -47,7 +47,7 @@ static void run_stage_1(int luo_fd)
 /* Stage 2: Executed after the kexec reboot. */
 static void run_stage_2(int luo_fd, int state_session_fd)
 {
-	int session_fd, mfd, stage;
+	int session_fd, mfd, stage, ret;
 
 	ksft_print_msg("[STAGE 2] Starting post-kexec verification...\n");
 
@@ -60,6 +60,16 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 	if (session_fd < 0)
 		fail_exit("luo_retrieve_session for '%s'", TEST_SESSION_NAME);
 
+	/*
+	 * memfd does not accept a retrieve argument. The rejected attempt must
+	 * not consume the preserved state, so the plain retrieve below still
+	 * succeeds.
+	 */
+	ret = luo_session_retrieve_fd_arg(session_fd, TEST_MEMFD_TOKEN, 1);
+	if (ret != -EOPNOTSUPP)
+		fail_exit("retrieve with arg returned %d, expected %d", ret,
+			  -EOPNOTSUPP);
+
 	ksft_print_msg("[STAGE 2] Restoring and verifying memfd (token %#x)...\n",
 		       TEST_MEMFD_TOKEN);
 	mfd = restore_and_verify_memfd(session_fd, TEST_MEMFD_TOKEN,
@@ -67,6 +77,12 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 	if (mfd < 0)
 		fail_exit("restore_and_verify_memfd for token %#x", TEST_MEMFD_TOKEN);
 	close(mfd);
+
+	/* An argument cannot be applied to an already retrieved token. */
+	ret = luo_session_retrieve_fd_arg(session_fd, TEST_MEMFD_TOKEN, 1);
+	if (ret != -EBUSY)
+		fail_exit("re-retrieve with arg returned %d, expected %d", ret,
+			  -EBUSY);
 
 	ksft_print_msg("[STAGE 2] Test data verified successfully.\n");
 	ksft_print_msg("[STAGE 2] Finalizing test session...\n");
