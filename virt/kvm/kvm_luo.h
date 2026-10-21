@@ -2,6 +2,10 @@
 #ifndef __KVM_LUO_H__
 #define __KVM_LUO_H__
 
+#include <linux/types.h>
+
+struct kvm;
+struct kvm_vcpu;
 struct module;
 
 #ifdef CONFIG_LIVEUPDATE

@@ -150,6 +150,60 @@ static_assert(offsetof(struct kvm_gmem_luo_state, size) == 128);
 /* The name of the live update file handler for guest_memfd files. */
 #define KVM_GMEM_LUO_FH_NAME	"guest_memfd"
 
+/**
+ * DOC: KVM vCPU live update ABI
+ *
+ * A vCPU preserved by the "kvm-vcpu" live update file handler is described by
+ * struct kvm_vcpu_luo_state. It starts with a struct luo_feature_hdr and
+ * follows the Live Update Orchestrator rules for adding and retiring
+ * features and fields.
+ *
+ * %KVM_VCPU_LUO_FEAT_CORE covers @vcpu_id, @reserved, and @arch_state_pa and
+ * is required for every vCPU. In addition, every vCPU has exactly one "kind"
+ * feature, marked required, that states what kind of VM the vCPU belongs to.
+ */
+
+/**
+ * enum kvm_vcpu_luo_feature - Feature indices for struct kvm_vcpu_luo_state.
+ * @KVM_VCPU_LUO_FEAT_CORE:     Covers @vcpu_id, @reserved, and @arch_state_pa.
+ *                              Required for every vCPU.
+ * @KVM_VCPU_LUO_FEAT_NON_COCO: Kind of vCPU belonging to a VM that has neither
+ *                              private memory nor protected guest state.
+ * @KVM_VCPU_LUO_FEAT_MAX:      Number of defined features.
+ *
+ * The values are ABI. New features are added before %KVM_VCPU_LUO_FEAT_MAX,
+ * and retired features keep their index.
+ */
+enum kvm_vcpu_luo_feature {
+	KVM_VCPU_LUO_FEAT_CORE = 0,
+	KVM_VCPU_LUO_FEAT_NON_COCO = 1,
+	KVM_VCPU_LUO_FEAT_MAX,
+};
+
+static_assert((int)KVM_VCPU_LUO_FEAT_MAX <= LUO_FEAT_MAX);
+
+/**
+ * struct kvm_vcpu_luo_state - Preserved state of a KVM vCPU.
+ * @features:      Feature header.
+ * @vcpu_id:       vCPU identifier as passed to KVM_CREATE_VCPU.
+ * @reserved:      Reserved for future use, must be zero.
+ * @arch_state_pa: Physical address of architecture-specific preserved vCPU
+ *                 state.
+ */
+struct kvm_vcpu_luo_state {
+	struct luo_feature_hdr features;
+	u32 vcpu_id;
+	u32 reserved;
+	u64 arch_state_pa;
+};
+
+static_assert(offsetof(struct kvm_vcpu_luo_state, vcpu_id) == 128);
+static_assert(offsetof(struct kvm_vcpu_luo_state, arch_state_pa) == 136);
+static_assert(sizeof(struct kvm_vcpu_luo_state) == 144);
+
+/* The name of the live update file handler for KVM vCPU files. */
+#define KVM_VCPU_LUO_FH_NAME	"kvm-vcpu"
+
 #ifdef CONFIG_X86
 
 #define KVM_LUO_X86_MAX_IRQ_ROUTES	1024

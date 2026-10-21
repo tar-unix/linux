@@ -1701,6 +1701,20 @@ struct kvm_guest_memfd_luo_retrieve {
 	__u32 vm_fd;
 };
 
+/**
+ * struct kvm_vcpu_luo_retrieve - Argument for retrieving a vCPU after a live
+ *                                update.
+ * @size:  sizeof(struct kvm_vcpu_luo_retrieve).
+ * @vm_fd: File descriptor of the VM to attach the retrieved vCPU to.
+ *
+ * Passed in &liveupdate_session_retrieve_fd.arg when retrieving a vCPU that
+ * was preserved with the "kvm-vcpu" live update file handler.
+ */
+struct kvm_vcpu_luo_retrieve {
+	__u32 size;
+	__u32 vm_fd;
+};
+
 #define KVM_PRE_FAULT_MEMORY	_IOWR(KVMIO, 0xd5, struct kvm_pre_fault_memory)
 
 struct kvm_pre_fault_memory {

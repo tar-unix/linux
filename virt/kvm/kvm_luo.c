@@ -28,12 +28,15 @@
  * same error; transient failures while creating the VM leave the preserved
  * state intact so retrieval can be retried.
  *
- * For now only the VM type is carried over. The VMM creates vCPUs, memory
- * slots, interrupt controllers, devices and capabilities as it does for a new
- * VM. Guest memory is preserved separately, by preserving the files that back
- * it.
+ * In addition to the VM type, architecture-specific VM state (such as
+ * in-kernel interrupt controller state, timers, and GSI routing) is carried
+ * over. vCPUs are preserved separately via the "kvm-vcpu" file handler and
+ * retrieved against the restored VM file descriptor using struct
+ * kvm_vcpu_luo_retrieve. Guest memory is preserved separately by preserving
+ * the files that back it, and the VMM re-attaches memory slots after
+ * retrieval.
  *
- * The file handler is available once KVM is loaded, on x86 together with
+ * The file handlers are available once KVM is loaded, on x86 together with
  * kvm-intel or kvm-amd. In the new kernel, these modules must be loaded before
  * /dev/liveupdate is opened for the first time, otherwise the preserved
  * sessions cannot be restored.
@@ -297,26 +300,303 @@ static struct liveupdate_file_handler kvm_vm_luo_handler = {
 	.name	= KVM_VM_LUO_FH_NAME,
 };
 
+static const u8 kvm_vcpu_luo_features[KVM_VCPU_LUO_FEAT_MAX] = {
+	[KVM_VCPU_LUO_FEAT_CORE]	= LUO_FEAT_REQUIRED,
+	[KVM_VCPU_LUO_FEAT_NON_COCO]	= LUO_FEAT_OPTIONAL,
+};
+
+static const unsigned int kvm_vcpu_luo_kinds[] = {
+	KVM_VCPU_LUO_FEAT_NON_COCO,
+};
+
+int __weak kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
+{
+	return -EOPNOTSUPP;
+}
+
+int __weak kvm_arch_luo_vcpu_freeze(struct kvm_vcpu *vcpu, u64 arch_state_pa)
+{
+	return -EOPNOTSUPP;
+}
+
+void __weak kvm_arch_luo_vcpu_unpreserve(struct kvm_vcpu *vcpu,
+					 u64 arch_state_pa)
+{
+}
+
+int __weak kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
+{
+	return -EOPNOTSUPP;
+}
+
+void __weak kvm_arch_luo_vcpu_finish(struct kvm_vcpu *vcpu, u64 arch_state_pa)
+{
+}
+
+static void kvm_luo_vcpu_load(struct kvm_vcpu *vcpu)
+{
+	if (!IS_ENABLED(CONFIG_ARM64))
+		vcpu_load(vcpu);
+}
+
+static void kvm_luo_vcpu_put(struct kvm_vcpu *vcpu)
+{
+	if (!IS_ENABLED(CONFIG_ARM64))
+		vcpu_put(vcpu);
+}
+
+static int kvm_vcpu_luo_get_kind(const struct luo_feature_hdr *hdr)
+{
+	int i, kind = -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(kvm_vcpu_luo_kinds); i++) {
+		if (!luo_feature_is_active(hdr, kvm_vcpu_luo_kinds[i]))
+			continue;
+		if (kind >= 0 ||
+		    !luo_feature_is_req(hdr, kvm_vcpu_luo_kinds[i]))
+			return -EINVAL;
+		kind = kvm_vcpu_luo_kinds[i];
+	}
+
+	return kind;
+}
+
+static bool kvm_vcpu_luo_can_preserve(struct liveupdate_file_handler *handler,
+				      struct file *file)
+{
+	return file_is_kvm_vcpu(file);
+}
+
+static int kvm_vcpu_luo_preserve(struct liveupdate_file_op_args *args)
+{
+	u8 features[KVM_VCPU_LUO_FEAT_MAX] = {
+		[KVM_VCPU_LUO_FEAT_CORE] = LUO_FEAT_REQUIRED,
+	};
+	struct kvm_vcpu *vcpu = args->file->private_data;
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_vcpu_luo_state *state;
+	int vm_kind, r;
+	u64 type;
+
+	if (kvm->vm_dead)
+		return -EIO;
+
+	scoped_guard(mutex, &kvm->lock) {
+		vm_kind = kvm_arch_luo_vm_kind(kvm, &type);
+		if (vm_kind != KVM_VM_LUO_FEAT_NON_COCO)
+			return vm_kind < 0 ? vm_kind : -EOPNOTSUPP;
+		if (!mutex_trylock(&vcpu->mutex))
+			return -EBUSY;
+	}
+
+	state = kho_alloc_preserve(sizeof(*state));
+	if (IS_ERR(state)) {
+		mutex_unlock(&vcpu->mutex);
+		return PTR_ERR(state);
+	}
+
+	kvm_luo_vcpu_load(vcpu);
+	r = kvm_arch_luo_vcpu_preserve(vcpu, &state->arch_state_pa);
+	kvm_luo_vcpu_put(vcpu);
+	mutex_unlock(&vcpu->mutex);
+	if (r) {
+		kho_unpreserve_free(state);
+		return r;
+	}
+
+	features[KVM_VCPU_LUO_FEAT_NON_COCO] = LUO_FEAT_REQUIRED;
+	luo_feature_hdr_init(&state->features, sizeof(*state), features);
+	state->vcpu_id = vcpu->vcpu_id;
+	state->reserved = 0;
+
+	args->serialized_data = __pa(state);
+	return 0;
+}
+
+static int kvm_vcpu_luo_freeze(struct liveupdate_file_op_args *args)
+{
+	struct kvm_vcpu_luo_state *state = __va(args->serialized_data);
+	struct kvm_vcpu *vcpu = args->file->private_data;
+	struct kvm *kvm = vcpu->kvm;
+	int vm_kind, r;
+	u64 type;
+
+	if (kvm->vm_dead)
+		return -EIO;
+
+	scoped_guard(mutex, &kvm->lock) {
+		vm_kind = kvm_arch_luo_vm_kind(kvm, &type);
+		if (vm_kind != KVM_VM_LUO_FEAT_NON_COCO)
+			return -EOPNOTSUPP;
+		if (!mutex_trylock(&vcpu->mutex))
+			return -EBUSY;
+	}
+
+	kvm_luo_vcpu_load(vcpu);
+	r = kvm_arch_luo_vcpu_freeze(vcpu, state->arch_state_pa);
+	kvm_luo_vcpu_put(vcpu);
+	mutex_unlock(&vcpu->mutex);
+
+	return r;
+}
+
+static void kvm_vcpu_luo_unpreserve(struct liveupdate_file_op_args *args)
+{
+	struct kvm_vcpu_luo_state *state = __va(args->serialized_data);
+	struct kvm_vcpu *vcpu = args->file->private_data;
+
+	scoped_guard(mutex, &vcpu->mutex)
+		kvm_arch_luo_vcpu_unpreserve(vcpu, state->arch_state_pa);
+	kho_unpreserve_free(state);
+}
+
+static int kvm_vcpu_luo_retrieve(struct liveupdate_file_op_args *args)
+{
+	const struct kvm_vcpu_luo_retrieve *arg = args->arg;
+	struct kvm_vcpu_luo_state *state = __va(args->serialized_data);
+	struct kvm_vcpu *vcpu;
+	struct file *file;
+	struct kvm *kvm;
+	int kind, vm_kind, r;
+	u64 type;
+
+	if (state->features.size < sizeof(*state)) {
+		kho_restore_free(state);
+		return -EINVAL;
+	}
+
+	r = luo_feature_hdr_validate(&state->features, kvm_vcpu_luo_features);
+	if (r) {
+		if (luo_feature_is_active(&state->features,
+					  KVM_VCPU_LUO_FEAT_CORE) &&
+		    state->arch_state_pa)
+			kvm_arch_luo_vcpu_finish(NULL, state->arch_state_pa);
+		kho_restore_free(state);
+		return r;
+	}
+
+	kind = kvm_vcpu_luo_get_kind(&state->features);
+	if (kind < 0 || state->vcpu_id >= KVM_MAX_VCPU_IDS ||
+	    state->reserved || !state->arch_state_pa) {
+		if (state->arch_state_pa)
+			kvm_arch_luo_vcpu_finish(NULL, state->arch_state_pa);
+		kho_restore_free(state);
+		return kind < 0 ? kind : -EINVAL;
+	}
+
+	/*
+	 * Until the vCPU is created, nothing has been consumed. Let userspace
+	 * retry with a different argument.
+	 */
+	args->retryable = true;
+
+	if (!arg)
+		return -EINVAL;
+
+	CLASS(fd, f)(arg->vm_fd);
+	if (fd_empty(f))
+		return -EBADF;
+
+	if (!file_is_kvm(fd_file(f)))
+		return -EINVAL;
+
+	kvm = fd_file(f)->private_data;
+	if (kvm->mm != current->mm || kvm->vm_dead)
+		return -EIO;
+
+	scoped_guard(mutex, &kvm->lock)
+		vm_kind = kvm_arch_luo_vm_kind(kvm, &type);
+	if (vm_kind != KVM_VM_LUO_FEAT_NON_COCO)
+		return -EINVAL;
+
+	file = kvm_create_vcpu_file(kvm, state->vcpu_id);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	args->retryable = false;
+
+	vcpu = file->private_data;
+	mutex_lock(&vcpu->mutex);
+	kvm_luo_vcpu_load(vcpu);
+	r = kvm_arch_luo_vcpu_retrieve(vcpu, state->arch_state_pa);
+	kvm_luo_vcpu_put(vcpu);
+	mutex_unlock(&vcpu->mutex);
+	if (r) {
+		kvm_vm_dead(kvm);
+		fput(file);
+		kvm_arch_luo_vcpu_finish(NULL, state->arch_state_pa);
+		kho_restore_free(state);
+		return r;
+	}
+
+	kvm_arch_luo_vcpu_finish(vcpu, state->arch_state_pa);
+	kho_restore_free(state);
+	args->file = file;
+	return 0;
+}
+
+static void kvm_vcpu_luo_finish(struct liveupdate_file_op_args *args)
+{
+	struct kvm_vcpu_luo_state *state;
+
+	/*
+	 * Retrieving has freed the state unless it was never attempted or
+	 * failed with a retryable error.
+	 */
+	if (args->retrieve_status)
+		return;
+
+	state = __va(args->serialized_data);
+	if (state->features.size >= sizeof(*state) &&
+	    luo_feature_is_active(&state->features, KVM_VCPU_LUO_FEAT_CORE) &&
+	    state->arch_state_pa)
+		kvm_arch_luo_vcpu_finish(NULL, state->arch_state_pa);
+	kho_restore_free(state);
+}
+
+static struct liveupdate_file_ops kvm_vcpu_luo_file_ops = {
+	.can_preserve	= kvm_vcpu_luo_can_preserve,
+	.preserve	= kvm_vcpu_luo_preserve,
+	.freeze		= kvm_vcpu_luo_freeze,
+	.unpreserve	= kvm_vcpu_luo_unpreserve,
+	.retrieve	= kvm_vcpu_luo_retrieve,
+	.finish		= kvm_vcpu_luo_finish,
+	.rarg		= LIVEUPDATE_ARG(struct kvm_vcpu_luo_retrieve, vm_fd),
+};
+
+static struct liveupdate_file_handler kvm_vcpu_luo_handler = {
+	.ops	= &kvm_vcpu_luo_file_ops,
+	.name	= KVM_VCPU_LUO_FH_NAME,
+};
+
 int kvm_vm_luo_init(struct module *module)
 {
 	int r;
 
 	/*
 	 * Pin the module that provides /dev/kvm, i.e. kvm-intel or kvm-amd on
-	 * x86, while a VM is preserved or waiting to be retrieved.
+	 * x86, while a VM or vCPU is preserved or waiting to be retrieved.
 	 */
 	kvm_vm_luo_file_ops.owner = module;
+	kvm_vcpu_luo_file_ops.owner = module;
 
 	r = liveupdate_register_file_handler(&kvm_vm_luo_handler);
-
-	/* Live update is disabled, nothing to do. */
 	if (r == -EOPNOTSUPP)
 		return 0;
+	if (r)
+		return r;
 
-	return r;
+	r = liveupdate_register_file_handler(&kvm_vcpu_luo_handler);
+	if (r) {
+		liveupdate_unregister_file_handler(&kvm_vm_luo_handler);
+		return r;
+	}
+
+	return 0;
 }
 
 void kvm_vm_luo_exit(void)
 {
+	liveupdate_unregister_file_handler(&kvm_vcpu_luo_handler);
 	liveupdate_unregister_file_handler(&kvm_vm_luo_handler);
 }

@@ -1683,6 +1683,13 @@ void kvm_arch_luo_vm_unpreserve(struct kvm *kvm, u64 arch_state_pa);
 int kvm_arch_luo_vm_retrieve(struct kvm *kvm, u64 arch_state_pa);
 void kvm_arch_luo_vm_finish(struct kvm *kvm, u64 arch_state_pa);
 
+/* Called with vcpu->mutex held and vcpu loaded, except unpreserve/finish. */
+int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa);
+int kvm_arch_luo_vcpu_freeze(struct kvm_vcpu *vcpu, u64 arch_state_pa);
+void kvm_arch_luo_vcpu_unpreserve(struct kvm_vcpu *vcpu, u64 arch_state_pa);
+int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa);
+void kvm_arch_luo_vcpu_finish(struct kvm_vcpu *vcpu, u64 arch_state_pa);
+
 #ifndef __KVM_HAVE_ARCH_VM_ALLOC
 /*
  * All architectures that want to use vzalloc currently also

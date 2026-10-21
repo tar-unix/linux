@@ -4201,15 +4201,20 @@ static struct file_operations kvm_vcpu_fops = {
 	KVM_COMPAT(kvm_vcpu_compat_ioctl),
 };
 
+bool file_is_kvm_vcpu(struct file *file)
+{
+	return file && file->f_op == &kvm_vcpu_fops;
+}
+
 /*
  * Allocates an inode for the vcpu.
  */
-static int create_vcpu_fd(struct kvm_vcpu *vcpu)
+static struct file *create_vcpu_file(struct kvm_vcpu *vcpu)
 {
 	char name[8 + 1 + ITOA_MAX_LEN + 1];
 
 	snprintf(name, sizeof(name), "kvm-vcpu:%d", vcpu->vcpu_id);
-	return anon_inode_getfd(name, &kvm_vcpu_fops, vcpu, O_RDWR | O_CLOEXEC);
+	return anon_inode_getfile(name, &kvm_vcpu_fops, vcpu, O_RDWR | O_CLOEXEC);
 }
 
 #ifdef __KVM_HAVE_ARCH_VCPU_DEBUGFS
@@ -4246,11 +4251,12 @@ static void kvm_create_vcpu_debugfs(struct kvm_vcpu *vcpu)
 /*
  * Creates some virtual cpus.  Good luck creating more than one.
  */
-static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, unsigned long id)
+struct file *kvm_create_vcpu_file(struct kvm *kvm, unsigned long id)
 {
-	int r;
 	struct kvm_vcpu *vcpu;
 	struct page *page;
+	struct file *file;
+	int r;
 
 	guard(mutex)(&kvm->lock);
 
@@ -4264,17 +4270,17 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, unsigned long id)
 	 */
 	BUILD_BUG_ON(KVM_MAX_VCPU_IDS > INT_MAX);
 	if (id >= KVM_MAX_VCPU_IDS)
-		return -EINVAL;
+		return ERR_PTR(-EINVAL);
 
 	if (kvm->created_vcpus >= kvm->max_vcpus)
-		return -EINVAL;
+		return ERR_PTR(-EINVAL);
 
 	if (kvm_get_vcpu_by_id(kvm, id))
-		return -EEXIST;
+		return ERR_PTR(-EEXIST);
 
 	r = kvm_arch_vcpu_precreate(kvm, id);
 	if (r)
-		return r;
+		return ERR_PTR(r);
 
 	kvm->created_vcpus++;
 
@@ -4328,9 +4334,11 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, unsigned long id)
 	 */
 	mutex_lock(&vcpu->mutex);
 	kvm_get_kvm(kvm);
-	r = create_vcpu_fd(vcpu);
-	if (r < 0)
+	file = create_vcpu_file(vcpu);
+	if (IS_ERR(file)) {
+		r = PTR_ERR(file);
 		goto kvm_put_xa_erase;
+	}
 
 	/*
 	 * Pairs with smp_rmb() in kvm_get_vcpu.  Store the vcpu
@@ -4342,7 +4350,7 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, unsigned long id)
 
 	kvm_arch_vcpu_postcreate(vcpu);
 	kvm_create_vcpu_debugfs(vcpu);
-	return r;
+	return file;
 
 kvm_put_xa_erase:
 	mutex_unlock(&vcpu->mutex);
@@ -4359,7 +4367,26 @@ vcpu_free:
 	kmem_cache_free(kvm_vcpu_cache, vcpu);
 vcpu_decrement:
 	kvm->created_vcpus--;
-	return r;
+	return ERR_PTR(r);
+}
+
+static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, unsigned long id)
+{
+	struct file *file;
+	int fd;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+
+	file = kvm_create_vcpu_file(kvm, id);
+	if (IS_ERR(file)) {
+		put_unused_fd(fd);
+		return PTR_ERR(file);
+	}
+
+	fd_install(fd, file);
+	return fd;
 }
 
 static int kvm_vcpu_ioctl_set_sigmask(struct kvm_vcpu *vcpu, sigset_t *sigset)
