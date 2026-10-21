@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include <linux/sizes.h>
 
@@ -28,7 +29,9 @@
 #define STATE_TOKEN		1
 
 #define GMEM_GPA		SZ_4G
+#define GMEM_SLOT		1
 #define GMEM_SIZE		SZ_2M
+#define GMEM_FLAGS		(GUEST_MEMFD_FLAG_MMAP | GUEST_MEMFD_FLAG_INIT_SHARED)
 
 struct scenario {
 	const char *name;
@@ -92,6 +95,65 @@ static void run_guest(struct kvm_vcpu *vcpu, u64 size, u64 seed, bool check)
 	}
 }
 
+/* Use the guest_memfd @gmem_fd as guest memory at GMEM_GPA. */
+static void map_gmem(struct kvm_vm *vm, int gmem_fd)
+{
+	vm_set_user_memory_region2(vm, GMEM_SLOT, KVM_MEM_GUEST_MEMFD, GMEM_GPA,
+				   GMEM_SIZE, NULL, gmem_fd, 0);
+	virt_map(vm, GMEM_GPA, GMEM_GPA, GMEM_SIZE / vm->page_size);
+}
+
+static int retrieve_gmem(int session_fd, u64 token, u32 size, u32 vm_fd)
+{
+	struct kvm_guest_memfd_luo_retrieve arg = {
+		.size = size,
+		.vm_fd = vm_fd,
+	};
+
+	return luo_session_retrieve_fd_arg(session_fd, token,
+					   (unsigned long)&arg);
+}
+
+/*
+ * Create a VM with a guest_memfd, let the guest fill the guest_memfd with a
+ * pattern derived from @token and return the guest_memfd. The VM is returned
+ * in @vmp, or freed if @vmp is NULL.
+ */
+static int create_gmem(u64 token, struct kvm_vm **vmp)
+{
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	int gmem_fd;
+
+	vm = create_vm(-1, &vcpu);
+	gmem_fd = vm_create_guest_memfd(vm, GMEM_SIZE, GMEM_FLAGS);
+	map_gmem(vm, gmem_fd);
+	run_guest(vcpu, GMEM_SIZE, token, false);
+
+	if (vmp)
+		*vmp = vm;
+	else
+		kvm_vm_free(vm);
+
+	return gmem_fd;
+}
+
+/* Bind the retrieved guest_memfd to @vm and check the pattern. */
+static void check_gmem(struct kvm_vm *vm, struct kvm_vcpu *vcpu, int gmem_fd,
+		       u64 token)
+{
+	u64 *mem;
+
+	map_gmem(vm, gmem_fd);
+	run_guest(vcpu, GMEM_SIZE, token, true);
+
+	mem = kvm_mmap(GMEM_SIZE, PROT_READ, MAP_SHARED, gmem_fd);
+	TEST_ASSERT_EQ(mem[0], token);
+	TEST_ASSERT_EQ(mem[GMEM_SIZE / sizeof(*mem) - 1],
+		       token ^ (GMEM_SIZE / sizeof(*mem) - 1));
+	kvm_munmap(mem, GMEM_SIZE);
+}
+
 /* Preserve the VM only. Its memory is not preserved. */
 static void vm_only_preserve(int session_fd, u64 token)
 {
@@ -123,10 +185,42 @@ static int vm_only_check(int session_fd, u64 token)
 	return KSFT_PASS;
 }
 
+/*
+ * Preserve a guest_memfd only, and close it and its VM. After the reboot, bind
+ * it to a new VM.
+ */
+static void gmem_only_preserve(int session_fd, u64 token)
+{
+	int gmem_fd = create_gmem(token, NULL);
+
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, gmem_fd, token), 0);
+	close(gmem_fd);
+}
+
+static int gmem_only_check(int session_fd, u64 token)
+{
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	int gmem_fd;
+
+	vm = create_vm(-1, &vcpu);
+	gmem_fd = retrieve_gmem(session_fd, token, sizeof(struct kvm_guest_memfd_luo_retrieve),
+				vm->fd);
+	TEST_ASSERT(gmem_fd >= 0, "Retrieving the guest_memfd failed: %d",
+		    gmem_fd);
+
+	check_gmem(vm, vcpu, gmem_fd, token);
+	close(gmem_fd);
+	kvm_vm_free(vm);
+
+	return KSFT_PASS;
+}
+
 #define SCENARIO(_name) { #_name, _name##_preserve, _name##_check }
 
 static const struct scenario scenarios[] = {
 	SCENARIO(vm_only),
+	SCENARIO(gmem_only),
 };
 
 /* Every scenario uses up to two tokens, starting at its own base. */
@@ -186,5 +280,9 @@ static void stage2(int luo_fd, int state_session_fd)
 
 int main(int argc, char *argv[])
 {
+	TEST_REQUIRE(kvm_has_cap(KVM_CAP_GUEST_MEMFD));
+	TEST_REQUIRE((kvm_check_cap(KVM_CAP_GUEST_MEMFD_FLAGS) & GMEM_FLAGS) ==
+		     GMEM_FLAGS);
+
 	return luo_test(argc, argv, STATE_SESSION_NAME, stage1, stage2);
 }
