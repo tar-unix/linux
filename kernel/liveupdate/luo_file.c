@@ -663,6 +663,7 @@ void luo_file_unfreeze(struct luo_file_set *file_set,
  *          kernel.
  * Return: 0 on success. Returns a negative errno on failure:
  *         -ENOENT if no file with the matching token is found.
+ *         -EBUSY if @arg is non-zero and the file was already retrieved.
  *         -EOPNOTSUPP if @arg is non-zero and the handler does not accept an arg.
  *         Any error code returned by the handler's .retrieve() op.
  */
@@ -694,6 +695,9 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 	}
 
 	if (luo_file->retrieve_status > 0) {
+		/* The argument cannot be applied to an already retrieved file. */
+		if (arg)
+			return -EBUSY;
 		/*
 		 * Someone is asking for this file again, so get a reference
 		 * for them.

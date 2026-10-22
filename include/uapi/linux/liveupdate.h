@@ -188,6 +188,10 @@ struct liveupdate_session_preserve_fd {
  * same error code. Early argument or target validation errors before
  * preserved state is consumed leave the token intact and may be retried.
  *
+ * Retrieving a token that was already retrieved returns a new descriptor for
+ * the same file. Doing so with a non-zero @arg fails with -EBUSY because the
+ * argument can no longer be applied.
+ *
  * Return: 0 on success, negative error code on failure (e.g., invalid token).
  */
 struct liveupdate_session_retrieve_fd {
