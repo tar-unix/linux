@@ -223,6 +223,7 @@ TEST_GEN_PROGS_arm64 += vcpu_luo_test
 
 # Live update tests that need a kexec reboot, see kvm_luo_vmtest.sh
 TEST_GEN_PROGS_EXTENDED_arm64 += kvm_luo_kexec_test
+TEST_GEN_PROGS_EXTENDED_arm64 += arm64/cca_realm_luo_test
 
 TEST_GEN_PROGS_s390 = $(TEST_GEN_PROGS_COMMON)
 TEST_GEN_PROGS_s390 += s390/memop
