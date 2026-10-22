@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <asm/kvm_emulate.h>
+#include <asm/kvm_rmi.h>
 #include <kvm/arm_arch_timer.h>
 #include <kvm/arm_vgic.h>
 
@@ -94,7 +95,7 @@ static int kvm_arm_luo_save_vm_state(struct kvm *kvm,
 	    !mtree_empty(&kvm->arch.smccc_filter))
 		return -EOPNOTSUPP;
 
-	memset(s, 0, sizeof(*s));
+	memset(s, 0, offsetof(struct kvm_luo_vm_arm64_state, cca));
 	s->version = KVM_LUO_ARM64_VM_STATE_VERSION;
 	s->psci_version = kvm->arch.psci_version;
 
@@ -176,7 +177,7 @@ int kvm_arch_luo_vm_preserve(struct kvm *kvm, u64 *arch_state_pa)
 	struct kvm_luo_vm_arm64_state *s;
 	int ret;
 
-	if (kvm_vm_is_protected(kvm) || kvm_is_realm(kvm))
+	if (kvm_vm_is_protected(kvm))
 		return -EOPNOTSUPP;
 
 	scoped_guard(mutex, &kvm->arch.config_lock) {
@@ -209,24 +210,63 @@ int kvm_arch_luo_vm_preserve(struct kvm *kvm, u64 *arch_state_pa)
 		return ret;
 	}
 
+	if (kvm_is_realm(kvm)) {
+		ret = kvm_realm_luo_preserve(kvm, &s->cca);
+		if (ret) {
+			kho_unpreserve_free(s);
+			return ret;
+		}
+	}
+
 	*arch_state_pa = __pa(s);
 	return 0;
 }
 
 int kvm_arch_luo_vm_freeze(struct kvm *kvm, u64 arch_state_pa)
 {
+	struct kvm_luo_vm_arm64_state *s;
+	int ret;
+
 	if (!arch_state_pa)
 		return 0;
 
-	return kvm_arm_luo_save_vm_state(kvm, __va(arch_state_pa));
+	s = __va(arch_state_pa);
+	ret = kvm_arm_luo_save_vm_state(kvm, s);
+	if (ret)
+		return ret;
+
+	if (kvm_is_realm(kvm))
+		return kvm_realm_luo_freeze(kvm, &s->cca);
+
+	return 0;
+}
+
+void kvm_arch_luo_vm_unfreeze(struct kvm *kvm, u64 arch_state_pa)
+{
+	struct kvm_luo_vm_arm64_state *s;
+
+	if (!arch_state_pa)
+		return;
+
+	s = __va(arch_state_pa);
+	if (s->cca.rd_phys || s->cca.pgd_phys || s->cca.rtt_pfns.total_pages ||
+	    (kvm && kvm_is_realm(kvm)))
+		kvm_realm_luo_unfreeze(kvm, &s->cca);
 }
 
 void kvm_arch_luo_vm_unpreserve(struct kvm *kvm, u64 arch_state_pa)
 {
+	struct kvm_luo_vm_arm64_state *s;
+
 	if (!arch_state_pa)
 		return;
 
-	kho_unpreserve_free(__va(arch_state_pa));
+	s = __va(arch_state_pa);
+	if (s->cca.rd_phys || s->cca.pgd_phys || s->cca.rtt_pfns.total_pages ||
+	    (kvm && kvm_is_realm(kvm)))
+		kvm_realm_luo_unpreserve(kvm, &s->cca);
+
+	kho_unpreserve_free(s);
 }
 
 int kvm_arch_luo_vm_retrieve(struct kvm *kvm, u64 arch_state_pa)
@@ -317,15 +357,52 @@ int kvm_arch_luo_vm_retrieve(struct kvm *kvm, u64 arch_state_pa)
 		}
 	}
 
+	if (kvm_is_realm(kvm)) {
+		ret = kvm_realm_luo_retrieve(kvm, &s->cca);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
 void kvm_arch_luo_vm_finish(struct kvm *kvm, u64 arch_state_pa)
 {
+	struct kvm_luo_vm_arm64_state *s;
+
 	if (!arch_state_pa)
 		return;
 
-	kho_restore_free(__va(arch_state_pa));
+	s = __va(arch_state_pa);
+	if (s->cca.rd_phys || s->cca.pgd_phys || s->cca.rtt_pfns.total_pages ||
+	    (kvm && kvm_is_realm(kvm)))
+		kvm_realm_luo_finish(kvm, &s->cca);
+
+	kho_restore_free(s);
+}
+
+int kvm_arch_gmem_luo_get_vm_id(struct kvm *kvm, u64 *vm_id)
+{
+	if (!kvm_is_realm(kvm) ||
+	    kvm_realm_state(kvm) != REALM_STATE_ACTIVE ||
+	    !READ_ONCE(kvm->arch.realm.luo_preserved) ||
+	    !kvm->arch.realm.rd)
+		return -EOPNOTSUPP;
+
+	*vm_id = virt_to_phys(kvm->arch.realm.rd) | KVM_VM_LUO_FEAT_ARM_CCA;
+	return 0;
+}
+
+bool kvm_arch_gmem_luo_validate_vm_id(struct kvm *kvm, u64 vm_id)
+{
+	if (!kvm_is_realm(kvm) ||
+	    kvm_realm_state(kvm) != REALM_STATE_ACTIVE ||
+	    !kvm->arch.realm.luo_retrieved ||
+	    !kvm->arch.realm.rd)
+		return false;
+
+	return (virt_to_phys(kvm->arch.realm.rd) |
+		KVM_VM_LUO_FEAT_ARM_CCA) == vm_id;
 }
 
 static int kvm_arm_luo_save_vcpu_state(struct kvm_vcpu *vcpu,

@@ -95,9 +95,11 @@ static inline long rmi_rtt_data_unmap(unsigned long rd,
 
 	ret = rmi_sro_execute(&regs);
 
+	if ((ret == RMI_SUCCESS || RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) &&
+	    out_top)
+		*out_top = regs.a1;
+
 	if (ret == RMI_SUCCESS) {
-		if (out_top)
-			*out_top = regs.a1;
 		if (out_range)
 			*out_range = regs.a2;
 		if (out_count)
@@ -301,12 +303,11 @@ static inline long rmi_rtt_destroy(unsigned long rd,
 	};
 	long ret = rmi_sro_execute(&regs);
 
-	if (ret == RMI_SUCCESS) {
-		if (out_rtt)
-			*out_rtt = regs.a1;
-		if (out_top)
-			*out_top = regs.a2;
-	}
+	if (ret == RMI_SUCCESS && out_rtt)
+		*out_rtt = regs.a1;
+	if ((ret == RMI_SUCCESS || RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) &&
+	    out_top)
+		*out_top = regs.a2;
 
 	return ret;
 }
@@ -450,9 +451,11 @@ static inline long rmi_rtt_unprot_unmap(unsigned long rd,
 	};
 	long ret = rmi_sro_execute(&regs);
 
+	if ((ret == RMI_SUCCESS || RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) &&
+	    out_top)
+		*out_top = regs.a1;
+
 	if (ret == RMI_SUCCESS) {
-		if (out_top)
-			*out_top = regs.a1;
 		if (out_range)
 			*out_range = regs.a2;
 		if (out_count)

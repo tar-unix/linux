@@ -253,10 +253,9 @@ static int kvm_arm_default_max_vcpus(void)
 int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type)
 {
 	/*
-	 * With pKVM or CCA realms, the hypervisor or RMM owns VM state that is
-	 * not preserved yet.
+	 * With pKVM, the hypervisor owns VM state that is not preserved yet.
 	 */
-	if (is_protected_kvm_enabled() || kvm_is_realm(kvm))
+	if (is_protected_kvm_enabled())
 		return -EOPNOTSUPP;
 
 	/*
@@ -265,6 +264,10 @@ int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type)
 	 * default, so that the new VM gets the same stage-2 layout.
 	 */
 	*type = KVM_VM_TYPE_ARM_IPA_SIZE(kvm_phys_shift(&kvm->arch.mmu));
+	if (kvm_is_realm(kvm)) {
+		*type |= KVM_VM_TYPE_ARM_REALM;
+		return KVM_VM_LUO_FEAT_ARM_CCA;
+	}
 	return KVM_VM_LUO_FEAT_NON_COCO;
 }
 #endif

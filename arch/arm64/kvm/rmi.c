@@ -4,7 +4,12 @@
  */
 
 #include <uapi/linux/psci.h>
+#include <linux/cleanup.h>
+#include <linux/kexec_handover.h>
+#include <linux/kho/abi/kvm.h>
 #include <linux/kvm_host.h>
+#include <linux/vmalloc.h>
+#include <linux/xarray.h>
 
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_hyp.h>
@@ -93,12 +98,137 @@ static unsigned long rmi_range_entry_size(int rmi_size)
 	return kvm_granule_size(KVM_PGTABLE_LAST_LEVEL - rmi_size);
 }
 
-static int undelegate_range_desc(unsigned long desc)
+#ifdef CONFIG_LIVEUPDATE
+static DEFINE_MUTEX(realm_luo_deferred_lock);
+/*
+ * Linear-map SRO used under realm_luo_deferred_lock when tearing down state
+ * left by the previous kernel and kzalloc() fails. Allocated at boot.
+ */
+static struct rmi_sro_state *realm_luo_fallback_sro;
+static DEFINE_XARRAY(realm_luo_reclaim_pages);
+
+#define REALM_LUO_DATA_DELEGATED	BIT(0)
+#define REALM_LUO_DATA_RES_INC		BIT(1)
+
+static void realm_luo_update_data(struct xarray *xa, unsigned long pfn,
+				  long delta, unsigned long set,
+				  unsigned long clr)
+{
+	void *old = xa_load(xa, pfn);
+	unsigned long val = xa_is_value(old) ? xa_to_value(old) : 0;
+
+	val = ((val + delta) | set) & ~clr;
+	if (old || val)
+		__xa_store(xa, pfn, val ? xa_mk_value(val) : NULL, 0);
+}
+
+static void realm_luo_track_delegated_range(struct realm *realm,
+					    unsigned long addr,
+					    unsigned long size)
+{
+	struct xarray *xa = &realm->luo_data_pages;
+	unsigned long pfn = PHYS_PFN(addr);
+	unsigned long end_pfn = PHYS_PFN(addr + size);
+
+	xa_lock(xa);
+	for (; pfn < end_pfn; pfn++)
+		realm_luo_update_data(xa, pfn, 0, REALM_LUO_DATA_DELEGATED, 0);
+	xa_unlock(xa);
+}
+
+static void realm_luo_forget_delegated_range(struct realm *realm,
+					     unsigned long addr,
+					     unsigned long size)
+{
+	struct xarray *xa = &realm->luo_data_pages;
+	unsigned long pfn = PHYS_PFN(addr);
+	unsigned long end_pfn = pfn + PHYS_PFN(size);
+
+	xa_lock(xa);
+	for (; pfn < end_pfn; pfn++)
+		realm_luo_update_data(xa, pfn, 0, 0, REALM_LUO_DATA_DELEGATED);
+	xa_unlock(xa);
+}
+
+int kvm_realm_luo_reserve_data(struct kvm *kvm, kvm_pfn_t pfn)
+{
+	XA_STATE(xas, &kvm->arch.realm.luo_data_pages, pfn);
+	unsigned long val;
+	void *old;
+
+	do {
+		xas_lock(&xas);
+		old = xas_load(&xas);
+		val = xa_is_value(old) ? xa_to_value(old) : 0;
+		xas_store(&xas, xa_mk_value(val + REALM_LUO_DATA_RES_INC));
+		xas_unlock(&xas);
+	} while (xas_nomem(&xas, GFP_KERNEL_ACCOUNT));
+
+	return xas_error(&xas);
+}
+
+void kvm_realm_luo_release_data(struct kvm *kvm, kvm_pfn_t pfn)
+{
+	struct xarray *xa = &kvm->arch.realm.luo_data_pages;
+
+	xa_lock(xa);
+	realm_luo_update_data(xa, pfn, -REALM_LUO_DATA_RES_INC, 0, 0);
+	xa_unlock(xa);
+}
+
+static void realm_luo_release_reclaimed_range(unsigned long addr,
+					      unsigned long size)
+{
+	unsigned long pfn, end_pfn;
+
+	if (likely(xa_empty(&realm_luo_reclaim_pages)))
+		return;
+
+	pfn = PHYS_PFN(addr);
+	end_pfn = PHYS_PFN(addr + size);
+
+	for (; pfn < end_pfn; pfn++) {
+		void *entry = xa_erase_irq(&realm_luo_reclaim_pages, pfn);
+
+		if (entry && !xa_is_value(entry))
+			put_page(entry);
+	}
+}
+#else
+static inline void realm_luo_track_delegated_range(struct realm *realm,
+						   unsigned long addr,
+						   unsigned long size)
+{
+}
+
+static inline void realm_luo_forget_delegated_range(struct realm *realm,
+						    unsigned long addr,
+						    unsigned long size)
+{
+}
+
+int kvm_realm_luo_reserve_data(struct kvm *kvm, kvm_pfn_t pfn)
+{
+	return 0;
+}
+
+void kvm_realm_luo_release_data(struct kvm *kvm, kvm_pfn_t pfn)
+{
+}
+
+static inline void realm_luo_release_reclaimed_range(unsigned long addr,
+						     unsigned long size)
+{
+}
+#endif
+
+static int undelegate_range_desc(struct realm *realm, unsigned long desc)
 {
 	unsigned long size = rmi_range_entry_size(RMI_ADDR_RANGE_SIZE(desc));
 	unsigned long count = RMI_ADDR_RANGE_COUNT(desc);
 	unsigned long addr = RMI_ADDR_RANGE_ADDR(desc);
 	unsigned long state = RMI_ADDR_RANGE_STATE(desc);
+	int ret;
 
 	if (state == RMI_OP_MEM_UNDELEGATED)
 		return 0;
@@ -106,7 +236,30 @@ static int undelegate_range_desc(unsigned long desc)
 	if (size * count == 0)
 		return 0;
 
-	return rmi_undelegate_range(addr, size * count);
+	ret = rmi_undelegate_range(addr, size * count);
+	if (!ret) {
+		realm_luo_forget_delegated_range(realm, addr, size * count);
+		realm_luo_release_reclaimed_range(addr, size * count);
+	}
+
+	return ret;
+}
+
+static long realm_rtt_data_unmap_and_undelegate(struct realm *realm,
+						unsigned long addr,
+						unsigned long end,
+						unsigned long flags,
+						unsigned long *next_addr)
+{
+	unsigned long out_range;
+	long ret;
+
+	ret = rmi_rtt_data_unmap(virt_to_phys(realm->rd), addr, end, flags, 0,
+				 next_addr, &out_range, NULL);
+	if (!ret && undelegate_range_desc(realm, out_range))
+		ret = -ENXIO;
+
+	return ret;
 }
 
 static phys_addr_t alloc_delegated_granule(struct kvm_mmu_memory_cache *mc)
@@ -129,6 +282,7 @@ static phys_addr_t alloc_delegated_granule(struct kvm_mmu_memory_cache *mc)
 		free_page((unsigned long)virt);
 		return PHYS_ADDR_MAX;
 	}
+	INIT_LIST_HEAD(&virt_to_page(virt)->lru);
 
 	return phys;
 }
@@ -145,6 +299,15 @@ static phys_addr_t alloc_rtt(struct kvm_mmu_memory_cache *mc)
 
 static void free_rtt(phys_addr_t phys)
 {
+#ifdef CONFIG_LIVEUPDATE
+	if (!page_ref_count(phys_to_page(phys))) {
+		if (kho_restore_pages(phys, 1))
+			free_delegated_page(phys);
+		else
+			WARN_ON(rmi_undelegate_page(phys));
+		return;
+	}
+#endif
 	if (free_delegated_page(phys))
 		return;
 
@@ -167,8 +330,27 @@ static long realm_rtt_create(struct realm *realm,
 			     int level,
 			     phys_addr_t phys)
 {
+	struct page *rtt_page = phys_to_page(phys);
+	unsigned long flags;
+	long ret;
+
 	addr = ALIGN_DOWN(addr, rmi_rtt_level_mapsize(level - 1));
-	return rmi_rtt_create(virt_to_phys(realm->rd), phys, addr, level);
+	spin_lock_irqsave(&realm->rtt_lock, flags);
+	list_add_tail(&rtt_page->lru, &realm->rtt_list);
+	realm->nr_rtt_pages++;
+	spin_unlock_irqrestore(&realm->rtt_lock, flags);
+
+	ret = rmi_rtt_create(virt_to_phys(realm->rd), phys, addr, level);
+	if (ret) {
+		spin_lock_irqsave(&realm->rtt_lock, flags);
+		if (!list_empty(&rtt_page->lru)) {
+			list_del_init(&rtt_page->lru);
+			realm->nr_rtt_pages--;
+		}
+		spin_unlock_irqrestore(&realm->rtt_lock, flags);
+	}
+
+	return ret;
 }
 
 static long realm_rtt_fold(struct realm *realm,
@@ -181,6 +363,17 @@ static long realm_rtt_fold(struct realm *realm,
 
 	addr = ALIGN_DOWN(addr, rmi_rtt_level_mapsize(level - 1));
 	ret = rmi_rtt_fold(virt_to_phys(realm->rd), addr, level, &out_rtt);
+	if (!ret) {
+		struct page *rtt_page = phys_to_page(out_rtt);
+		unsigned long flags;
+
+		spin_lock_irqsave(&realm->rtt_lock, flags);
+		if (!list_empty(&rtt_page->lru)) {
+			list_del_init(&rtt_page->lru);
+			realm->nr_rtt_pages--;
+		}
+		spin_unlock_irqrestore(&realm->rtt_lock, flags);
+	}
 
 	if (rtt_granule)
 		*rtt_granule = out_rtt;
@@ -205,6 +398,17 @@ static long realm_rtt_destroy(struct realm *realm, unsigned long addr,
 
 	ret = rmi_rtt_destroy(virt_to_phys(realm->rd), addr, level,
 			      &out_rtt, next_addr);
+	if (!ret) {
+		struct page *rtt_page = phys_to_page(out_rtt);
+		unsigned long flags;
+
+		spin_lock_irqsave(&realm->rtt_lock, flags);
+		if (!list_empty(&rtt_page->lru)) {
+			list_del_init(&rtt_page->lru);
+			realm->nr_rtt_pages--;
+		}
+		spin_unlock_irqrestore(&realm->rtt_lock, flags);
+	}
 
 	*rtt_granule = out_rtt;
 
@@ -465,6 +669,7 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 	for (addr = start; addr < end; addr = next_addr) {
 		long ret;
 
+		next_addr = addr;
 		ret = rmi_rtt_unprot_unmap(rd, addr, end, RMI_ADDR_TYPE_NONE,
 					   0, &next_addr, NULL, NULL);
 		if (WARN_ON(ret < 0))
@@ -476,6 +681,9 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 		case RMI_ERROR_RTT: {
 			int err_level = RMI_RETURN_INDEX(ret);
 			int level = find_map_level(realm, addr, end);
+
+			if (next_addr > addr)
+				break;
 
 			if (err_level >= level) {
 				/* Nothing present, so skip */
@@ -496,9 +704,15 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 			return;
 		}
 
-		if (may_block)
+		if (may_block) {
 			cond_resched_rwlock_write(&kvm->mmu_lock);
+			if (READ_ONCE(realm->luo_frozen))
+				return;
+		}
 	}
+
+	if (READ_ONCE(realm->luo_frozen))
+		return;
 
 	realm_fold_rtt_level(realm, get_start_level(realm) + 1,
 			     start, end);
@@ -622,23 +836,21 @@ free_rd:
 }
 
 static void realm_unmap_private_range(struct kvm *kvm,
+				      struct realm *realm,
 				      unsigned long start,
 				      unsigned long end,
 				      bool may_block)
 {
-	struct realm *realm = &kvm->arch.realm;
-	unsigned long rd = virt_to_phys(realm->rd);
 	unsigned long next_addr, addr;
 	long ret;
 
 	for (addr = start; addr < end; addr = next_addr) {
-		unsigned long out_range;
 		unsigned long flags = RMI_ADDR_TYPE_SINGLE;
 		/* TODO: Optimise using RMI_ADDR_TYPE_LIST */
 
 retry:
-		ret = rmi_rtt_data_unmap(rd, addr, end, flags, 0,
-					 &next_addr, &out_range, NULL);
+		ret = realm_rtt_data_unmap_and_undelegate(realm, addr, end, flags,
+							  &next_addr);
 		if (WARN_ON(ret < 0))
 			return;
 
@@ -662,13 +874,15 @@ retry:
 			continue;
 		}
 
-		ret = undelegate_range_desc(out_range);
-		if (WARN_ON(ret))
-			break;
-
-		if (may_block)
+		if (may_block) {
 			cond_resched_rwlock_write(&kvm->mmu_lock);
+			if (READ_ONCE(realm->luo_frozen))
+				return;
+		}
 	}
+
+	if (READ_ONCE(realm->luo_frozen))
+		return;
 
 	realm_fold_rtt_level(realm, get_start_level(realm) + 1,
 			     start, end);
@@ -681,14 +895,16 @@ void kvm_realm_unmap_range(struct kvm *kvm, unsigned long start,
 	unsigned long end = start + size;
 	struct realm *realm = &kvm->arch.realm;
 
-	if (!kvm_realm_is_created(kvm))
+	if (!kvm_realm_is_created(kvm) || READ_ONCE(realm->luo_frozen))
 		return;
 
 	end = min(BIT(realm->ia_bits - 1), end);
 
 	realm_unmap_shared_range(kvm, start, end, may_block);
+	if (READ_ONCE(realm->luo_frozen))
+		return;
 	if (unmap_private)
-		realm_unmap_private_range(kvm, start, end, may_block);
+		realm_unmap_private_range(kvm, realm, start, end, may_block);
 }
 
 static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
@@ -706,8 +922,14 @@ static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
 	dst_phys = __pfn_to_phys(dst_pfn);
 	src_phys = __pfn_to_phys(src_pfn);
 
-	if (rmi_delegate_page(dst_phys))
+	ret = kvm_realm_luo_reserve_data(kvm, dst_pfn);
+	if (ret)
+		return ret;
+
+	if (rmi_delegate_page(dst_phys)) {
+		kvm_realm_luo_release_data(kvm, dst_pfn);
 		return -ENXIO;
+	}
 
 retry:
 	ret = rmi_rtt_data_map_init(rd, dst_phys, ipa, src_phys, flags);
@@ -723,10 +945,12 @@ retry:
 			goto retry;
 	}
 
-	if (ret && WARN_ON(rmi_undelegate_page(dst_phys))) {
+	if (!ret)
+		realm_luo_track_delegated_range(realm, dst_phys, PAGE_SIZE);
+	else if (WARN_ON(rmi_undelegate_page(dst_phys)))
 		/* Leak the page if the undelegate fails */
 		get_page(pfn_to_page(dst_pfn));
-	}
+	kvm_realm_luo_release_data(kvm, dst_pfn);
 
 	return ret <= 0 ? ret : -ENXIO;
 }
@@ -832,6 +1056,8 @@ static int realm_map_protected(struct kvm *kvm,
 		if (WARN_ON(ret))
 			goto err_undelegate;
 
+		/* Slots were reserved by kvm_realm_luo_reserve_data() */
+		realm_luo_track_delegated_range(realm, phys, out_top - ipa);
 		phys += out_top - ipa;
 		ipa = out_top;
 	}
@@ -839,7 +1065,7 @@ static int realm_map_protected(struct kvm *kvm,
 	return 0;
 
 err_undelegate:
-	realm_unmap_private_range(kvm, base_ipa, ipa, true);
+	realm_unmap_private_range(kvm, realm, base_ipa, ipa, true);
 	if (WARN_ON(rmi_undelegate_range(base_phys, map_size))) {
 		/* Page can't be returned to NS world so is lost */
 		get_page(phys_to_page(base_phys));
@@ -907,6 +1133,8 @@ static int realm_map_non_secure(struct kvm *kvm,
 			 */
 			if (level >= req_level) {
 				realm_unmap_shared_range(kvm, ipa, ipa_top, true);
+				if (READ_ONCE(realm->luo_frozen))
+					return -EBUSY;
 				continue;
 			}
 
@@ -938,6 +1166,9 @@ int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 		  struct kvm_mmu_memory_cache *memcache)
 {
 	struct realm *realm = &kvm->arch.realm;
+
+	if (READ_ONCE(realm->luo_frozen))
+		return -EBUSY;
 
 	ipa = ALIGN_DOWN(ipa, map_size);
 	if (!kvm_realm_is_private_address(realm, ipa)) {
@@ -1073,10 +1304,16 @@ static int realm_set_ipa_state(struct kvm_vcpu *vcpu,
 			       unsigned long *top_ipa)
 {
 	struct kvm *kvm = vcpu->kvm;
-	int ret = ripas_change(kvm, vcpu, start, end, RIPAS_SET, top_ipa);
+	int ret;
+
+	if (READ_ONCE(kvm->arch.realm.luo_frozen))
+		return -EBUSY;
+
+	ret = ripas_change(kvm, vcpu, start, end, RIPAS_SET, top_ipa);
 
 	if (!ret && ripas == RMI_EMPTY && *top_ipa != start)
-		realm_unmap_private_range(kvm, start, *top_ipa, false);
+		realm_unmap_private_range(kvm, &kvm->arch.realm, start,
+					  *top_ipa, false);
 
 	return ret;
 }
@@ -1205,6 +1442,12 @@ static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
 				break;
 			base = top_ipa;
 			continue;
+		}
+
+		if (ret == -EBUSY) {
+			rec->run->exit.ripas_base = base;
+			kvm_make_request(KVM_REQ_RMI, vcpu);
+			return -EBUSY;
 		}
 
 		if (WARN_RATELIMIT(ret,
@@ -1424,18 +1667,19 @@ int kvm_activate_realm(struct kvm *kvm)
 	unsigned long i;
 	int ret;
 
-	if (kvm_realm_state(kvm) >= REALM_STATE_ACTIVE)
-		return 0;
-
 	if (!irqchip_in_kernel(kvm)) {
 		/* Userspace irqchip not yet supported with realms */
 		return -EOPNOTSUPP;
 	}
 
 	guard(mutex)(&kvm->arch.config_lock);
-	/* Check again with the lock held */
-	if (kvm_realm_state(kvm) >= REALM_STATE_ACTIVE)
+	if (kvm_realm_state(kvm) >= REALM_STATE_ACTIVE) {
+		kvm_for_each_vcpu(i, vcpu, kvm) {
+			if (!vcpu->arch.rec.run)
+				return -EINVAL;
+		}
 		return 0;
+	}
 
 	ret = realm_ensure_created(kvm);
 	if (ret)
@@ -1462,6 +1706,229 @@ int kvm_activate_realm(struct kvm *kvm)
 	return 0;
 }
 
+#ifdef CONFIG_LIVEUPDATE
+struct realm_luo_deferred {
+	struct list_head node;
+	phys_addr_t rd_phys;
+	phys_addr_t pgd_phys;
+	size_t pgd_size;
+	bool accounted;
+};
+
+static LIST_HEAD(realm_luo_deferred_list);
+
+static bool realm_luo_defer_teardown(phys_addr_t rd_phys, phys_addr_t pgd_phys,
+				     size_t pgd_size, bool accounted)
+{
+	struct realm_luo_deferred *def;
+
+	def = kzalloc_obj(*def);
+	if (!def)
+		return false;
+
+	def->rd_phys = rd_phys;
+	def->pgd_phys = pgd_phys;
+	def->pgd_size = pgd_size;
+	def->accounted = accounted;
+
+	guard(mutex)(&realm_luo_deferred_lock);
+	list_add_tail(&def->node, &realm_luo_deferred_list);
+	return true;
+}
+
+static void realm_luo_drain_deferred(void)
+{
+	struct rmi_sro_state *dyn_sro __free(kfree) = kzalloc_obj(*dyn_sro);
+	struct realm_luo_deferred *def, *tmp;
+	struct rmi_sro_state *sro;
+
+	guard(mutex)(&realm_luo_deferred_lock);
+	if (list_empty(&realm_luo_deferred_list))
+		return;
+
+	sro = dyn_sro ?: realm_luo_fallback_sro;
+	if (!sro)
+		return;
+	if (!dyn_sro)
+		memset(sro, 0, sizeof(*sro));
+
+	list_for_each_entry_safe(def, tmp, &realm_luo_deferred_list, node) {
+		if (rmi_realm_destroy(def->rd_phys, sro))
+			continue;
+
+		free_delegated_page(def->rd_phys);
+		if (def->pgd_phys &&
+		    !WARN_ON(rmi_undelegate_range(def->pgd_phys, def->pgd_size))) {
+			void *pgd_va = phys_to_virt(def->pgd_phys);
+
+			if (def->accounted)
+				kvm_account_pgtable_pages(pgd_va,
+							  -(def->pgd_size >> PAGE_SHIFT));
+			free_pages_exact(pgd_va, def->pgd_size);
+		}
+		list_del(&def->node);
+		kfree(def);
+	}
+}
+
+#define REALM_LUO_SUBTREE_NAME	"kvm-arm-cca"
+#define REALM_LUO_PFN_DATA	BIT_ULL(63)
+#define REALM_LUO_PFN_MASK	(~REALM_LUO_PFN_DATA)
+
+struct realm_luo_cca_dir {
+	struct kho_vmalloc entries[255];
+	u64 reserved[2];
+};
+
+static struct realm_luo_cca_dir *realm_luo_dir;
+
+static int realm_luo_dir_register(const struct kho_vmalloc *vm)
+{
+	unsigned int i;
+	int ret;
+
+	if (!vm || !vm->first.phys || !vm->total_pages)
+		return 0;
+
+	guard(mutex)(&realm_luo_deferred_lock);
+	if (!realm_luo_dir) {
+		struct realm_luo_cca_dir *dir;
+
+		BUILD_BUG_ON(sizeof(*dir) > PAGE_SIZE);
+		dir = kho_alloc_preserve(PAGE_SIZE);
+		if (IS_ERR(dir))
+			return PTR_ERR(dir);
+		ret = kho_add_subtree(REALM_LUO_SUBTREE_NAME, dir, PAGE_SIZE);
+		if (ret) {
+			kho_unpreserve_free(dir);
+			return ret;
+		}
+		realm_luo_dir = dir;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(realm_luo_dir->entries); i++) {
+		if (!realm_luo_dir->entries[i].first.phys ||
+		    realm_luo_dir->entries[i].first.phys == vm->first.phys) {
+			realm_luo_dir->entries[i] = *vm;
+			return 0;
+		}
+	}
+
+	return -ENOSPC;
+}
+
+static void realm_luo_dir_unregister(const struct kho_vmalloc *vm)
+{
+	bool any = false;
+	unsigned int i;
+
+	if (!vm || !vm->first.phys)
+		return;
+
+	guard(mutex)(&realm_luo_deferred_lock);
+	if (!realm_luo_dir)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(realm_luo_dir->entries); i++) {
+		if (realm_luo_dir->entries[i].first.phys == vm->first.phys)
+			memset(&realm_luo_dir->entries[i], 0,
+			       sizeof(realm_luo_dir->entries[i]));
+		else if (realm_luo_dir->entries[i].first.phys)
+			any = true;
+	}
+
+	if (!any) {
+		kho_remove_subtree(realm_luo_dir);
+		kho_unpreserve_free(realm_luo_dir);
+		realm_luo_dir = NULL;
+	}
+}
+
+static int __init realm_luo_init_reclaim_pages(void)
+{
+	struct realm_luo_cca_dir *dir;
+	phys_addr_t dir_phys = 0;
+	size_t dir_size = 0;
+	unsigned int i;
+
+	if (!is_kho_boot())
+		return 0;
+
+	realm_luo_fallback_sro = kzalloc_obj(*realm_luo_fallback_sro);
+
+	if (kho_retrieve_subtree(REALM_LUO_SUBTREE_NAME, &dir_phys, &dir_size) ||
+	    !dir_phys || dir_size < sizeof(*dir))
+		return 0;
+
+	dir = phys_to_virt(dir_phys);
+	for (i = 0; i < ARRAY_SIZE(dir->entries); i++) {
+		const struct kho_vmalloc *vm = &dir->entries[i];
+		u32 entries_per_blk = (PAGE_SIZE / sizeof(u64)) << vm->order;
+		struct kho_vmalloc_chunk *chunk;
+
+		for (chunk = KHOSER_LOAD_PTR(vm->first); chunk;
+		     chunk = KHOSER_LOAD_PTR(chunk->hdr.next)) {
+			for (u32 k = 0; k < KHO_VMALLOC_SIZE && chunk->phys[k]; k++) {
+				const u64 *pfns = phys_to_virt(chunk->phys[k]);
+
+				for (u32 j = 0; j < entries_per_blk; j++) {
+					unsigned long pfn;
+
+					if (!(pfns[j] & REALM_LUO_PFN_DATA))
+						continue;
+					pfn = pfns[j] & REALM_LUO_PFN_MASK;
+					WARN_ON_ONCE(xa_is_err(xa_store(&realm_luo_reclaim_pages,
+									pfn, xa_mk_value(1),
+									GFP_KERNEL)));
+				}
+			}
+		}
+	}
+
+	kho_restore_free(dir);
+	return 0;
+}
+late_initcall(realm_luo_init_reclaim_pages);
+
+void kvm_arch_gmem_reclaim(kvm_pfn_t pfn, kvm_pfn_t nr_pages)
+{
+	unsigned long flags;
+	kvm_pfn_t i;
+
+	if (!is_kho_boot() || !static_branch_unlikely(&kvm_rmi_is_available) ||
+	    likely(xa_empty(&realm_luo_reclaim_pages)))
+		return;
+
+	xa_lock_irqsave(&realm_luo_reclaim_pages, flags);
+	for (i = 0; i < nr_pages; i++) {
+		kvm_pfn_t cur_pfn = pfn + i;
+		struct page *page;
+
+		if (xa_load(&realm_luo_reclaim_pages, cur_pfn) != xa_mk_value(1))
+			continue;
+
+		page = pfn_to_page(cur_pfn);
+		get_page(page);
+		if (__xa_cmpxchg(&realm_luo_reclaim_pages, cur_pfn,
+				 xa_mk_value(1), page, GFP_NOWAIT) !=
+		    xa_mk_value(1))
+			put_page(page);
+	}
+	xa_unlock_irqrestore(&realm_luo_reclaim_pages, flags);
+}
+#else
+static inline bool realm_luo_defer_teardown(phys_addr_t rd_phys,
+					    phys_addr_t pgd_phys,
+					    size_t pgd_size, bool accounted)
+{
+	return false;
+}
+
+void kvm_arch_gmem_reclaim(kvm_pfn_t pfn, kvm_pfn_t nr_pages)
+{
+}
+#endif
+
 void kvm_destroy_realm(struct kvm *kvm)
 {
 	struct realm *realm = &kvm->arch.realm;
@@ -1470,11 +1937,14 @@ void kvm_destroy_realm(struct kvm *kvm)
 	guard(mutex)(&kvm->arch.config_lock);
 
 	if (!kvm_realm_is_created(kvm)) {
+		kvm_free_stage2_pgd(&kvm->arch.mmu);
 		kfree(realm->sro);
 		realm->sro = NULL;
+		xa_destroy(&realm->luo_data_pages);
 		return;
 	}
 
+	WRITE_ONCE(realm->luo_frozen, false);
 	kvm_set_realm_state(kvm, REALM_STATE_DYING);
 
 	/*
@@ -1495,8 +1965,28 @@ void kvm_destroy_realm(struct kvm *kvm)
 		if (WARN_ON(realm_destroy_rtts(kvm)))
 			return;
 
-		if (WARN_ON(rmi_realm_destroy(rd_phys, realm->sro)))
+		if (rmi_realm_destroy(rd_phys, realm->sro)) {
+			if (realm->luo_retrieved &&
+			    realm_luo_defer_teardown(rd_phys,
+						     kvm->arch.mmu.pgd_phys,
+						     pgd_size, true)) {
+				write_lock(&kvm->mmu_lock);
+				free_percpu(kvm->arch.mmu.last_vcpu_ran);
+				kvm->arch.mmu.last_vcpu_ran = NULL;
+				kfree(kvm->arch.mmu.pgt);
+				kvm->arch.mmu.pgt = NULL;
+				kvm->arch.mmu.pgd_phys = 0;
+				write_unlock(&kvm->mmu_lock);
+				realm->rd = NULL;
+				kvm_set_realm_state(kvm, REALM_STATE_DEAD);
+				kfree(realm->sro);
+				realm->sro = NULL;
+				xa_destroy(&realm->luo_data_pages);
+				return;
+			}
+			WARN_ON(1);
 			return;
+		}
 		free_delegated_page(rd_phys);
 		realm->rd = NULL;
 	}
@@ -1512,18 +2002,489 @@ void kvm_destroy_realm(struct kvm *kvm)
 
 	kfree(realm->sro);
 	realm->sro = NULL;
+	xa_destroy(&realm->luo_data_pages);
 }
 
 int kvm_init_realm(struct kvm *kvm)
 {
 	struct realm *realm = &kvm->arch.realm;
 
-	realm->sro = kmalloc_obj(*realm->sro);
+	INIT_LIST_HEAD(&realm->rtt_list);
+	spin_lock_init(&realm->rtt_lock);
+	xa_init(&realm->luo_data_pages);
+
+	realm->sro = kzalloc_obj(*realm->sro);
 	if (!realm->sro)
 		return -ENOMEM;
 
 	return 0;
 }
+
+#ifdef CONFIG_LIVEUPDATE
+int kvm_realm_luo_preserve(struct kvm *kvm,
+			   struct kvm_arm64_cca_vm_luo_state *cca)
+{
+	guard(mutex)(&kvm->arch.config_lock);
+
+	if (kvm_realm_state(kvm) != REALM_STATE_ACTIVE)
+		return -EINVAL;
+
+	memset(cca, 0, sizeof(*cca));
+	WRITE_ONCE(kvm->arch.realm.luo_preserved, true);
+	return 0;
+}
+
+static void kvm_realm_luo_unpreserve_cca(struct kvm *kvm,
+					 struct kvm_arm64_cca_vm_luo_state *cca)
+{
+	u64 *pfns = kvm ? kvm->arch.realm.luo_pfns : NULL;
+	u32 i;
+
+	if (!cca)
+		return;
+
+	realm_luo_dir_unregister(&cca->rtt_pfns);
+
+	if (cca->rd_phys)
+		kho_unpreserve_pages(phys_to_page(cca->rd_phys), 1);
+	if (cca->pgd_phys && cca->pgd_pages)
+		kho_unpreserve_pages(phys_to_page(cca->pgd_phys), cca->pgd_pages);
+
+	if (pfns) {
+		for (i = 0; i < cca->nr_rtt_pages; i++)
+			kho_unpreserve_pages(pfn_to_page(pfns[i]), 1);
+	}
+	if (cca->rtt_pfns.total_pages)
+		kho_unpreserve_vmalloc(&cca->rtt_pfns);
+	if (pfns) {
+		vfree(pfns);
+		kvm->arch.realm.luo_pfns = NULL;
+	}
+
+	memset(cca, 0, sizeof(*cca));
+}
+
+int kvm_realm_luo_freeze(struct kvm *kvm,
+			 struct kvm_arm64_cca_vm_luo_state *cca)
+{
+	struct realm *realm = &kvm->arch.realm;
+	size_t pgd_size = kvm_pgtable_stage2_pgd_size(kvm->arch.mmu.vtcr);
+	u32 pgd_pages = pgd_size >> PAGE_SHIFT;
+	struct kvm_memory_slot *memslot;
+	struct kvm_memslots *slots;
+	unsigned long data_idx;
+	u64 *pfns = NULL;
+	u32 nr_rtt, nr_data = 0, total_pfns, i = 0;
+	struct page *page;
+	unsigned long flags;
+	void *xa_entry;
+	int ret, srcu_idx, bkt;
+
+	guard(mutex)(&kvm->slots_lock);
+	guard(mutex)(&kvm->arch.config_lock);
+
+	if (kvm_realm_state(kvm) != REALM_STATE_ACTIVE || !realm->rd ||
+	    !READ_ONCE(realm->luo_preserved))
+		return -EINVAL;
+
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	slots = kvm_memslots(kvm);
+	kvm_for_each_memslot(memslot, bkt, slots) {
+		if (!kvm_slot_has_gmem(memslot))
+			continue;
+		if (!kvm_gmem_file_is_frozen(READ_ONCE(memslot->gmem.file))) {
+			srcu_read_unlock(&kvm->srcu, srcu_idx);
+			return -EINVAL;
+		}
+	}
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+
+	if (cca->rd_phys) {
+		kvm_realm_luo_unpreserve_cca(kvm, cca);
+		WRITE_ONCE(realm->luo_frozen, false);
+	}
+
+	/*
+	 * Freeze under mmu_lock so no stage-2 fault, RIPAS change or MMU
+	 * notifier can create, fold or free RTTs after this point; then sync
+	 * the RMM donations, which the shared unmap may have changed.
+	 */
+	write_lock(&kvm->mmu_lock);
+	WRITE_ONCE(realm->luo_frozen, true);
+	realm_unmap_shared_range(kvm, 0, BIT(realm->ia_bits - 1), false);
+	write_unlock(&kvm->mmu_lock);
+
+	ret = arm_rmm_luo_sync_donations();
+	if (ret)
+		goto err_unfreeze;
+
+	spin_lock_irqsave(&realm->rtt_lock, flags);
+	nr_rtt = realm->nr_rtt_pages;
+	spin_unlock_irqrestore(&realm->rtt_lock, flags);
+
+	xa_for_each(&realm->luo_data_pages, data_idx, xa_entry) {
+		if (!xa_is_value(xa_entry) ||
+		    !(xa_to_value(xa_entry) & REALM_LUO_DATA_DELEGATED))
+			continue;
+		if (!kvm_gmem_pfn_is_frozen(kvm, data_idx)) {
+			ret = -EINVAL;
+			goto err_unfreeze;
+		}
+		nr_data++;
+	}
+
+	total_pfns = nr_rtt + nr_data;
+	if (total_pfns) {
+		u32 d_idx;
+
+		pfns = vcalloc(total_pfns, sizeof(u64));
+		if (!pfns) {
+			ret = -ENOMEM;
+			goto err_unfreeze;
+		}
+
+		spin_lock_irqsave(&realm->rtt_lock, flags);
+		list_for_each_entry(page, &realm->rtt_list, lru) {
+			if (i >= nr_rtt)
+				break;
+			pfns[i++] = page_to_pfn(page);
+		}
+		spin_unlock_irqrestore(&realm->rtt_lock, flags);
+		nr_rtt = i;
+
+		for (i = 0; i < nr_rtt; i++) {
+			ret = kho_preserve_pages(pfn_to_page(pfns[i]), 1);
+			if (ret)
+				goto err_unpreserve_rtts;
+		}
+
+		d_idx = nr_rtt;
+		xa_for_each(&realm->luo_data_pages, data_idx, xa_entry) {
+			if (d_idx >= total_pfns)
+				break;
+			if (xa_is_value(xa_entry) &&
+			    (xa_to_value(xa_entry) & REALM_LUO_DATA_DELEGATED))
+				pfns[d_idx++] = REALM_LUO_PFN_DATA | data_idx;
+		}
+
+		ret = kho_preserve_vmalloc(pfns, &cca->rtt_pfns);
+		if (ret)
+			goto err_unpreserve_rtts;
+	}
+
+	ret = kho_preserve_pages(phys_to_page(kvm->arch.mmu.pgd_phys),
+				 pgd_pages);
+	if (ret)
+		goto err_unpreserve_vmalloc;
+
+	ret = kho_preserve_pages(virt_to_page(realm->rd), 1);
+	if (ret)
+		goto err_unpreserve_pgd;
+
+	if (pfns && nr_data) {
+		ret = realm_luo_dir_register(&cca->rtt_pfns);
+		if (ret)
+			goto err_unpreserve_rd;
+	}
+
+	realm->luo_pfns = pfns;
+	cca->rd_phys = virt_to_phys(realm->rd);
+	cca->pgd_phys = kvm->arch.mmu.pgd_phys;
+	cca->pgd_pages = pgd_pages;
+	cca->ia_bits = realm->ia_bits;
+	cca->realm_state = REALM_STATE_ACTIVE;
+	cca->nr_rtt_pages = nr_rtt;
+	return 0;
+
+err_unpreserve_rd:
+	kho_unpreserve_pages(virt_to_page(realm->rd), 1);
+err_unpreserve_pgd:
+	kho_unpreserve_pages(phys_to_page(kvm->arch.mmu.pgd_phys), pgd_pages);
+err_unpreserve_vmalloc:
+	if (cca->rtt_pfns.total_pages)
+		kho_unpreserve_vmalloc(&cca->rtt_pfns);
+err_unpreserve_rtts:
+	memset(&cca->rtt_pfns, 0, sizeof(cca->rtt_pfns));
+	if (pfns) {
+		while (i--)
+			kho_unpreserve_pages(pfn_to_page(pfns[i]), 1);
+		vfree(pfns);
+	}
+err_unfreeze:
+	WRITE_ONCE(realm->luo_frozen, false);
+	return ret;
+}
+
+void kvm_realm_luo_unfreeze(struct kvm *kvm,
+			    struct kvm_arm64_cca_vm_luo_state *cca)
+{
+	/*
+	 * Unpreserve the RTT pages while still frozen, so that no MMU notifier
+	 * or fault can fold and free them underneath kvm_realm_luo_unpreserve_cca().
+	 */
+	guard(mutex)(&kvm->slots_lock);
+	guard(mutex)(&kvm->arch.config_lock);
+	kvm_realm_luo_unpreserve_cca(kvm, cca);
+	WRITE_ONCE(kvm->arch.realm.luo_frozen, false);
+}
+
+void kvm_realm_luo_unpreserve(struct kvm *kvm,
+			      struct kvm_arm64_cca_vm_luo_state *cca)
+{
+	guard(mutex)(&kvm->slots_lock);
+	guard(mutex)(&kvm->arch.config_lock);
+	kvm_realm_luo_unpreserve_cca(kvm, cca);
+	WRITE_ONCE(kvm->arch.realm.luo_preserved, false);
+	WRITE_ONCE(kvm->arch.realm.luo_frozen, false);
+}
+
+static void realm_luo_teardown_abandoned(struct page *rd_page,
+					 struct page *pgd_page,
+					 struct list_head *restored_rtts,
+					 u32 nr_restored_rtts,
+					 struct kvm_arm64_cca_vm_luo_state *cca)
+{
+	struct rmi_sro_state *dyn_sro __free(kfree) = kzalloc_obj(*dyn_sro);
+	struct rmi_sro_state *sro = dyn_sro;
+	phys_addr_t rd_phys = page_to_phys(rd_page);
+	phys_addr_t pgd_phys = pgd_page ? page_to_phys(pgd_page) : 0;
+	size_t pgd_size = (size_t)cca->pgd_pages * PAGE_SIZE;
+	struct realm tmp_realm = {};
+	u64 *pfns;
+	u32 i;
+
+	mutex_lock(&realm_luo_deferred_lock);
+	if (!sro)
+		sro = realm_luo_fallback_sro;
+	if (WARN_ON_ONCE(!sro)) {
+		/* Leak the Realm rather than issue RMI calls without an SRO. */
+		mutex_unlock(&realm_luo_deferred_lock);
+		return;
+	}
+
+	INIT_LIST_HEAD(&tmp_realm.rtt_list);
+	spin_lock_init(&tmp_realm.rtt_lock);
+	xa_init(&tmp_realm.luo_data_pages);
+	tmp_realm.rd = page_to_virt(rd_page);
+	tmp_realm.ia_bits = cca->ia_bits;
+	tmp_realm.sro = sro;
+
+	if (restored_rtts && !list_empty(restored_rtts)) {
+		list_splice_tail_init(restored_rtts, &tmp_realm.rtt_list);
+		tmp_realm.nr_rtt_pages = nr_restored_rtts;
+	}
+
+	if (cca->rtt_pfns.total_pages) {
+		pfns = kho_restore_vmalloc(&cca->rtt_pfns);
+		memset(&cca->rtt_pfns, 0, sizeof(cca->rtt_pfns));
+		if (pfns) {
+			for (i = 0; i < cca->nr_rtt_pages; i++) {
+				struct page *rtt_page;
+				void *rtt_va;
+
+				rtt_page = kho_restore_pages(PFN_PHYS(pfns[i]),
+							     1);
+				if (!rtt_page)
+					continue;
+				rtt_va = page_to_virt(rtt_page);
+				kvm_account_pgtable_pages(rtt_va, 1);
+				list_add_tail(&rtt_page->lru,
+					      &tmp_realm.rtt_list);
+				tmp_realm.nr_rtt_pages++;
+			}
+			vfree(pfns);
+			cca->nr_rtt_pages = 0;
+		}
+	}
+
+	realm_unmap_private_range(NULL, &tmp_realm, 0, BIT(cca->ia_bits - 1),
+				  false);
+	WARN_ON(rmi_realm_terminate(rd_phys, sro));
+	WARN_ON(realm_tear_down_rtt_range(&tmp_realm, 0, BIT(cca->ia_bits)));
+	if (rmi_realm_destroy(rd_phys, sro)) {
+		mutex_unlock(&realm_luo_deferred_lock);
+		if (!realm_luo_defer_teardown(rd_phys, pgd_phys, pgd_size,
+					      false))
+			WARN_ON(1);
+	} else {
+		mutex_unlock(&realm_luo_deferred_lock);
+		free_delegated_page(rd_phys);
+		if (pgd_page &&
+		    !WARN_ON(rmi_undelegate_range(pgd_phys, pgd_size)))
+			free_pages_exact(page_to_virt(pgd_page), pgd_size);
+	}
+
+	realm_luo_drain_deferred();
+}
+
+int kvm_realm_luo_retrieve(struct kvm *kvm,
+			   struct kvm_arm64_cca_vm_luo_state *cca)
+{
+	struct realm *realm = &kvm->arch.realm;
+	size_t pgd_size = kvm_pgtable_stage2_pgd_size(kvm->arch.mmu.vtcr);
+	u32 pfns_nr_pages = cca->rtt_pfns.total_pages;
+	struct page *rd_page, *pgd_page;
+	phys_addr_t pgd_phys = cca->pgd_phys;
+	LIST_HEAD(restored_rtts);
+	u32 nr_restored_rtts = 0;
+	u64 *pfns = NULL;
+	u32 i;
+
+	if (!cca->rd_phys || !cca->pgd_phys ||
+	    cca->realm_state != REALM_STATE_ACTIVE ||
+	    cca->ia_bits != VTCR_EL2_IPA(kvm->arch.mmu.vtcr) ||
+	    cca->pgd_pages != (pgd_size >> PAGE_SHIFT))
+		return -EINVAL;
+
+	if (cca->nr_rtt_pages &&
+	    (!cca->rtt_pfns.first.phys ||
+	     pfns_nr_pages <
+	     (PAGE_ALIGN(cca->nr_rtt_pages * sizeof(u64)) >> PAGE_SHIFT)))
+		return -EINVAL;
+
+	rd_page = kho_restore_pages(cca->rd_phys, 1);
+	if (!rd_page)
+		return -ENOMEM;
+	cca->rd_phys = 0;
+
+	pgd_page = kho_restore_pages(cca->pgd_phys, cca->pgd_pages);
+	if (!pgd_page) {
+		realm_luo_teardown_abandoned(rd_page, NULL, NULL, 0, cca);
+		return -ENOMEM;
+	}
+	cca->pgd_phys = 0;
+
+	if (pfns_nr_pages) {
+		pfns = kho_restore_vmalloc(&cca->rtt_pfns);
+		memset(&cca->rtt_pfns, 0, sizeof(cca->rtt_pfns));
+		if (!pfns) {
+			realm_luo_teardown_abandoned(rd_page, pgd_page, NULL,
+						     0, cca);
+			return -ENOMEM;
+		}
+
+		for (i = 0; i < cca->nr_rtt_pages; i++) {
+			struct page *rtt_page;
+
+			rtt_page = kho_restore_pages(PFN_PHYS(pfns[i]), 1);
+			if (!rtt_page) {
+				u32 j;
+
+				for (j = i + 1; j < cca->nr_rtt_pages; j++) {
+					rtt_page = kho_restore_pages(PFN_PHYS(pfns[j]), 1);
+					if (!rtt_page)
+						continue;
+					kvm_account_pgtable_pages(page_to_virt(rtt_page), 1);
+					list_add_tail(&rtt_page->lru, &restored_rtts);
+					nr_restored_rtts++;
+				}
+				vfree(pfns);
+				cca->nr_rtt_pages = 0;
+				realm_luo_teardown_abandoned(rd_page, pgd_page,
+							     &restored_rtts,
+							     nr_restored_rtts,
+							     cca);
+				return -ENOMEM;
+			}
+			kvm_account_pgtable_pages(page_to_virt(rtt_page), 1);
+			list_add_tail(&rtt_page->lru, &restored_rtts);
+			nr_restored_rtts++;
+		}
+
+		/*
+		 * Carry this Realm's DATA granules over, so that freezing it
+		 * again records them for the next kernel.
+		 */
+		for (i = cca->nr_rtt_pages;
+		     i < pfns_nr_pages * PAGE_SIZE / sizeof(u64); i++) {
+			if (!(pfns[i] & REALM_LUO_PFN_DATA))
+				continue;
+			if (xa_is_err(xa_store(&realm->luo_data_pages,
+					       pfns[i] & REALM_LUO_PFN_MASK,
+					       xa_mk_value(1),
+					       GFP_KERNEL_ACCOUNT))) {
+				xa_destroy(&realm->luo_data_pages);
+				vfree(pfns);
+				cca->nr_rtt_pages = 0;
+				realm_luo_teardown_abandoned(rd_page, pgd_page,
+							     &restored_rtts,
+							     nr_restored_rtts,
+							     cca);
+				return -ENOMEM;
+			}
+		}
+		vfree(pfns);
+		cca->nr_rtt_pages = 0;
+	}
+
+	/*
+	 * Replace the freshly allocated Stage-2 root PGD from
+	 * kvm_init_stage2_mmu() with the preserved RMM-delegated root RTT
+	 * and mark the Realm active only after all KHO pages are restored.
+	 */
+	kvm->arch.mmu.pgt->mm_ops->free_pages_exact(__va(kvm->arch.mmu.pgd_phys),
+						    pgd_size);
+	kvm_account_pgtable_pages(page_to_virt(pgd_page), cca->pgd_pages);
+	kvm->arch.mmu.pgd_phys = pgd_phys;
+	kvm->arch.mmu.pgt->pgd = (kvm_pteref_t)page_to_virt(pgd_page);
+
+	list_splice_tail(&restored_rtts, &realm->rtt_list);
+	realm->nr_rtt_pages = nr_restored_rtts;
+	realm->rd = page_to_virt(rd_page);
+	realm->ia_bits = cca->ia_bits;
+	realm->luo_retrieved = true;
+	kvm_set_realm_state(kvm, REALM_STATE_ACTIVE);
+
+	return 0;
+}
+
+void kvm_realm_luo_finish(struct kvm *kvm,
+			  struct kvm_arm64_cca_vm_luo_state *cca)
+{
+	struct page *rd_page = NULL, *pgd_page = NULL;
+
+	if (kvm || !cca) {
+		realm_luo_drain_deferred();
+		return;
+	}
+
+	if (cca->rd_phys) {
+		rd_page = kho_restore_pages(cca->rd_phys, 1);
+		cca->rd_phys = 0;
+	}
+	if (cca->pgd_phys) {
+		pgd_page = kho_restore_pages(cca->pgd_phys, cca->pgd_pages);
+		cca->pgd_phys = 0;
+	}
+
+	if (rd_page) {
+		realm_luo_teardown_abandoned(rd_page, pgd_page, NULL, 0, cca);
+	} else {
+		if (cca->rtt_pfns.total_pages) {
+			u64 *pfns = kho_restore_vmalloc(&cca->rtt_pfns);
+
+			memset(&cca->rtt_pfns, 0, sizeof(cca->rtt_pfns));
+			if (pfns) {
+				for (u32 i = 0; i < cca->nr_rtt_pages; i++) {
+					if (kho_restore_pages(PFN_PHYS(pfns[i]), 1))
+						free_delegated_page(PFN_PHYS(pfns[i]));
+				}
+				vfree(pfns);
+				cca->nr_rtt_pages = 0;
+			}
+		}
+		if (pgd_page) {
+			size_t pgd_size = (size_t)cca->pgd_pages * PAGE_SIZE;
+			phys_addr_t pgd_phys = page_to_phys(pgd_page);
+
+			if (!WARN_ON(rmi_undelegate_range(pgd_phys, pgd_size)))
+				free_pages_exact(page_to_virt(pgd_page), pgd_size);
+		}
+		realm_luo_drain_deferred();
+	}
+}
+
+#endif /* CONFIG_LIVEUPDATE */
 
 static int rmm_check_features(void)
 {

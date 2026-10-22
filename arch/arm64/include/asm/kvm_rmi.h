@@ -59,6 +59,15 @@ enum realm_state {
  * @ia_bits: Number of valid Input Address bits in the IPA
  * @stage2_unmapped: The Realm stage-2 mappings have been removed
  * @rtts_destroyed: The non-root RTTs have been torn down
+ * @luo_preserved: Realm is preserved in an active live update session
+ * @luo_frozen: Stage-2 RTTs are frozen for live update handover
+ * @luo_retrieved: Realm was retrieved from a live update session
+ * @luo_pfns: Preserved vmalloc array of RTT/DATA PFNs during live update freeze
+ * @luo_data_pages: Delegated DATA granules of this Realm (by pfn), recorded
+ *		    at freeze so the next kernel keeps them out of the allocator
+ * @rtt_list: List of non-root RTT struct pages (linked via page->lru)
+ * @rtt_lock: Spinlock protecting @rtt_list and @nr_rtt_pages
+ * @nr_rtt_pages: Number of active non-root RTT pages in @rtt_list
  */
 struct realm {
 	void *rd;
@@ -74,6 +83,15 @@ struct realm {
 	unsigned int ia_bits;
 	bool stage2_unmapped;
 	bool rtts_destroyed;
+	bool luo_preserved;
+	bool luo_frozen;
+	bool luo_retrieved;
+	u64 *luo_pfns;
+	struct xarray luo_data_pages;
+	struct list_head rtt_list;
+	/* Protects rtt_list and nr_rtt_pages */
+	spinlock_t rtt_lock;
+	unsigned long nr_rtt_pages;
 };
 
 /**
@@ -104,10 +122,27 @@ u64 kvm_realm_reset_id_aa64dfr0_el1(const struct kvm_vcpu *vcpu, u64 val);
 bool kvm_rmi_supports_sve(void);
 
 int kvm_init_realm(struct kvm *kvm);
+int kvm_realm_luo_reserve_data(struct kvm *kvm, kvm_pfn_t pfn);
+void kvm_realm_luo_release_data(struct kvm *kvm, kvm_pfn_t pfn);
 int kvm_activate_realm(struct kvm *kvm);
 void kvm_destroy_realm(struct kvm *kvm);
 int kvm_realm_teardown_stage2(struct kvm *kvm);
 void kvm_destroy_rec(struct kvm_vcpu *vcpu);
+
+struct kvm_arm64_cca_vm_luo_state;
+
+int kvm_realm_luo_preserve(struct kvm *kvm,
+			   struct kvm_arm64_cca_vm_luo_state *cca);
+int kvm_realm_luo_freeze(struct kvm *kvm,
+			 struct kvm_arm64_cca_vm_luo_state *cca);
+void kvm_realm_luo_unfreeze(struct kvm *kvm,
+			    struct kvm_arm64_cca_vm_luo_state *cca);
+void kvm_realm_luo_unpreserve(struct kvm *kvm,
+			      struct kvm_arm64_cca_vm_luo_state *cca);
+int kvm_realm_luo_retrieve(struct kvm *kvm,
+			   struct kvm_arm64_cca_vm_luo_state *cca);
+void kvm_realm_luo_finish(struct kvm *kvm,
+			  struct kvm_arm64_cca_vm_luo_state *cca);
 
 int kvm_rec_enter(struct kvm_vcpu *vcpu);
 int kvm_rec_exit(struct kvm_vcpu *vcpu, int rec_run_status);

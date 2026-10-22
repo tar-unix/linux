@@ -42,6 +42,7 @@
  *                                (%KVM_X86_TDX_VM).
  * @KVM_VM_LUO_FEAT_SEV_SNP:      Kind of AMD SEV-SNP confidential VM
  *                                (%KVM_X86_SNP_VM).
+ * @KVM_VM_LUO_FEAT_ARM_CCA:      Kind of ARM64 CCA Realm confidential VM.
  * @KVM_VM_LUO_FEAT_MAX:          Number of defined features.
  *
  * The values are ABI. New features are added before %KVM_VM_LUO_FEAT_MAX,
@@ -53,6 +54,7 @@ enum kvm_vm_luo_feature {
 	KVM_VM_LUO_FEAT_SW_PROTECTED = 2,
 	KVM_VM_LUO_FEAT_TDX = 3,
 	KVM_VM_LUO_FEAT_SEV_SNP = 4,
+	KVM_VM_LUO_FEAT_ARM_CCA = 5,
 	KVM_VM_LUO_FEAT_MAX,
 };
 
@@ -221,6 +223,8 @@ static_assert(sizeof(struct kvm_gmem_luo_state) == 200);
  *                                  confidential VM (%KVM_X86_TDX_VM).
  * @KVM_VCPU_LUO_FEAT_SEV_SNP:      Kind of vCPU belonging to an AMD SEV-SNP
  *                                  confidential VM (%KVM_X86_SNP_VM).
+ * @KVM_VCPU_LUO_FEAT_ARM_CCA:      Kind of vCPU (REC) belonging to an ARM64
+ *                                  CCA Realm confidential VM.
  * @KVM_VCPU_LUO_FEAT_MAX:          Number of defined features.
  *
  * The values are ABI. New features are added before %KVM_VCPU_LUO_FEAT_MAX,
@@ -232,6 +236,7 @@ enum kvm_vcpu_luo_feature {
 	KVM_VCPU_LUO_FEAT_SW_PROTECTED = 2,
 	KVM_VCPU_LUO_FEAT_TDX = 3,
 	KVM_VCPU_LUO_FEAT_SEV_SNP = 4,
+	KVM_VCPU_LUO_FEAT_ARM_CCA = 5,
 	KVM_VCPU_LUO_FEAT_MAX,
 };
 
@@ -240,6 +245,7 @@ static_assert((int)KVM_VCPU_LUO_FEAT_NON_COCO == (int)KVM_VM_LUO_FEAT_NON_COCO);
 static_assert((int)KVM_VCPU_LUO_FEAT_SW_PROTECTED == (int)KVM_VM_LUO_FEAT_SW_PROTECTED);
 static_assert((int)KVM_VCPU_LUO_FEAT_TDX == (int)KVM_VM_LUO_FEAT_TDX);
 static_assert((int)KVM_VCPU_LUO_FEAT_SEV_SNP == (int)KVM_VM_LUO_FEAT_SEV_SNP);
+static_assert((int)KVM_VCPU_LUO_FEAT_ARM_CCA == (int)KVM_VM_LUO_FEAT_ARM_CCA);
 
 /**
  * struct kvm_vcpu_luo_state - Preserved state of a KVM vCPU.
@@ -785,6 +791,28 @@ struct kvm_luo_arm64_sys_reg {
 static_assert(sizeof(struct kvm_luo_arm64_sys_reg) == 16);
 
 /**
+ * struct kvm_arm64_cca_vm_luo_state - ARM64 CCA Realm per-VM KHO state.
+ * @rd_phys:           Physical address of the 4KB Realm Descriptor (GRANULE_STATE_RD).
+ * @pgd_phys:          Physical base address of the Stage-2 root PGD (GRANULE_STATE_RTT).
+ * @pgd_pages:         Number of contiguous 4KB pages in the Stage-2 root PGD.
+ * @ia_bits:           Realm IPA width in bits (realm->ia_bits).
+ * @realm_state:  Realm lifecycle state at freeze time (REALM_STATE_ACTIVE).
+ * @nr_rtt_pages: Number of non-root 4KB RTT pages in @rtt_pfns.
+ * @rtt_pfns:     KHO-preserved vmalloc array of u64 RTT/DATA PFNs.
+ */
+struct kvm_arm64_cca_vm_luo_state {
+	u64 rd_phys;
+	u64 pgd_phys;
+	u32 pgd_pages;
+	u32 ia_bits;
+	u32 realm_state;
+	u32 nr_rtt_pages;
+	struct kho_vmalloc rtt_pfns;
+};
+
+static_assert(sizeof(struct kvm_arm64_cca_vm_luo_state) == 48);
+
+/**
  * struct kvm_luo_vgic_irq_state - Preserved state of one vGICv3 SGI/PPI/SPI.
  * @intid:         Virtual interrupt identifier.
  * @pending_latch: Software-latched pending state.
@@ -865,6 +893,7 @@ static_assert(sizeof(struct kvm_luo_vgic_rd_region) == 16);
  * @reserved2:               Reserved for alignment, must be zero.
  * @rd_regions:              Preserved redistributor regions.
  * @spis:                    Preserved SPI interrupt states.
+ * @cca:                     Per-Realm VM state for %KVM_VM_LUO_FEAT_ARM_CCA.
  */
 struct kvm_luo_vm_arm64_state {
 	u32 version;
@@ -898,9 +927,10 @@ struct kvm_luo_vm_arm64_state {
 	u32 reserved2;
 	struct kvm_luo_vgic_rd_region rd_regions[KVM_LUO_ARM64_MAX_RD_REGIONS];
 	struct kvm_luo_vgic_irq_state spis[KVM_LUO_ARM64_MAX_SPIS];
+	struct kvm_arm64_cca_vm_luo_state cca;
 };
 
-static_assert(sizeof(struct kvm_luo_vm_arm64_state) == 24632);
+static_assert(sizeof(struct kvm_luo_vm_arm64_state) == 24680);
 
 /**
  * struct kvm_luo_vcpu_arm64_state - Preserved arm64 vCPU architectural state.

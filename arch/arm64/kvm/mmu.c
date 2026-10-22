@@ -1083,11 +1083,20 @@ out_free_pgtable:
 static void kvm_realm_uninit_stage2(struct kvm_s2_mmu *mmu)
 {
 	struct kvm *kvm = kvm_s2_mmu_to_kvm(mmu);
+	struct realm *realm = &kvm->arch.realm;
 
 	mutex_lock(&kvm->arch.config_lock);
 	if (kvm_realm_state(kvm) == REALM_STATE_ACTIVE) {
-		kvm_set_realm_state(kvm, REALM_STATE_DYING);
-		WARN_ON(kvm_realm_teardown_stage2(kvm));
+		if (!READ_ONCE(realm->luo_preserved) &&
+		    !READ_ONCE(realm->luo_frozen)) {
+			kvm_set_realm_state(kvm, REALM_STATE_DYING);
+			WARN_ON(kvm_realm_teardown_stage2(kvm));
+		} else if (!READ_ONCE(realm->luo_frozen)) {
+			write_lock(&kvm->mmu_lock);
+			kvm_realm_unmap_range(kvm, 0, BIT(realm->ia_bits - 1),
+					      false, true);
+			write_unlock(&kvm->mmu_lock);
+		}
 	}
 	mutex_unlock(&kvm->arch.config_lock);
 }
@@ -1718,6 +1727,12 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 	if (s2fd->nested)
 		prot = adjust_nested_exec_perms(kvm, s2fd->nested, prot);
 
+	if (kvm_is_realm(kvm)) {
+		ret = kvm_realm_luo_reserve_data(kvm, pfn);
+		if (ret)
+			return ret;
+	}
+
 	kvm_fault_lock(kvm);
 	if (mmu_invalidate_retry(kvm, mmu_seq)) {
 		ret = -EAGAIN;
@@ -1747,6 +1762,8 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 
 out_unlock:
 	kvm_fault_unlock(kvm);
+	if (kvm_is_realm(kvm))
+		kvm_realm_luo_release_data(kvm, pfn);
 
 	if ((prot & KVM_PGTABLE_PROT_W) && !ret)
 		mark_page_dirty_in_slot(kvm, s2fd->memslot, gfn);
@@ -2493,9 +2510,13 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 				!write_fault &&
 				!kvm_vcpu_trap_is_exec_fault(vcpu));
 
-		if (kvm_slot_has_gmem(memslot) &&
-		    (kvm_memslot_is_gmem_only(memslot) ||
-		     !shared_ipa_fault(vcpu->kvm, fault_ipa)))
+		if (kvm_is_realm(vcpu->kvm) &&
+		    !shared_ipa_fault(vcpu->kvm, fault_ipa) &&
+		    !kvm_slot_has_gmem(memslot))
+			ret = -EFAULT;
+		else if (kvm_slot_has_gmem(memslot) &&
+			 (kvm_memslot_is_gmem_only(memslot) ||
+			  !shared_ipa_fault(vcpu->kvm, fault_ipa)))
 			ret = gmem_abort(&s2fd);
 		else
 			ret = user_mem_abort(&s2fd);
@@ -2709,6 +2730,9 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 {
 	hva_t hva, reg_end;
 	int ret = 0;
+
+	if (kvm_is_realm(kvm) && READ_ONCE(kvm->arch.realm.luo_frozen))
+		return -EBUSY;
 
 	if (kvm_vm_is_protected(kvm)) {
 		/* Cannot modify memslots once a pVM has run. */
