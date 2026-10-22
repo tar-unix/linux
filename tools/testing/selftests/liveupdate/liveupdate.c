@@ -535,13 +535,13 @@ TEST_F(liveupdate_device, preserve_many_files)
  * Test Case: Preserve MemFD with User Argument
  *
  * Verifies that passing a non-zero user argument to memfd preservation fails
- * with -EOPNOTSUPP, while passing a zero argument or using the minimum struct
+ * with -EOPNOTSUPP, while passing a zero argument or using a shorter struct
  * size without the arg field succeeds.
  */
 TEST_F(liveupdate_device, preserve_memfd_with_arg)
 {
 	struct liveupdate_session_preserve_fd min_arg = {};
-	int session_fd, mem_fd1, mem_fd2;
+	int session_fd, mem_fd1, mem_fd2, mem_fd3;
 
 	self->fd1 = open(LIVEUPDATE_DEV, O_RDWR);
 	if (self->fd1 < 0 && errno == ENOENT)
@@ -558,20 +558,36 @@ TEST_F(liveupdate_device, preserve_memfd_with_arg)
 	EXPECT_EQ(luo_session_preserve_fd_arg(session_fd, mem_fd1, 0x1111, 1),
 		  -EOPNOTSUPP);
 
+	/* Partial arg field size must be rejected */
+	min_arg.size = offsetof(struct liveupdate_session_preserve_fd, arg) + 1;
+	min_arg.fd = mem_fd1;
+	min_arg.token = 0x1111;
+	ASSERT_EQ(ioctl(session_fd, LIVEUPDATE_SESSION_PRESERVE_FD, &min_arg), -1);
+	ASSERT_EQ(errno, EINVAL);
+
 	/* Legacy struct size (up to token) should zero-fill arg and succeed */
-	min_arg.size = offsetof(struct liveupdate_session_preserve_fd, arg);
+	min_arg.size = offsetof(struct liveupdate_session_preserve_fd, handler);
 	min_arg.fd = mem_fd1;
 	min_arg.token = 0x1111;
 	ASSERT_EQ(ioctl(session_fd, LIVEUPDATE_SESSION_PRESERVE_FD, &min_arg), 0);
 
-	/* Explicit zero arg with full struct size should also succeed */
+	/* Struct size up to handler should zero-fill arg and succeed */
 	mem_fd2 = memfd_create("arg-memfd-2", 0);
 	ASSERT_GE(mem_fd2, 0);
-	ASSERT_EQ(luo_session_preserve_fd_arg(session_fd, mem_fd2, 0x2222, 0), 0);
+	min_arg.size = offsetof(struct liveupdate_session_preserve_fd, arg);
+	min_arg.fd = mem_fd2;
+	min_arg.token = 0x2222;
+	ASSERT_EQ(ioctl(session_fd, LIVEUPDATE_SESSION_PRESERVE_FD, &min_arg), 0);
+
+	/* Explicit zero arg with full struct size should also succeed */
+	mem_fd3 = memfd_create("arg-memfd-3", 0);
+	ASSERT_GE(mem_fd3, 0);
+	ASSERT_EQ(luo_session_preserve_fd_arg(session_fd, mem_fd3, 0x3333, 0), 0);
 
 	ASSERT_EQ(close(session_fd), 0);
 	ASSERT_EQ(close(mem_fd1), 0);
 	ASSERT_EQ(close(mem_fd2), 0);
+	ASSERT_EQ(close(mem_fd3), 0);
 }
 
 TEST_HARNESS_MAIN
