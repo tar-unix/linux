@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 
+#include <linux/falloc.h>
 #include <linux/sizes.h>
 
 #include "kvm_util.h"
@@ -737,6 +738,163 @@ static int feature_mismatch_check(int session_fd, u64 token)
 	return KSFT_PASS;
 }
 
+/*
+ * Preserve a KVM_X86_SW_PROTECTED_VM, its vCPU, an init-shared guest_memfd
+ * whose first page is converted to private, and an init-private guest_memfd
+ * whose second page is converted to shared. Verify that private folios, shared
+ * folios, and per-page attributes survive kexec.
+ */
+static void sw_protected_preserve(int session_fd, u64 token)
+{
+#ifdef __x86_64__
+	u64 local_acc = token ^ 0x0f0f0f0f0f0f0f0fULL;
+	struct vm_shape shape = VM_SHAPE_DEFAULT;
+	u64 extra_pages = GMEM_SIZE / SZ_4K;
+	size_t page_size = getpagesize();
+	int gmem_conv, gmem_priv;
+	struct kvm_vcpu *vcpu;
+	struct kvm_regs regs;
+	struct kvm_vm *vm;
+	u64 *mem, err_off;
+
+	if (!(kvm_check_cap(KVM_CAP_VM_TYPES) & BIT(KVM_X86_SW_PROTECTED_VM)))
+		return;
+	if (!(kvm_check_cap(KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES) &
+	      KVM_MEMORY_ATTRIBUTE_PRIVATE))
+		return;
+
+	WRITE_ONCE(vcpu_resume_timer_fired, 0);
+	shape.type = KVM_X86_SW_PROTECTED_VM;
+	vm = __vm_create(shape, 1, extra_pages);
+	vm_install_exception_handler(vm, 0xec, vcpu_resume_timer_handler);
+
+	gmem_conv = vm_create_guest_memfd(vm, GMEM_SIZE, GMEM_FLAGS);
+	map_gmem(vm, gmem_conv);
+	TEST_ASSERT_EQ(__gmem_set_private(gmem_conv, 0, page_size, &err_off), 0);
+
+	vcpu = vm_vcpu_add(vm, 0, vcpu_resume_guest_code);
+	kvm_arch_vm_finalize_vcpus(vm);
+
+	vcpu_regs_get(vcpu, &regs);
+	regs.rsp = GMEM_GPA + GMEM_SIZE - 8;
+	vcpu_regs_set(vcpu, &regs);
+
+	vcpu_args_set(vcpu, 2, GMEM_GPA, token);
+	vcpu_run(vcpu);
+	TEST_ASSERT_EQ(vcpu->run->exit_reason, KVM_EXIT_IO);
+	TEST_ASSERT_EQ(vcpu->run->io.port, VCPU_RESUME_IO_PORT);
+	vcpu_run_complete_io(vcpu);
+
+	gmem_priv = vm_create_guest_memfd(vm, GMEM_SIZE, GUEST_MEMFD_FLAG_MMAP);
+	TEST_ASSERT_EQ(fallocate(gmem_priv, FALLOC_FL_KEEP_SIZE, 0, page_size),
+		       0);
+	TEST_ASSERT_EQ(__gmem_set_shared(gmem_priv, page_size, page_size,
+					 &err_off), 0);
+	mem = kvm_mmap(GMEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+		       gmem_priv);
+	WRITE_ONCE(mem[page_size / sizeof(*mem)], local_acc);
+	kvm_munmap(mem, GMEM_SIZE);
+
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, vm->fd, token), 0);
+	TEST_ASSERT_EQ(luo_preserve_vcpu(session_fd, vcpu->fd, token + 1), 0);
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, gmem_conv,
+					       token + 2), 0);
+	TEST_ASSERT_EQ(__gmem_set_shared(gmem_conv, 0, page_size, &err_off), -1);
+	TEST_ASSERT_EQ(errno, EPERM);
+	TEST_ASSERT_EQ(luo_session_preserve_fd(session_fd, gmem_priv,
+					       token + 3), 0);
+#endif
+}
+
+static int sw_protected_check(int session_fd, u64 token)
+{
+#ifdef __x86_64__
+	u32 size = sizeof(struct kvm_guest_memfd_luo_retrieve);
+	u64 local_acc = token ^ 0x0f0f0f0f0f0f0f0fULL;
+	struct vm_shape shape = VM_SHAPE_DEFAULT;
+	u64 extra_pages = GMEM_SIZE / SZ_4K;
+	int vm_fd, vcpu_fd, gmem_conv, gmem_priv;
+	size_t page_size = getpagesize();
+	struct kvm_vm *default_vm, *vm;
+	struct kvm_vcpu *vcpu;
+	struct ucall uc;
+	u64 *mem, err_off;
+	u64 i;
+
+	if (!(kvm_check_cap(KVM_CAP_VM_TYPES) & BIT(KVM_X86_SW_PROTECTED_VM)))
+		return KSFT_SKIP;
+	if (!(kvm_check_cap(KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES) &
+	      KVM_MEMORY_ATTRIBUTE_PRIVATE))
+		return KSFT_SKIP;
+
+	/* Cross-type retrieve with a default VM must fail with EINVAL. */
+	default_vm = vm_create_barebones();
+	TEST_ASSERT_EQ(luo_retrieve_vcpu(session_fd, token + 1,
+					 default_vm->fd), -EINVAL);
+	TEST_ASSERT_EQ(retrieve_gmem(session_fd, token + 2, size,
+				     default_vm->fd), -EINVAL);
+	TEST_ASSERT_EQ(retrieve_gmem(session_fd, token + 3, size,
+				     default_vm->fd), -EINVAL);
+	kvm_vm_free(default_vm);
+
+	vm_fd = luo_session_retrieve_fd(session_fd, token);
+	TEST_ASSERT(vm_fd >= 0, "Retrieving SW_PROTECTED_VM failed: %d", vm_fd);
+
+	shape.type = KVM_X86_SW_PROTECTED_VM;
+	vm = vm_create_from_fd(vm_fd, shape, 1, extra_pages);
+
+	vcpu_fd = luo_retrieve_vcpu(session_fd, token + 1, vm->fd);
+	TEST_ASSERT(vcpu_fd >= 0, "Retrieving SW_PROTECTED vCPU failed: %d",
+		    vcpu_fd);
+
+	gmem_conv = retrieve_gmem(session_fd, token + 2, size, vm->fd);
+	TEST_ASSERT(gmem_conv >= 0, "Retrieving gmem_conv failed: %d",
+		    gmem_conv);
+	map_gmem(vm, gmem_conv);
+
+	gmem_priv = retrieve_gmem(session_fd, token + 3, size, vm->fd);
+	TEST_ASSERT(gmem_priv >= 0, "Retrieving gmem_priv failed: %d",
+		    gmem_priv);
+
+	vcpu = vm_vcpu_add_from_fd(vm, 0, vcpu_fd);
+	kvm_arch_vm_finalize_vcpus(vm);
+
+	vcpu_run(vcpu);
+	switch (get_ucall(vcpu, &uc)) {
+	case UCALL_DONE:
+		break;
+	case UCALL_ABORT:
+		REPORT_GUEST_ASSERT(uc);
+		break;
+	default:
+		TEST_FAIL("Unexpected exit: %s",
+			  exit_reason_str(vcpu->run->exit_reason));
+	}
+
+	mem = kvm_mmap(GMEM_SIZE, PROT_READ, MAP_SHARED, gmem_conv);
+	TEST_EXPECT_SIGBUS((void)READ_ONCE(mem[0]));
+	TEST_ASSERT_EQ(__gmem_set_shared(gmem_conv, 0, page_size, &err_off), 0);
+	for (i = 0; i < 64; i++) {
+		TEST_ASSERT_EQ(mem[i], local_acc ^ i);
+		TEST_ASSERT_EQ(mem[64 + i], ~local_acc ^ i);
+	}
+	kvm_munmap(mem, GMEM_SIZE);
+
+	mem = kvm_mmap(GMEM_SIZE, PROT_READ, MAP_SHARED, gmem_priv);
+	TEST_EXPECT_SIGBUS((void)READ_ONCE(mem[0]));
+	TEST_ASSERT_EQ(READ_ONCE(mem[page_size / sizeof(*mem)]), local_acc);
+	kvm_munmap(mem, GMEM_SIZE);
+
+	close(gmem_priv);
+	close(gmem_conv);
+	kvm_vm_free(vm);
+
+	return KSFT_PASS;
+#else
+	return KSFT_SKIP;
+#endif
+}
+
 #define SCENARIO(_name) { #_name, _name##_preserve, _name##_check }
 
 static const struct scenario scenarios[] = {
@@ -748,6 +906,7 @@ static const struct scenario scenarios[] = {
 	SCENARIO(vcpu_retrieve_errors),
 	SCENARIO(not_retrieved),
 	SCENARIO(feature_mismatch),
+	SCENARIO(sw_protected),
 };
 
 /* Every scenario has its own range of tokens, starting at its base. */
