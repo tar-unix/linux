@@ -111,6 +111,11 @@ int kvm_ioapic_set_irq(struct kvm_kernel_irq_routing_entry *e, struct kvm *kvm,
 
 void kvm_get_ioapic(struct kvm *kvm, struct kvm_ioapic_state *state);
 void kvm_set_ioapic(struct kvm *kvm, struct kvm_ioapic_state *state);
+void kvm_ioapic_luo_save(struct kvm *kvm, struct kvm_ioapic_state *state,
+			 u32 *irr_delivered);
+void kvm_ioapic_luo_restore(struct kvm *kvm,
+			    const struct kvm_ioapic_state *state,
+			    u32 irr_delivered);
 void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu,
 			   ulong *ioapic_handled_vectors);
 

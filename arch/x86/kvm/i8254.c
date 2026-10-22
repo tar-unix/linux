@@ -707,6 +707,51 @@ int kvm_vm_ioctl_set_pit2(struct kvm *kvm, struct kvm_pit_state2 *ps)
 	return 0;
 }
 
+void kvm_pit_luo_restore(struct kvm *kvm, const struct kvm_pit_state2 *ps,
+			 bool timer_active, u32 nr_vcpus)
+{
+	struct kvm_pit *pit = kvm->arch.vpit;
+	int i;
+
+	mutex_lock(&pit->pit_state.lock);
+	memcpy(&pit->pit_state.channels, &ps->channels,
+	       sizeof(pit->pit_state.channels));
+	pit->pit_state.flags = ps->flags;
+	pit->pit_state.luo_pending_vcpus = timer_active ? nr_vcpus : 0;
+	for (i = 0; i < 3; i++)
+		kvm_pit_load_count(pit, i, pit->pit_state.channels[i].count,
+				   i == 0 && (!timer_active || nr_vcpus ||
+					      (ps->flags & KVM_PIT_FLAGS_HPET_LEGACY)));
+	if (!timer_active && ioapic_in_kernel(kvm) &&
+	    !(ps->flags & KVM_PIT_FLAGS_HPET_LEGACY)) {
+		u8 mode = pit->pit_state.channels[0].mode;
+
+		if (mode == 0 || mode == 1 || mode == 4) {
+			pit->pit_state.period = mul_u64_u32_div(
+				pit->pit_state.channels[0].count,
+				NSEC_PER_SEC, KVM_PIT_FREQ);
+			hrtimer_set_expires(&pit->pit_state.timer, ktime_get());
+		}
+	}
+	mutex_unlock(&pit->pit_state.lock);
+}
+
+void kvm_pit_luo_vcpu_retrieved(struct kvm *kvm)
+{
+	struct kvm_pit *pit = kvm->arch.vpit;
+
+	if (!pit)
+		return;
+
+	mutex_lock(&pit->pit_state.lock);
+	if (pit->pit_state.luo_pending_vcpus &&
+	    !--pit->pit_state.luo_pending_vcpus)
+		kvm_pit_load_count(pit, 0, pit->pit_state.channels[0].count,
+				   !!(pit->pit_state.flags &
+				      KVM_PIT_FLAGS_HPET_LEGACY));
+	mutex_unlock(&pit->pit_state.lock);
+}
+
 int kvm_vm_ioctl_reinject(struct kvm *kvm, struct kvm_reinject_control *control)
 {
 	struct kvm_pit *pit = kvm->arch.vpit;

@@ -3903,20 +3903,30 @@ vm_fault_t kvm_arch_vcpu_fault(struct kvm_vcpu *vcpu, struct vm_fault *vmf)
 	return VM_FAULT_SIGBUS;
 }
 
-static int kvm_vm_ioctl_set_tss_addr(struct kvm *kvm, unsigned long addr)
+int kvm_vm_ioctl_set_tss_addr(struct kvm *kvm, unsigned long addr)
 {
 	int ret;
 
 	if (addr > (unsigned int)(-3 * PAGE_SIZE))
 		return -EINVAL;
 	ret = kvm_x86_call(set_tss_addr)(kvm, addr);
+	if (!ret) {
+		kvm->arch.luo_tss_addr = addr;
+		kvm->arch.luo_tss_addr_set = true;
+	}
 	return ret;
 }
 
-static int kvm_vm_ioctl_set_identity_map_addr(struct kvm *kvm,
-					      u64 ident_addr)
+int kvm_vm_ioctl_set_identity_map_addr(struct kvm *kvm, u64 ident_addr)
 {
-	return kvm_x86_call(set_identity_map_addr)(kvm, ident_addr);
+	int ret;
+
+	ret = kvm_x86_call(set_identity_map_addr)(kvm, ident_addr);
+	if (!ret) {
+		kvm->arch.luo_identity_map_addr = ident_addr;
+		kvm->arch.luo_identity_map_addr_set = true;
+	}
+	return ret;
 }
 
 static int kvm_vm_ioctl_set_nr_mmu_pages(struct kvm *kvm,
@@ -4401,6 +4411,39 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
 	return 0;
 }
 
+void kvm_luo_save_clock(struct kvm *kvm, u64 *clock_ns, u64 *realtime_ns)
+{
+	struct kvm_clock_data data = {};
+
+	get_kvmclock(kvm, &data);
+	*clock_ns = data.clock;
+	if (data.flags & KVM_CLOCK_REALTIME)
+		*realtime_ns = data.realtime;
+	else
+		*realtime_ns = ktime_get_real_ns();
+}
+
+void kvm_luo_restore_clock(struct kvm *kvm, u64 clock_ns, u64 realtime_ns)
+{
+	struct kvm_arch *ka = &kvm->arch;
+	u64 now_real_ns = ktime_get_real_ns();
+	u64 now_raw_ns;
+
+	kvm_hv_request_tsc_page_update(kvm);
+	kvm_start_pvclock_update(kvm);
+	pvclock_update_vm_gtod_copy(kvm);
+
+	if (realtime_ns && now_real_ns > realtime_ns)
+		clock_ns += now_real_ns - realtime_ns;
+
+	if (ka->use_master_clock)
+		now_raw_ns = ka->master_kernel_ns;
+	else
+		now_raw_ns = get_kvmclock_base_ns();
+	ka->kvmclock_offset = clock_ns - now_raw_ns;
+	kvm_end_pvclock_update(kvm);
+}
+
 long kvm_arch_vcpu_unlocked_ioctl(struct file *filp, unsigned int ioctl,
 				  unsigned long arg)
 {
@@ -4435,7 +4478,9 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 
 	switch (ioctl) {
 	case KVM_SET_TSS_ADDR:
+		mutex_lock(&kvm->lock);
 		r = kvm_vm_ioctl_set_tss_addr(kvm, arg);
+		mutex_unlock(&kvm->lock);
 		break;
 	case KVM_SET_IDENTITY_MAP_ADDR: {
 		u64 ident_addr;

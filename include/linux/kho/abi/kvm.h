@@ -27,6 +27,7 @@
 #include <linux/kho/abi/kexec_handover.h>
 #include <linux/kho/abi/luo.h>
 #include <linux/types.h>
+#include <uapi/linux/kvm.h>
 
 /**
  * enum kvm_vm_luo_feature - Feature indices for struct kvm_vm_luo_state.
@@ -148,5 +149,80 @@ static_assert(offsetof(struct kvm_gmem_luo_state, size) == 128);
 
 /* The name of the live update file handler for guest_memfd files. */
 #define KVM_GMEM_LUO_FH_NAME	"guest_memfd"
+
+#ifdef CONFIG_X86
+
+#define KVM_LUO_X86_MAX_IRQ_ROUTES	1024
+
+#define KVM_LUO_X86_VM_STATE_VERSION	1
+#define KVM_LUO_X86_VM_FLAG_HAS_PIT		BIT(0)
+#define KVM_LUO_X86_VM_FLAG_HAS_TSS		BIT(1)
+#define KVM_LUO_X86_VM_FLAG_HAS_IDENT		BIT(2)
+#define KVM_LUO_X86_VM_FLAG_WALL_CLOCK		BIT(3)
+#define KVM_LUO_X86_VM_FLAG_EXCEPTION_PAYLOAD	BIT(4)
+#define KVM_LUO_X86_VM_FLAG_PIT_SPEAKER_DUMMY	BIT(5)
+#define KVM_LUO_X86_VM_FLAG_PIT_REINJECT	BIT(6)
+#define KVM_LUO_X86_VM_FLAG_TRIPLE_FAULT_EVENT	BIT(7)
+#define KVM_LUO_X86_VM_FLAG_X2APIC_FORMAT	BIT(8)
+#define KVM_LUO_X86_VM_FLAG_X2APIC_BC_QUIRK_DIS	BIT(9)
+#define KVM_LUO_X86_VM_FLAG_BUS_LOCK_DETECTION	BIT(10)
+#define KVM_LUO_X86_VM_FLAG_SUPPRESS_EOI_BC_EN	BIT(11)
+#define KVM_LUO_X86_VM_FLAG_SUPPRESS_EOI_BC_DIS	BIT(12)
+#define KVM_LUO_X86_VM_FLAG_MSR_PLATFORM_INFO	BIT(13)
+#define KVM_LUO_X86_VM_FLAG_EXIT_ON_EMUL_ERR	BIT(14)
+#define KVM_LUO_X86_VM_FLAG_EXIT_HC_MAP_GPA	BIT(15)
+#define KVM_LUO_X86_VM_FLAG_DISABLE_EXITS_PAUSE	BIT(16)
+#define KVM_LUO_X86_VM_FLAG_DISABLE_PMU		BIT(17)
+#define KVM_LUO_X86_VM_FLAG_PIT_TIMER_ACTIVE	BIT(18)
+
+/**
+ * struct kvm_luo_vm_x86_state - Preserved x86 VM architectural state.
+ * @version:              Format version (%KVM_LUO_X86_VM_STATE_VERSION).
+ * @flags:                %KVM_LUO_X86_VM_FLAG_* flags.
+ * @irqchip_mode:         In-kernel irqchip mode (NONE, KERNEL, SPLIT).
+ * @nr_ioapic_pins:       Number of split-irqchip IOAPIC pins.
+ * @default_tsc_khz:      VM default TSC frequency in kHz.
+ * @bsp_vcpu_id:          Boot processor vCPU identifier.
+ * @tss_addr:             TSS address set via KVM_SET_TSS_ADDR.
+ * @ioapic_irr_delivered: Preserved IOAPIC irr_delivered bitmap.
+ * @identity_map_addr:    Identity map address set via KVM_SET_IDENTITY_MAP_ADDR.
+ * @clock_ns:             Guest kvmclock value in nanoseconds at freeze.
+ * @clock_realtime_ns:    Host CLOCK_REALTIME in nanoseconds at freeze.
+ * @wall_clock_gpa:       Guest physical address of pvclock wall_clock.
+ * @pic_master:           Master 8259A PIC state.
+ * @pic_slave:            Slave 8259A PIC state.
+ * @ioapic:               In-kernel IOAPIC state.
+ * @pit:                  In-kernel 8254 PIT state.
+ * @nr_irq_routes:        Number of preserved GSI routing entries.
+ * @nr_vcpus:             Number of online vCPUs at freeze time.
+ * @disabled_quirks:      Preserved VM disabled_quirks mask.
+ * @irq_routes:           Preserved GSI routing table entries.
+ */
+struct kvm_luo_vm_x86_state {
+	u32 version;
+	u32 flags;
+	u32 irqchip_mode;
+	u32 nr_ioapic_pins;
+	u32 default_tsc_khz;
+	u32 bsp_vcpu_id;
+	u32 tss_addr;
+	u32 ioapic_irr_delivered;
+	u64 identity_map_addr;
+	u64 clock_ns;
+	u64 clock_realtime_ns;
+	u64 wall_clock_gpa;
+	struct kvm_irqchip pic_master;
+	struct kvm_irqchip pic_slave;
+	struct kvm_irqchip ioapic;
+	struct kvm_pit_state2 pit;
+	u16 nr_irq_routes;
+	u16 nr_vcpus;
+	u32 disabled_quirks;
+	struct kvm_irq_routing_entry irq_routes[KVM_LUO_X86_MAX_IRQ_ROUTES];
+};
+
+static_assert(sizeof(struct kvm_luo_vm_x86_state) == 50896);
+
+#endif /* CONFIG_X86 */
 
 #endif /* _LINUX_KHO_ABI_KVM_H */

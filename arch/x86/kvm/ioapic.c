@@ -779,3 +779,28 @@ void kvm_set_ioapic(struct kvm *kvm, struct kvm_ioapic_state *state)
 	kvm_ioapic_inject_all(ioapic, state->irr);
 	spin_unlock(&ioapic->lock);
 }
+
+void kvm_ioapic_luo_save(struct kvm *kvm, struct kvm_ioapic_state *state,
+			 u32 *irr_delivered)
+{
+	struct kvm_ioapic *ioapic = kvm->arch.vioapic;
+
+	spin_lock(&ioapic->lock);
+	memcpy(state, ioapic, sizeof(struct kvm_ioapic_state));
+	*irr_delivered = ioapic->irr_delivered;
+	spin_unlock(&ioapic->lock);
+}
+
+void kvm_ioapic_luo_restore(struct kvm *kvm,
+			    const struct kvm_ioapic_state *state,
+			    u32 irr_delivered)
+{
+	struct kvm_ioapic *ioapic = kvm->arch.vioapic;
+
+	spin_lock(&ioapic->lock);
+	memcpy(ioapic, state, sizeof(struct kvm_ioapic_state));
+	ioapic->irr = state->irr;
+	ioapic->irr_delivered = irr_delivered & state->irr;
+	rtc_irq_eoi_tracking_reset(ioapic);
+	spin_unlock(&ioapic->lock);
+}

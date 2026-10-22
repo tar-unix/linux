@@ -911,4 +911,9 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu);
 
 void kvm_flush_pml_buffer(struct kvm_vcpu *vcpu, u16 pml_idx);
 
+int kvm_vm_ioctl_set_tss_addr(struct kvm *kvm, unsigned long addr);
+int kvm_vm_ioctl_set_identity_map_addr(struct kvm *kvm, u64 ident_addr);
+void kvm_luo_save_clock(struct kvm *kvm, u64 *clock_ns, u64 *realtime_ns);
+void kvm_luo_restore_clock(struct kvm *kvm, u64 clock_ns, u64 realtime_ns);
+
 #endif

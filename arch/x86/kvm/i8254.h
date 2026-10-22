@@ -34,6 +34,7 @@ struct kvm_kpit_state {
 	bool is_periodic;
 	s64 period; 				/* unit: ns */
 	struct hrtimer timer;
+	u32 luo_pending_vcpus;
 
 	struct mutex lock;
 	atomic_t reinject;
@@ -67,6 +68,11 @@ int kvm_vm_ioctl_reinject(struct kvm *kvm, struct kvm_reinject_control *control)
 
 struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags);
 void kvm_free_pit(struct kvm *kvm);
+void kvm_pit_luo_restore(struct kvm *kvm, const struct kvm_pit_state2 *ps,
+			 bool timer_active, u32 nr_vcpus);
+void kvm_pit_luo_vcpu_retrieved(struct kvm *kvm);
+#else
+static inline void kvm_pit_luo_vcpu_retrieved(struct kvm *kvm) {}
 #endif /* CONFIG_KVM_IOAPIC */
 
 #endif

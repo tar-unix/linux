@@ -1422,6 +1422,10 @@ struct kvm_arch {
 	 * current VM.
 	 */
 	int cpu_dirty_log_size;
+	u32 luo_tss_addr;
+	u64 luo_identity_map_addr;
+	bool luo_tss_addr_set;
+	bool luo_identity_map_addr_set;
 };
 
 struct kvm_vm_stat {
