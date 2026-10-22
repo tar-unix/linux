@@ -181,6 +181,7 @@ TEST_GEN_PROGS_EXTENDED_x86 += x86/nx_huge_pages_test
 
 # Live update tests that need a kexec reboot, see kvm_luo_vmtest.sh
 TEST_GEN_PROGS_EXTENDED_x86 += kvm_luo_kexec_test
+TEST_GEN_PROGS_EXTENDED_x86 += x86/sev_snp_luo_kexec_test
 
 TEST_GEN_PROGS_arm64 = $(TEST_GEN_PROGS_COMMON)
 TEST_GEN_PROGS_arm64 += arm64/aarch32_id_regs
