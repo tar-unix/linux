@@ -258,6 +258,7 @@ static_assert(sizeof(struct kvm_vcpu_luo_state) == 144);
 
 /* Global CoCo FLB handler names. */
 #define TDX_HOST_LUO_FLB_NAME	"tdx-host"
+#define SEV_SNP_LUO_FLB_NAME	"sev-snp"
 
 #ifdef CONFIG_X86
 
@@ -435,6 +436,81 @@ struct kvm_tdx_vcpu_luo_state {
 };
 
 static_assert(sizeof(struct kvm_tdx_vcpu_luo_state) == 256);
+
+#define SEV_SNP_LUO_MAX_IOMMUS		16
+#define SEV_SNP_LUO_MAX_HV_FIXED	64
+#define SEV_SNP_LUO_MAX_ASIDS		1024
+
+#define SEV_SNP_LUO_FLB_MAGIC		0x534e504cU
+#define SEV_SNP_LUO_FLB_F_ACTIVE_VMS	BIT(0)
+
+/**
+ * struct amd_iommu_luo_state - Preserved ring/table buffers for one AMD IOMMU.
+ * @pci_seg:        PCI segment number of the IOMMU.
+ * @devid:          PCI device ID (BDF) of the IOMMU.
+ * @dev_table_size: Device table size in bytes (iommu->pci_seg->dev_table_size).
+ * @evt_buf_size:   Event log buffer size in bytes.
+ * @ppr_log_size:   PPR log buffer size in bytes.
+ * @dev_table_pa:   Physical address of the device table.
+ * @cmd_buf_pa:     Physical address of the command buffer.
+ * @evt_buf_pa:     Physical address of the event log buffer.
+ * @ppr_log_pa:     Physical address of the PPR log buffer.
+ * @cmd_sem_pa:     Physical address of the 4KB command semaphore page.
+ * @ga_log_pa:      Physical address of the guest APIC log buffer.
+ * @ga_log_tail_pa: Physical address of the guest APIC log tail page.
+ */
+struct amd_iommu_luo_state {
+	u16 pci_seg;
+	u16 devid;
+	u32 dev_table_size;
+	u32 evt_buf_size;
+	u32 ppr_log_size;
+	u64 dev_table_pa;
+	u64 cmd_buf_pa;
+	u64 evt_buf_pa;
+	u64 ppr_log_pa;
+	u64 cmd_sem_pa;
+	u64 ga_log_pa;
+	u64 ga_log_tail_pa;
+};
+
+static_assert(sizeof(struct amd_iommu_luo_state) == 72);
+
+/**
+ * struct sev_snp_luo_flb_state - Preserved global state for "sev-snp" FLB.
+ * @magic:             Magic value (%SEV_SNP_LUO_FLB_MAGIC).
+ * @flags:             %SEV_SNP_LUO_FLB_F_* flags.
+ * @rmp_base:          Physical base address of the RMP table.
+ * @rmp_end:           Physical end address of the RMP table.
+ * @sev_es_tmr_pa:     Physical address of the SEV-ES TMR buffer.
+ * @sev_es_tmr_order:  Page allocation order of @sev_es_tmr_pa.
+ * @sev_init_ex_order: Page allocation order of @sev_init_ex_pa.
+ * @sev_init_ex_pa:    Physical address of the SEV_INIT_EX NV buffer.
+ * @nr_hv_fixed_pages: Number of preserved hypervisor fixed page ranges.
+ * @nr_iommus:         Number of preserved AMD IOMMU instances.
+ * @active_asids:      Bitmap of preserved active SEV-SNP ASIDs.
+ * @hv_fixed_pa:       Physical addresses of HV_FIXED page ranges.
+ * @hv_fixed_order:    Page orders of HV_FIXED page ranges.
+ * @iommus:            Preserved AMD IOMMU hardware buffer states.
+ */
+struct sev_snp_luo_flb_state {
+	u32 magic;
+	u32 flags;
+	u64 rmp_base;
+	u64 rmp_end;
+	u64 sev_es_tmr_pa;
+	u32 sev_es_tmr_order;
+	u32 sev_init_ex_order;
+	u64 sev_init_ex_pa;
+	u32 nr_hv_fixed_pages;
+	u32 nr_iommus;
+	u64 active_asids[16];
+	u64 hv_fixed_pa[SEV_SNP_LUO_MAX_HV_FIXED];
+	u32 hv_fixed_order[SEV_SNP_LUO_MAX_HV_FIXED];
+	struct amd_iommu_luo_state iommus[SEV_SNP_LUO_MAX_IOMMUS];
+};
+
+static_assert(sizeof(struct sev_snp_luo_flb_state) == 2104);
 
 #define KVM_LUO_X86_MAX_CPUID_ENTRIES	256
 #define KVM_LUO_X86_MAX_MSR_ENTRIES	512

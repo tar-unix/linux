@@ -646,9 +646,18 @@ static inline u64 savic_ghcb_msr_read(u32 reg) { return 0; }
 
 #endif	/* CONFIG_AMD_MEM_ENCRYPT */
 
+struct sev_snp_luo_flb_state;
+
 #ifdef CONFIG_KVM_AMD_SEV
 bool snp_probe_rmptable_info(void);
 int snp_rmptable_init(void);
+int snp_rmptable_luo_early_init(void);
+void snp_get_rmp_range(u64 *base, u64 *end);
+bool snp_luo_is_adopted(void);
+void snp_luo_clear_adopted(void);
+int amd_iommu_luo_preserve(struct sev_snp_luo_flb_state *st);
+void amd_iommu_luo_unpreserve(const struct sev_snp_luo_flb_state *st);
+int amd_iommu_luo_retrieve(const struct sev_snp_luo_flb_state *st);
 int snp_lookup_rmpentry(u64 pfn, bool *assigned, int *level);
 void snp_dump_hva_rmpentry(unsigned long address);
 int psmash(u64 pfn);
@@ -666,6 +675,28 @@ void snp_shutdown(void);
 #else
 static inline bool snp_probe_rmptable_info(void) { return false; }
 static inline int snp_rmptable_init(void) { return -ENOSYS; }
+static inline int snp_rmptable_luo_early_init(void) { return 0; }
+static inline void snp_get_rmp_range(u64 *base, u64 *end)
+{
+	*base = 0;
+	*end = 0;
+}
+
+static inline bool snp_luo_is_adopted(void) { return false; }
+static inline void snp_luo_clear_adopted(void) {}
+
+static inline int amd_iommu_luo_preserve(struct sev_snp_luo_flb_state *st)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void amd_iommu_luo_unpreserve(const struct sev_snp_luo_flb_state *st) {}
+
+static inline int amd_iommu_luo_retrieve(const struct sev_snp_luo_flb_state *st)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline int snp_lookup_rmpentry(u64 pfn, bool *assigned, int *level) { return -ENODEV; }
 static inline void snp_dump_hva_rmpentry(unsigned long address) {}
 static inline int psmash(u64 pfn) { return -ENODEV; }

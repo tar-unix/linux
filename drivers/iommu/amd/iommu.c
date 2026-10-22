@@ -500,7 +500,7 @@ static struct iommu_dev_data *find_dev_data(struct amd_iommu *iommu, u16 devid)
 		if (!dev_data)
 			return NULL;
 
-		if (translation_pre_enabled(iommu))
+		if (translation_pre_enabled(iommu) && !iommu_snp_luo_adopted())
 			dev_data->defer_attach = true;
 	}
 

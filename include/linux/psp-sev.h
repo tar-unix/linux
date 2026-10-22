@@ -1181,4 +1181,29 @@ static inline bool sev_is_snp_ciphertext_hiding_supported(void) { return false; 
 
 #endif	/* CONFIG_CRYPTO_DEV_SP_PSP */
 
+struct liveupdate_flb;
+struct liveupdate_flb_op_args;
+
+#ifdef CONFIG_CRYPTO_DEV_SP_PSP
+extern struct liveupdate_flb sev_snp_luo_flb;
+int sev_snp_luo_preserve(struct liveupdate_flb_op_args *args);
+void sev_snp_luo_unpreserve(struct liveupdate_flb_op_args *args);
+int sev_snp_luo_retrieve(struct liveupdate_flb_op_args *args);
+void sev_snp_luo_finish(struct liveupdate_flb_op_args *args);
+#else
+static inline int sev_snp_luo_preserve(struct liveupdate_flb_op_args *args)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void sev_snp_luo_unpreserve(struct liveupdate_flb_op_args *args) {}
+
+static inline int sev_snp_luo_retrieve(struct liveupdate_flb_op_args *args)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void sev_snp_luo_finish(struct liveupdate_flb_op_args *args) {}
+#endif
+
 #endif	/* __PSP_SEV_H__ */

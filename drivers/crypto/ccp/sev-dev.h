@@ -58,6 +58,7 @@ struct sev_device {
 	bool cmd_buf_backup_active;
 
 	bool snp_initialized;
+	bool luo_preserved;
 
 	struct kobject *sev_kobj;
 	struct kobject *verify_mit;

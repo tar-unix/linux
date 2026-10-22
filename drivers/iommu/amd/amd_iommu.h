@@ -170,6 +170,7 @@ static inline struct protection_domain *to_pdomain(struct iommu_domain *dom)
 }
 
 bool translation_pre_enabled(struct amd_iommu *iommu);
+bool iommu_snp_luo_adopted(void);
 int __init add_special_device(u8 type, u8 id, u32 *devid, bool cmd_line);
 
 int amd_iommu_pdom_id_alloc(void);

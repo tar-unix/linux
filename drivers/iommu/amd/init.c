@@ -32,6 +32,9 @@
 #include <asm/sev.h>
 
 #include <linux/crash_dump.h>
+#include <linux/kexec_handover.h>
+#include <linux/kho/abi/kvm.h>
+#include <linux/liveupdate.h>
 
 #include "amd_iommu.h"
 #include "../irq_remapping.h"
@@ -358,12 +361,31 @@ static void iommu_write_l2(struct amd_iommu *iommu, u8 address, u32 val)
  *
  ****************************************************************************/
 
+static bool amd_iommu_luo_adopted;
+static bool amd_iommu_luo_restored;
+
+/*
+ * Set once by init_iommu_all() when the IOMMU tables and buffers are adopted
+ * in-place from the previous kernel.  It must not follow later changes of
+ * snp_luo_is_adopted(): once adopted, the hardware keeps using these buffers,
+ * so they must never be freed or reallocated as if this were a fresh boot.
+ */
+bool iommu_snp_luo_adopted(void)
+{
+	return amd_iommu_luo_adopted;
+}
+
+static bool iommu_snp_luo_boot_adopt(void)
+{
+	return iommu_snp_luo_adopted() && init_state != IOMMU_INITIALIZED;
+}
+
 static void iommu_set_cwwb_range(struct amd_iommu *iommu)
 {
 	u64 start = iommu_virt_to_phys((void *)iommu->cmd_sem);
 	u64 entry = start & PM_ADDR_MASK;
 
-	if (!check_feature(FEATURE_SNP))
+	if (!check_feature(FEATURE_SNP) || iommu_snp_luo_boot_adopt())
 		return;
 
 	/* Note:
@@ -390,7 +412,7 @@ static void iommu_set_device_table(struct amd_iommu *iommu)
 
 	BUG_ON(iommu->mmio_base == NULL);
 
-	if (is_kdump_kernel())
+	if (is_kdump_kernel() || iommu_snp_luo_boot_adopt())
 		return;
 
 	entry = iommu_virt_to_phys(dev_table);
@@ -635,7 +657,8 @@ static inline void free_dev_table(struct amd_iommu_pci_seg *pci_seg)
 {
 	if (is_kdump_kernel())
 		memunmap((void *)pci_seg->dev_table);
-	else
+	else if (pci_seg->dev_table != pci_seg->old_dev_tbl_cpy ||
+		 !iommu_snp_luo_adopted() || amd_iommu_luo_restored)
 		iommu_free_pages(pci_seg->dev_table);
 	pci_seg->dev_table = NULL;
 }
@@ -802,7 +825,7 @@ static void iommu_enable_command_buffer(struct amd_iommu *iommu)
 
 	BUG_ON(iommu->cmd_buf == NULL);
 
-	if (!is_kdump_kernel()) {
+	if (!is_kdump_kernel() && !iommu_snp_luo_boot_adopt()) {
 		/*
 		 * Command buffer is re-used for kdump kernel and setting
 		 * of MMIO register is not required.
@@ -813,7 +836,8 @@ static void iommu_enable_command_buffer(struct amd_iommu *iommu)
 			    &entry, sizeof(entry));
 	}
 
-	amd_iommu_reset_cmd_buffer(iommu);
+	if (!iommu_snp_luo_boot_adopt())
+		amd_iommu_reset_cmd_buffer(iommu);
 }
 
 /*
@@ -868,6 +892,9 @@ static void iommu_enable_event_buffer(void)
 	struct amd_iommu *iommu;
 	u64 entry;
 
+	if (iommu_snp_luo_boot_adopt())
+		return;
+
 	for_each_iommu(iommu) {
 		BUG_ON(iommu->evt_buf == NULL);
 
@@ -908,9 +935,11 @@ static void __init free_event_buffer(struct amd_iommu *iommu)
 static void free_ga_log(struct amd_iommu *iommu)
 {
 #ifdef CONFIG_IRQ_REMAP
-	iommu_free_pages(iommu->ga_log);
+	if (!iommu_snp_luo_adopted() || amd_iommu_luo_restored) {
+		iommu_free_pages(iommu->ga_log);
+		iommu_free_pages(iommu->ga_log_tail);
+	}
 	iommu->ga_log = NULL;
-	iommu_free_pages(iommu->ga_log_tail);
 	iommu->ga_log_tail = NULL;
 #endif
 }
@@ -1038,6 +1067,19 @@ static int __init alloc_iommu_buffers(struct amd_iommu *iommu)
 {
 	int ret;
 
+	if (iommu_snp_luo_adopted()) {
+		u64 paddr;
+
+		paddr = readq(iommu->mmio_base + MMIO_EXCL_BASE_OFFSET) & PM_ADDR_MASK;
+		iommu->cmd_sem = iommu_phys_to_virt(paddr);
+		iommu->cmd_sem_paddr = paddr;
+		iommu->cmd_sem_val = READ_ONCE(*iommu->cmd_sem);
+
+		paddr = readq(iommu->mmio_base + MMIO_CMD_BUF_OFFSET) & PM_ADDR_MASK;
+		iommu->cmd_buf = iommu_phys_to_virt(paddr);
+		return 0;
+	}
+
 	/*
 	 * Reuse/Remap the previous kernel's allocated completion wait
 	 * command and event buffers for kdump boot.
@@ -1094,7 +1136,7 @@ static void __init free_iommu_buffers(struct amd_iommu *iommu)
 		unmap_cwwb_sem(iommu);
 		unmap_command_buffer(iommu);
 		unmap_event_buffer(iommu);
-	} else {
+	} else if (!iommu_snp_luo_adopted() || amd_iommu_luo_restored) {
 		free_cwwb_sem(iommu);
 		free_command_buffer(iommu);
 		free_event_buffer(iommu);
@@ -1174,9 +1216,12 @@ static bool __reuse_device_table(struct amd_iommu *iommu)
 	}
 
 	/*
-	 * Re-use the previous kernel's device table for kdump.
+	 * Re-use the previous kernel's device table for kdump or SNP liveupdate.
 	 */
-	pci_seg->old_dev_tbl_cpy = iommu_memremap(old_devtb_phys, pci_seg->dev_table_size);
+	if (iommu_snp_luo_adopted())
+		pci_seg->old_dev_tbl_cpy = iommu_phys_to_virt(old_devtb_phys);
+	else
+		pci_seg->old_dev_tbl_cpy = iommu_memremap(old_devtb_phys, pci_seg->dev_table_size);
 	if (pci_seg->old_dev_tbl_cpy == NULL) {
 		pr_err("Failed to remap memory for reusing old device table!\n");
 		return false;
@@ -1792,7 +1837,9 @@ static void __init free_iommu_one(struct amd_iommu *iommu)
 {
 	free_sysfs(iommu);
 	free_iommu_buffers(iommu);
-	amd_iommu_free_ppr_log(iommu);
+	if (!iommu_snp_luo_adopted() || !amd_iommu_gt_ppr_supported() ||
+	    amd_iommu_luo_restored)
+		amd_iommu_free_ppr_log(iommu);
 	free_ga_log(iommu);
 	iommu_unmap_mmio_space(iommu);
 	amd_iommu_iopf_uninit(iommu);
@@ -1961,16 +2008,6 @@ static int __init init_iommu_one_late(struct amd_iommu *iommu)
 
 	iommu->int_enabled = false;
 
-	init_translation_status(iommu);
-	if (translation_pre_enabled(iommu) && !is_kdump_kernel()) {
-		iommu_disable(iommu);
-		clear_translation_pre_enabled(iommu);
-		pr_warn("Translation was enabled for IOMMU:%d but we are not in kdump mode\n",
-			iommu->index);
-	}
-	if (amd_iommu_pre_enabled)
-		amd_iommu_pre_enabled = translation_pre_enabled(iommu);
-
 	if (amd_iommu_irq_remap) {
 		ret = amd_iommu_create_irq_domain(iommu);
 		if (ret)
@@ -2054,6 +2091,27 @@ static int __init init_iommu_all(struct acpi_table_header *table)
 
 	/* Phase 2 : Early feature support check */
 	get_global_efr();
+
+	for_each_iommu(iommu) {
+		init_translation_status(iommu);
+		if (translation_pre_enabled(iommu) && !is_kdump_kernel() &&
+		    !(IS_ENABLED(CONFIG_LIVEUPDATE) &&
+		      check_feature(FEATURE_SNP) &&
+		      snp_luo_is_adopted())) {
+			iommu_disable(iommu);
+			clear_translation_pre_enabled(iommu);
+			pr_warn("Translation was enabled for IOMMU:%d but we are not in kdump mode\n",
+				iommu->index);
+		}
+		if (amd_iommu_pre_enabled)
+			amd_iommu_pre_enabled = translation_pre_enabled(iommu);
+	}
+
+	if (IS_ENABLED(CONFIG_LIVEUPDATE) &&
+	    check_feature(FEATURE_SNP) &&
+	    snp_luo_is_adopted() &&
+	    amd_iommu_pre_enabled)
+		amd_iommu_luo_adopted = true;
 
 	/* Phase 3 : Enabling IOMMU features */
 	for_each_iommu(iommu) {
@@ -2193,8 +2251,16 @@ static int __init iommu_init_pci(struct amd_iommu *iommu)
 		iommu_enable_gt(iommu);
 	}
 
-	if (check_feature(FEATURE_PPR) && amd_iommu_alloc_ppr_log(iommu))
-		return -ENOMEM;
+	if (check_feature(FEATURE_PPR)) {
+		u64 paddr = 0;
+
+		if (iommu_snp_luo_adopted() && amd_iommu_gt_ppr_supported())
+			paddr = readq(iommu->mmio_base + MMIO_PPR_LOG_OFFSET) & PM_ADDR_MASK;
+		if (paddr)
+			iommu->ppr_log = iommu_phys_to_virt(paddr);
+		else if (amd_iommu_alloc_ppr_log(iommu))
+			return -ENOMEM;
+	}
 
 	if (iommu->cap & (1UL << IOMMU_CAP_NPCACHE)) {
 		pr_info("Using strict mode due to virtualization\n");
@@ -2367,6 +2433,12 @@ static int iommu_setup_msi(struct amd_iommu *iommu)
 	if (r) {
 		pci_disable_msi(iommu->dev);
 		return r;
+	}
+
+	if (iommu_snp_luo_boot_adopt()) {
+		disable_irq(iommu->dev->irq);
+		amd_iommu_int_thread(iommu->dev->irq, iommu);
+		enable_irq(iommu->dev->irq);
 	}
 
 	return 0;
@@ -2543,6 +2615,12 @@ static int __iommu_setup_intcapxt(struct amd_iommu *iommu, const char *devname,
 		irq_domain_free_irqs(irq, 1);
 		irq_domain_remove(domain);
 		return ret;
+	}
+
+	if (iommu_snp_luo_boot_adopt()) {
+		disable_irq(irq);
+		thread_fn(irq, iommu);
+		enable_irq(irq);
 	}
 
 	return 0;
@@ -2831,19 +2909,28 @@ static void iommu_apply_resume_quirks(struct amd_iommu *iommu)
 			       iommu->stored_addr_lo | 1);
 }
 
-static void iommu_enable_ga(struct amd_iommu *iommu)
+static void iommu_init_ga(struct amd_iommu *iommu)
 {
 #ifdef CONFIG_IRQ_REMAP
 	switch (amd_iommu_guest_ir) {
 	case AMD_IOMMU_GUEST_IR_VAPIC:
 	case AMD_IOMMU_GUEST_IR_LEGACY_GA:
-		iommu_feature_enable(iommu, CONTROL_GA_EN);
 		iommu->irte_ops = &irte_128_ops;
 		break;
 	default:
 		iommu->irte_ops = &irte_32_ops;
 		break;
 	}
+#endif
+}
+
+static void iommu_enable_ga(struct amd_iommu *iommu)
+{
+#ifdef CONFIG_IRQ_REMAP
+	iommu_init_ga(iommu);
+	if (amd_iommu_guest_ir == AMD_IOMMU_GUEST_IR_VAPIC ||
+	    amd_iommu_guest_ir == AMD_IOMMU_GUEST_IR_LEGACY_GA)
+		iommu_feature_enable(iommu, CONTROL_GA_EN);
 #endif
 }
 
@@ -2949,6 +3036,17 @@ static void early_enable_iommus(void)
 		}
 
 		for_each_iommu(iommu) {
+			if (iommu_snp_luo_adopted()) {
+				iommu->cmd_buf_head =
+					readl(iommu->mmio_base + MMIO_CMD_HEAD_OFFSET);
+				iommu->cmd_buf_tail =
+					readl(iommu->mmio_base + MMIO_CMD_TAIL_OFFSET);
+				iommu_disable_irtcachedis(iommu);
+				iommu_init_ga(iommu);
+				iommu_enable_irtcachedis(iommu);
+				amd_iommu_flush_all_caches(iommu);
+				continue;
+			}
 			iommu_disable_command_buffer(iommu);
 			iommu_disable_event_buffer(iommu);
 			iommu_disable_irtcachedis(iommu);
@@ -2967,7 +3065,7 @@ static void enable_iommus_ppr(void)
 {
 	struct amd_iommu *iommu;
 
-	if (!amd_iommu_gt_ppr_supported())
+	if (!amd_iommu_gt_ppr_supported() || iommu_snp_luo_boot_adopt())
 		return;
 
 	for_each_iommu(iommu)
@@ -2979,6 +3077,22 @@ static void enable_iommus_vapic(void)
 #ifdef CONFIG_IRQ_REMAP
 	u32 status, i;
 	struct amd_iommu *iommu;
+
+	if (iommu_snp_luo_boot_adopt()) {
+		if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir))
+			return;
+
+		if (!check_feature(FEATURE_GAM_VAPIC) ||
+		    (amd_iommu_snp_en && !FEATURE_SNPAVICSUP_GAM(amd_iommu_efr2))) {
+			amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_LEGACY_GA;
+			return;
+		}
+
+		/* GA log buffers were adopted by amd_iommu_enable_interrupts(). */
+		amd_iommu_irq_ops.capability |= (1 << IRQ_POSTING_CAP);
+		pr_info("Virtual APIC adopted\n");
+		return;
+	}
 
 	for_each_iommu(iommu) {
 		/*
@@ -3041,6 +3155,9 @@ static void enable_iommus_vapic(void)
 static void disable_iommus(void)
 {
 	struct amd_iommu *iommu;
+
+	if (amd_iommu_snp_en && liveupdate_coco_is_preserving())
+		return;
 
 	for_each_iommu(iommu)
 		iommu_disable(iommu);
@@ -3228,6 +3345,8 @@ static int __init early_amd_iommu_init(void)
 	acpi_status status;
 	u8 efr_hats, max_vasize;
 
+	snp_rmptable_luo_early_init();
+
 	if (!amd_iommu_detected)
 		return -ENODEV;
 
@@ -3309,7 +3428,7 @@ static int __init early_amd_iommu_init(void)
 	}
 
 	/* Disable any previously enabled IOMMUs */
-	if (!is_kdump_kernel() || amd_iommu_disabled)
+	if ((!is_kdump_kernel() && !iommu_snp_luo_adopted()) || amd_iommu_disabled)
 		disable_iommus();
 
 	if (amd_iommu_irq_remap)
@@ -3338,12 +3457,36 @@ out:
 	return ret;
 }
 
+/*
+ * On a live update boot the GA log kept running across kexec.  Adopt its
+ * buffers before iommu_init_irq() can unmask the GA log interrupt, so that
+ * iommu_poll_ga_log() never sees a NULL iommu->ga_log.
+ */
+static void iommu_luo_adopt_ga_log(struct amd_iommu *iommu)
+{
+#ifdef CONFIG_IRQ_REMAP
+	u64 paddr;
+
+	paddr = readq(iommu->mmio_base + MMIO_GA_LOG_BASE_OFFSET) & PM_ADDR_MASK;
+	if (paddr)
+		iommu->ga_log = iommu_phys_to_virt(paddr);
+
+	paddr = readq(iommu->mmio_base + MMIO_GA_LOG_TAIL_OFFSET) & PM_ADDR_MASK;
+	if (paddr)
+		iommu->ga_log_tail = iommu_phys_to_virt(paddr);
+#endif
+}
+
 static int amd_iommu_enable_interrupts(void)
 {
+	bool luo_adopt = iommu_snp_luo_boot_adopt();
 	struct amd_iommu *iommu;
 	int ret = 0;
 
 	for_each_iommu(iommu) {
+		if (luo_adopt)
+			iommu_luo_adopt_ga_log(iommu);
+
 		ret = iommu_init_irq(iommu);
 		if (ret)
 			goto out;
@@ -3516,10 +3659,22 @@ static int __init state_next(void)
 		amd_iommu_apply_erratum_snp();
 
 		/* Allocate/enable event log buffer */
-		if (is_kdump_kernel())
+		if (iommu_snp_luo_adopted()) {
+			struct amd_iommu *iommu;
+
+			for_each_iommu(iommu) {
+				u64 paddr = readq(iommu->mmio_base +
+						  MMIO_EVT_BUF_OFFSET) &
+					    PM_ADDR_MASK;
+
+				iommu->evt_buf = iommu_phys_to_virt(paddr);
+			}
+			ret = 0;
+		} else if (is_kdump_kernel()) {
 			ret = remap_event_buffer();
-		else
+		} else {
 			ret = alloc_event_buffer();
+		}
 
 		if (ret) {
 			init_state = IOMMU_INIT_ERROR;
@@ -3554,7 +3709,8 @@ static int __init state_next(void)
 	if (ret) {
 		free_dma_resources();
 		if (!irq_remapping_enabled) {
-			disable_iommus();
+			if (!iommu_snp_luo_adopted())
+				disable_iommus();
 			free_iommu_resources();
 		} else {
 			struct amd_iommu *iommu;
@@ -4160,4 +4316,193 @@ bool amd_iommu_sev_tio_supported(void)
 	return check_feature2(FEATURE_SEVSNPIO_SUP);
 }
 EXPORT_SYMBOL_GPL(amd_iommu_sev_tio_supported);
+
+static int iommu_kho_preserve_buf(void *buf, size_t size, u64 *phys_out)
+{
+	phys_addr_t phys;
+	int ret;
+
+	if (!buf || !size) {
+		*phys_out = 0;
+		return 0;
+	}
+
+	phys = __sme_clr(iommu_virt_to_phys(buf));
+	ret = kho_preserve_folio(page_folio(phys_to_page(phys)));
+	if (ret)
+		return ret;
+
+	*phys_out = phys;
+	return 0;
+}
+
+static void iommu_kho_unpreserve_buf(u64 phys, size_t size)
+{
+	if (!phys || !size)
+		return;
+
+	kho_unpreserve_folio(page_folio(phys_to_page(phys)));
+}
+
+static int iommu_kho_restore_buf(u64 phys, size_t size)
+{
+	struct folio *folio;
+	unsigned long pgcnt;
+
+	if (!phys || !size)
+		return 0;
+
+	folio = kho_restore_folio(phys);
+	if (!folio)
+		return -EFAULT;
+
+	pgcnt = folio_nr_pages(folio);
+	if (iommu_snp_luo_adopted()) {
+		mod_node_page_state(folio_pgdat(folio), NR_IOMMU_PAGES, pgcnt);
+		lruvec_stat_mod_folio(folio, NR_SECONDARY_PAGETABLE, pgcnt);
+	} else {
+		__snp_leak_pages(folio_pfn(folio), pgcnt, false);
+	}
+
+	return 0;
+}
+
+int amd_iommu_luo_preserve(struct sev_snp_luo_flb_state *st)
+{
+	struct amd_iommu *iommu;
+	unsigned int i = 0, j;
+	int ret;
+
+	if (!amd_iommu_snp_en)
+		return -ENODEV;
+
+	st->nr_iommus = 0;
+
+	for_each_iommu(iommu) {
+		struct amd_iommu_luo_state *ist;
+
+		if (i >= ARRAY_SIZE(st->iommus)) {
+			ret = -ENOSPC;
+			goto err_unpreserve;
+		}
+
+		ist = &st->iommus[i];
+		memset(ist, 0, sizeof(*ist));
+		ist->pci_seg = iommu->pci_seg->id;
+		ist->devid = iommu->devid;
+		ist->evt_buf_size = amd_iommu_evtlog_size;
+		ist->ppr_log_size = amd_iommu_pprlog_size;
+
+		for (j = 0; j < i; j++) {
+			if (st->iommus[j].pci_seg == ist->pci_seg)
+				break;
+		}
+		if (j == i) {
+			ret = iommu_kho_preserve_buf(iommu->pci_seg->dev_table,
+						     iommu->pci_seg->dev_table_size,
+						     &ist->dev_table_pa);
+			if (ret)
+				goto err_unpreserve;
+			ist->dev_table_size = iommu->pci_seg->dev_table_size;
+		}
+
+		st->nr_iommus = i + 1;
+
+		ret = iommu_kho_preserve_buf(iommu->cmd_buf, CMD_BUFFER_SIZE,
+					     &ist->cmd_buf_pa);
+		if (ret)
+			goto err_unpreserve;
+
+		ret = iommu_kho_preserve_buf(iommu->evt_buf, ist->evt_buf_size,
+					     &ist->evt_buf_pa);
+		if (ret)
+			goto err_unpreserve;
+
+		if (amd_iommu_gt_ppr_supported()) {
+			ret = iommu_kho_preserve_buf(iommu->ppr_log,
+						     ist->ppr_log_size,
+						     &ist->ppr_log_pa);
+			if (ret)
+				goto err_unpreserve;
+		}
+
+		ret = iommu_kho_preserve_buf((void *)iommu->cmd_sem, PAGE_SIZE,
+					     &ist->cmd_sem_pa);
+		if (ret)
+			goto err_unpreserve;
+
+		ret = iommu_kho_preserve_buf(iommu->ga_log, GA_LOG_SIZE,
+					     &ist->ga_log_pa);
+		if (ret)
+			goto err_unpreserve;
+
+		ret = iommu_kho_preserve_buf(iommu->ga_log_tail, PAGE_SIZE,
+					     &ist->ga_log_tail_pa);
+		if (ret)
+			goto err_unpreserve;
+
+		i++;
+	}
+
+	return 0;
+
+err_unpreserve:
+	amd_iommu_luo_unpreserve(st);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(amd_iommu_luo_preserve);
+
+void amd_iommu_luo_unpreserve(const struct sev_snp_luo_flb_state *st)
+{
+	unsigned int i;
+
+	for (i = 0; i < st->nr_iommus; i++) {
+		const struct amd_iommu_luo_state *ist = &st->iommus[i];
+
+		iommu_kho_unpreserve_buf(ist->ga_log_tail_pa, PAGE_SIZE);
+		iommu_kho_unpreserve_buf(ist->ga_log_pa, GA_LOG_SIZE);
+		iommu_kho_unpreserve_buf(ist->cmd_sem_pa, PAGE_SIZE);
+		iommu_kho_unpreserve_buf(ist->ppr_log_pa, ist->ppr_log_size);
+		iommu_kho_unpreserve_buf(ist->evt_buf_pa, ist->evt_buf_size);
+		iommu_kho_unpreserve_buf(ist->cmd_buf_pa, CMD_BUFFER_SIZE);
+		iommu_kho_unpreserve_buf(ist->dev_table_pa, ist->dev_table_size);
+	}
+}
+EXPORT_SYMBOL_GPL(amd_iommu_luo_unpreserve);
+
+int amd_iommu_luo_retrieve(const struct sev_snp_luo_flb_state *st)
+{
+	unsigned int i;
+	int ret = 0, err;
+
+	for (i = 0; i < st->nr_iommus; i++) {
+		const struct amd_iommu_luo_state *ist = &st->iommus[i];
+
+		err = iommu_kho_restore_buf(ist->dev_table_pa, ist->dev_table_size);
+		ret = ret ?: err;
+
+		err = iommu_kho_restore_buf(ist->cmd_buf_pa, CMD_BUFFER_SIZE);
+		ret = ret ?: err;
+
+		err = iommu_kho_restore_buf(ist->evt_buf_pa, ist->evt_buf_size);
+		ret = ret ?: err;
+
+		err = iommu_kho_restore_buf(ist->ppr_log_pa, ist->ppr_log_size);
+		ret = ret ?: err;
+
+		err = iommu_kho_restore_buf(ist->cmd_sem_pa, PAGE_SIZE);
+		ret = ret ?: err;
+
+		err = iommu_kho_restore_buf(ist->ga_log_pa, GA_LOG_SIZE);
+		ret = ret ?: err;
+
+		err = iommu_kho_restore_buf(ist->ga_log_tail_pa, PAGE_SIZE);
+		ret = ret ?: err;
+	}
+
+	if (!ret)
+		amd_iommu_luo_restored = true;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(amd_iommu_luo_retrieve);
 #endif

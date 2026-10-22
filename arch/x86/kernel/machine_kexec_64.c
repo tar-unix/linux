@@ -236,6 +236,52 @@ static void *alloc_pgt_page(void *data)
 	return p;
 }
 
+static int split_ident_pmd_to_4k(struct kimage *image, pgd_t *pgd,
+				 unsigned long paddr)
+{
+	unsigned long base = paddr & PMD_MASK;
+	pgprotval_t prot = __PAGE_KERNEL_EXEC;
+	pgprotval_t kernpg = _KERNPG_TABLE_NOENC;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	int i;
+
+	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT)) {
+		prot |= _PAGE_ENC;
+		kernpg |= _PAGE_ENC;
+	}
+
+	pgd += pgd_index(base);
+	if (!pgd_present(*pgd))
+		return -EINVAL;
+	p4d = p4d_offset(pgd, base);
+	if (!p4d_present(*p4d))
+		return -EINVAL;
+	pud = pud_offset(p4d, base);
+	if (!pud_present(*pud) || pud_leaf(*pud))
+		return -EINVAL;
+	pmd = pmd_offset(pud, base);
+	if (!pmd_present(*pmd))
+		return -EINVAL;
+	if (!pmd_leaf(*pmd))
+		return 0;
+
+	pte = alloc_pgt_page(image);
+	if (!pte)
+		return -ENOMEM;
+
+	for (i = 0; i < PTRS_PER_PTE; i++) {
+		unsigned long pa = base + ((unsigned long)i << PAGE_SHIFT);
+
+		set_pte(&pte[i], __pte(pa | prot));
+	}
+
+	set_pmd(pmd, __pmd(__pa(pte) | kernpg));
+	return 0;
+}
+
 static int init_pgtable(struct kimage *image, unsigned long control_page)
 {
 	struct x86_mapping_info info = {
@@ -257,7 +303,7 @@ static int init_pgtable(struct kimage *image, unsigned long control_page)
 		info.kernpg_flag |= _PAGE_ENC;
 	}
 
-	if (direct_gbpages)
+	if (direct_gbpages && !cc_platform_has(CC_ATTR_HOST_SEV_SNP))
 		info.direct_gbpages = true;
 
 	for (i = 0; i < nr_pfn_mapped; i++) {
@@ -285,6 +331,32 @@ static int init_pgtable(struct kimage *image, unsigned long control_page)
 
 		if (result)
 			return result;
+
+		if (cc_platform_has(CC_ATTR_HOST_SEV_SNP)) {
+			unsigned long addr = mstart & PMD_MASK;
+
+			for (; addr < mend; addr += PMD_SIZE) {
+				result = split_ident_pmd_to_4k(image,
+							       image->arch.pgd,
+							       addr);
+				if (result)
+					return result;
+			}
+		}
+	}
+
+	if (cc_platform_has(CC_ATTR_HOST_SEV_SNP)) {
+		result = split_ident_pmd_to_4k(image, image->arch.pgd,
+					       control_page);
+		if (result)
+			return result;
+
+		if (image->swap_page) {
+			result = split_ident_pmd_to_4k(image, image->arch.pgd,
+						       page_to_pfn(image->swap_page) << PAGE_SHIFT);
+			if (result)
+				return result;
+		}
 	}
 
 	/*

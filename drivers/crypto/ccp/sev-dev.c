@@ -29,6 +29,9 @@
 #include <linux/psp.h>
 #include <linux/amd-iommu.h>
 #include <linux/crash_dump.h>
+#include <linux/kexec_handover.h>
+#include <linux/kho/abi/kvm.h>
+#include <linux/liveupdate.h>
 
 #include <asm/smp.h>
 #include <asm/cacheflush.h>
@@ -453,7 +456,7 @@ static struct page *__snp_alloc_firmware_pages(gfp_t gfp_mask, int order, bool l
 
 	/* If SEV-SNP is initialized then add the page in RMP table. */
 	sev = psp_master->sev_data;
-	if (!sev->snp_initialized)
+	if (!sev->snp_initialized && !snp_luo_is_adopted())
 		return page;
 
 	paddr = __pa((unsigned long)page_address(page));
@@ -475,18 +478,21 @@ EXPORT_SYMBOL_GPL(snp_alloc_firmware_page);
 
 static void __snp_free_firmware_pages(struct page *page, int order, bool locked)
 {
-	struct sev_device *sev = psp_master->sev_data;
+	struct sev_device *sev = psp_master ? psp_master->sev_data : NULL;
 	unsigned long paddr, npages = 1ul << order;
 
 	if (!page)
 		return;
 
 	paddr = __pa((unsigned long)page_address(page));
-	if (sev->snp_initialized &&
+	if (((sev && sev->snp_initialized) || snp_luo_is_adopted()) &&
 	    snp_reclaim_pages(paddr, npages, locked))
 		return;
 
-	__free_pages(page, order);
+	if (order > 0 && page_ref_count(page + 1))
+		free_contig_range(page_to_pfn(page), npages);
+	else
+		__free_pages(page, order);
 }
 
 void snp_free_firmware_page(void *addr)
@@ -804,7 +810,8 @@ static bool snp_legacy_handling_needed(int cmd)
 {
 	struct sev_device *sev = psp_master->sev_data;
 
-	return cmd < SEV_CMD_SNP_INIT && sev->snp_initialized;
+	return cmd < SEV_CMD_SNP_INIT &&
+	       (sev->snp_initialized || snp_luo_is_adopted());
 }
 
 static int snp_prep_cmd_buf(int cmd, void *cmd_buf, struct cmd_buf_desc *desc_list)
@@ -1089,6 +1096,28 @@ static void snp_hv_fixed_pages_state_update(struct sev_device *sev,
 		entry->page_state = page_state;
 }
 
+static int sev_snp_luo_ensure_retrieved(void)
+{
+	void *flb_obj;
+	int ret;
+
+	if (!snp_luo_is_adopted())
+		return 0;
+
+	ret = liveupdate_flb_get_incoming(&sev_snp_luo_flb, &flb_obj);
+	if (ret == 0) {
+		const struct sev_snp_luo_flb_state *st = flb_obj;
+
+		if (!st || !(st->flags & SEV_SNP_LUO_FLB_F_ACTIVE_VMS))
+			snp_luo_clear_adopted();
+		liveupdate_flb_put_incoming(&sev_snp_luo_flb);
+	} else if (ret == -ENODATA || ret == -ENOENT || ret == -EOPNOTSUPP) {
+		snp_luo_clear_adopted();
+		return 0;
+	}
+	return ret;
+}
+
 /*
  * Allocate HV_FIXED pages in 2MB aligned sizes to ensure the whole
  * 2MB pages are marked as HV_FIXED.
@@ -1102,6 +1131,15 @@ struct page *snp_alloc_hv_fixed_pages(unsigned int num_2mb_pages)
 
 	if (!psp_master)
 		return NULL;
+
+	/*
+	 * Retrieve the preserved HV_FIXED pages first so the exact-fit reuse
+	 * below returns the buffer that firmware already holds as HV_FIXED.
+	 * Retrieval only restores KHO pages and leaks any unadopted Firmware
+	 * or HV_FIXED pages without issuing PSP mailbox commands, so it is
+	 * safe even when called from sfs_dev_init() before sev_pci_init().
+	 */
+	sev_snp_luo_ensure_retrieved();
 
 	order = get_order(PMD_SIZE * num_2mb_pages);
 
@@ -1174,7 +1212,11 @@ void snp_free_hv_fixed_pages(struct page *page)
 		if (entry->page_state == HV_FIXED) {
 			entry->free = true;
 		} else {
-			__free_pages(page, entry->order);
+			if (entry->order > 0 && page_ref_count(page + 1))
+				free_contig_range(page_to_pfn(page),
+						  1UL << entry->order);
+			else
+				__free_pages(page, entry->order);
 			list_del(&entry->list);
 			kfree(entry);
 		}
@@ -1225,11 +1267,16 @@ static void snp_leak_hv_fixed_pages(void)
 		return;
 
 	list_for_each_entry_safe(entry, nentry, &snp_hv_fixed_pages, list) {
-		if (entry->free && entry->page_state != HV_FIXED)
-			__free_pages(entry->page, entry->order);
-		else
+		if (entry->free && entry->page_state != HV_FIXED) {
+			if (entry->order > 0 && page_ref_count(entry->page + 1))
+				free_contig_range(page_to_pfn(entry->page),
+						  1UL << entry->order);
+			else
+				__free_pages(entry->page, entry->order);
+		} else {
 			__snp_leak_pages(page_to_pfn(entry->page),
 					 1 << entry->order, false);
+		}
 
 		list_del(&entry->list);
 		kfree(entry);
@@ -1259,10 +1306,12 @@ EXPORT_SYMBOL_GPL(sev_is_snp_ciphertext_hiding_supported);
 
 static int snp_get_platform_data(struct sev_device *sev, int *error)
 {
-	struct sev_data_snp_feature_info snp_feat_info;
+	struct sev_data_snp_feature_info snp_feat_info = {};
 	struct snp_feature_info *feat_info;
-	struct sev_data_snp_addr buf;
-	struct page *page;
+	struct sev_data_snp_addr buf = {};
+	struct page *page = NULL;
+	void *status_buf = NULL;
+	bool fw_pages = snp_luo_is_adopted();
 	int rc;
 
 	/*
@@ -1272,8 +1321,22 @@ static int snp_get_platform_data(struct sev_device *sev, int *error)
 	if (sev->snp_initialized)
 		return -EINVAL;
 
-	buf.address = __psp_pa(&sev->snp_plat_status);
+	if (fw_pages) {
+		status_buf = snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT);
+		if (!status_buf)
+			return -ENOMEM;
+		buf.address = __psp_pa(status_buf);
+	} else {
+		buf.address = __psp_pa(&sev->snp_plat_status);
+	}
+
 	rc = sev_do_cmd(SEV_CMD_SNP_PLATFORM_STATUS, &buf, error);
+	if (fw_pages) {
+		if (!rc)
+			memcpy(&sev->snp_plat_status, status_buf,
+			       sizeof(sev->snp_plat_status));
+		snp_free_firmware_page(status_buf);
+	}
 	if (rc) {
 		dev_err(sev->dev, "SNP PLATFORM_STATUS command failed, ret = %d, error = %#x\n",
 			rc, *error);
@@ -1297,11 +1360,17 @@ static int snp_get_platform_data(struct sev_device *sev, int *error)
 	 * command to ensure structure is 8-byte aligned, and does not
 	 * cross a page boundary.
 	 */
-	page = alloc_page(GFP_KERNEL);
-	if (!page)
-		return -ENOMEM;
+	if (fw_pages) {
+		feat_info = snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT);
+		if (!feat_info)
+			return -ENOMEM;
+	} else {
+		page = alloc_page(GFP_KERNEL);
+		if (!page)
+			return -ENOMEM;
+		feat_info = page_address(page);
+	}
 
-	feat_info = page_address(page);
 	snp_feat_info.length = sizeof(snp_feat_info);
 	snp_feat_info.ecx_in = 0;
 	snp_feat_info.feature_info_paddr = __psp_pa(feat_info);
@@ -1313,7 +1382,10 @@ static int snp_get_platform_data(struct sev_device *sev, int *error)
 		dev_err(sev->dev, "SNP FEATURE_INFO command failed, ret = %d, error = %#x\n",
 			rc, *error);
 
-	__free_page(page);
+	if (fw_pages)
+		snp_free_firmware_page(feat_info);
+	else
+		__free_page(page);
 
 	return rc;
 }
@@ -1531,6 +1603,19 @@ static int __sev_snp_init_locked(int *error, unsigned int max_snp_asid)
 	rc = snp_prepare();
 	if (rc)
 		return rc;
+
+	if (snp_luo_is_adopted() &&
+	    sev->snp_plat_status.state == SEV_STATE_INIT) {
+		snp_hv_fixed_pages_state_update(sev, HV_FIXED);
+		sev->snp_initialized = true;
+		sev_es_tmr_size = SNP_TMR_SIZE;
+		atomic_notifier_chain_register(&panic_notifier_list,
+					       &snp_panic_notifier);
+		dev_info(sev->dev,
+			 "SEV-SNP adopted across liveupdate (API:%d.%d build:%d)\n",
+			 sev->api_major, sev->api_minor, sev->build);
+		return 0;
+	}
 
 	/*
 	 * Starting in SNP firmware v1.52, the SNP_INIT_EX command takes a list
@@ -1817,12 +1902,15 @@ static int _sev_platform_init_locked(struct sev_platform_init_args *args)
 
 	sev = psp_master->sev_data;
 
-	if (sev->sev_plat_status.state == SEV_STATE_INIT)
-		return 0;
-
 	rc = __sev_snp_init_locked(&args->error, args->max_snp_asid);
 	if (rc && rc != -ENODEV)
 		return rc;
+
+	if (snp_luo_is_adopted() && sev->snp_initialized)
+		return 0;
+
+	if (sev->sev_plat_status.state == SEV_STATE_INIT)
+		return 0;
 
 	/* Defer legacy SEV/SEV-ES support if allowed by caller/module. */
 	if (args->probe && !psp_init_on_probe)
@@ -2191,14 +2279,16 @@ static int __sev_snp_shutdown_locked(int *error, bool panic)
 	struct psp_device *psp = psp_master;
 	struct sev_device *sev;
 	struct sev_data_snp_shutdown_ex data;
+	bool was_initialized;
 	int ret;
 
 	if (!psp || !psp->sev_data)
 		return 0;
 
 	sev = psp->sev_data;
+	was_initialized = sev->snp_initialized;
 
-	if (!sev->snp_initialized)
+	if (!was_initialized && !snp_luo_is_adopted())
 		return 0;
 
 	memset(&data, 0, sizeof(data));
@@ -2227,6 +2317,8 @@ static int __sev_snp_shutdown_locked(int *error, bool panic)
 		if (ret) {
 			dev_err(sev->dev, "SEV-SNP DF_FLUSH failed, ret = %d, error = %#x\n",
 				ret, dfflush_error);
+			snp_leak_hv_fixed_pages();
+			snp_luo_clear_adopted();
 			return ret;
 		}
 		/* reissue the shutdown command */
@@ -2236,6 +2328,8 @@ static int __sev_snp_shutdown_locked(int *error, bool panic)
 	if (ret) {
 		dev_err(sev->dev, "SEV-SNP firmware shutdown failed, rc %d, error %#x\n",
 			ret, *error);
+		snp_leak_hv_fixed_pages();
+		snp_luo_clear_adopted();
 		return ret;
 	}
 
@@ -2260,12 +2354,16 @@ static int __sev_snp_shutdown_locked(int *error, bool panic)
 		ret = amd_iommu_snp_disable();
 		if (ret) {
 			dev_err(sev->dev, "SNP IOMMU shutdown failed\n");
+			snp_leak_hv_fixed_pages();
+			snp_luo_clear_adopted();
 			return ret;
 		}
 	}
 
 	snp_leak_hv_fixed_pages();
 	sev->snp_initialized = false;
+	sev->snp_plat_status.state = SEV_STATE_UNINIT;
+	snp_luo_clear_adopted();
 	dev_dbg(sev->dev, "SEV-SNP firmware shutdown\n");
 
 	/*
@@ -2273,7 +2371,7 @@ static int __sev_snp_shutdown_locked(int *error, bool panic)
 	 * itself during panic as the panic notifier is called with RCU read
 	 * lock held and notifier unregistration does RCU synchronization.
 	 */
-	if (!panic)
+	if (!panic && was_initialized)
 		atomic_notifier_chain_unregister(&panic_notifier_list,
 						 &snp_panic_notifier);
 
@@ -2548,6 +2646,7 @@ static int __sev_do_snp_platform_status(struct sev_user_data_snp_status *status,
 					int *error)
 {
 	struct sev_device *sev = psp_master->sev_data;
+	bool fw_owned = sev->snp_initialized || snp_luo_is_adopted();
 	struct sev_data_snp_addr buf;
 	struct page *status_page;
 	void *data;
@@ -2563,7 +2662,7 @@ static int __sev_do_snp_platform_status(struct sev_user_data_snp_status *status,
 	 * SNP_PLATFORM_STATUS can be executed in any SNP state. But if executed
 	 * when SNP has been initialized, the status page must be firmware-owned.
 	 */
-	if (sev->snp_initialized) {
+	if (fw_owned) {
 		/*
 		 * Firmware expects the status page to be in Firmware state,
 		 * otherwise it will report an error INVALID_PAGE_STATE.
@@ -2577,7 +2676,7 @@ static int __sev_do_snp_platform_status(struct sev_user_data_snp_status *status,
 	buf.address = __psp_pa(data);
 	ret = __sev_do_cmd_locked(SEV_CMD_SNP_PLATFORM_STATUS, &buf, error);
 
-	if (sev->snp_initialized) {
+	if (fw_owned) {
 		/*
 		 * The status page will be in Reclaim state on success, or left
 		 * in Firmware state on failure. Use snp_reclaim_pages() to
@@ -2900,9 +2999,49 @@ e_err:
 	return ret;
 }
 
+static struct sev_snp_luo_flb_state *sev_snp_luo_outgoing;
+
+static void sev_snp_luo_drop_outgoing_locked(struct sev_device *sev)
+{
+	struct sev_snp_luo_flb_state *st = sev_snp_luo_outgoing;
+	unsigned int i;
+
+	if (!sev->luo_preserved || !st)
+		return;
+
+	st->flags &= ~SEV_SNP_LUO_FLB_F_ACTIVE_VMS;
+
+	if (st->sev_init_ex_pa) {
+		kho_unpreserve_pages(phys_to_page(st->sev_init_ex_pa),
+				     1UL << st->sev_init_ex_order);
+		st->sev_init_ex_pa = 0;
+	}
+
+	if (st->sev_es_tmr_pa) {
+		kho_unpreserve_pages(phys_to_page(st->sev_es_tmr_pa),
+				     1UL << st->sev_es_tmr_order);
+		st->sev_es_tmr_pa = 0;
+	}
+
+	for (i = 0; i < st->nr_hv_fixed_pages; i++)
+		kho_unpreserve_pages(phys_to_page(st->hv_fixed_pa[i]),
+				     1UL << st->hv_fixed_order[i]);
+	st->nr_hv_fixed_pages = 0;
+
+	amd_iommu_luo_unpreserve(st);
+	st->nr_iommus = 0;
+	sev->luo_preserved = false;
+}
+
 static void __sev_firmware_shutdown(struct sev_device *sev, bool panic)
 {
 	int error;
+
+	if (!panic && liveupdate_coco_is_preserving())
+		return;
+
+	if (!panic)
+		sev_snp_luo_drop_outgoing_locked(sev);
 
 	__sev_platform_shutdown_locked(&error);
 
@@ -3057,20 +3196,25 @@ void sev_pci_init(void)
 {
 	struct sev_device *sev = psp_master->sev_data;
 	u8 api_major, api_minor, build;
+	int ret;
 
 	if (!sev)
 		return;
 
 	psp_timeout = psp_probe_timeout;
 
-	if (sev_get_api_version())
+	ret = sev_snp_luo_ensure_retrieved();
+
+	if (sev_get_api_version() || ret)
 		goto err;
 
 	api_major = sev->api_major;
 	api_minor = sev->api_minor;
 	build     = sev->build;
 
-	if (sev_update_firmware(sev->dev) == 0)
+	if (!(snp_luo_is_adopted() &&
+	      sev->snp_plat_status.state == SEV_STATE_INIT) &&
+	    sev_update_firmware(sev->dev) == 0)
 		sev_get_api_version();
 
 	if (api_major != sev->api_major || api_minor != sev->api_minor ||
@@ -3166,3 +3310,315 @@ int sev_firmware_supported_vm_types(void)
 
 }
 EXPORT_SYMBOL_FOR_MODULES(sev_firmware_supported_vm_types, "kvm-amd");
+
+int sev_snp_luo_preserve(struct liveupdate_flb_op_args *args)
+{
+	struct snp_hv_fixed_pages_entry *entry;
+	struct sev_snp_luo_flb_state *st;
+	struct sev_device *sev;
+	unsigned int i = 0;
+	int ret;
+
+	if (!psp_master || !psp_master->sev_data)
+		return -ENODEV;
+
+	sev = psp_master->sev_data;
+
+	mutex_lock(&sev_cmd_mutex);
+	if (!sev->snp_initialized) {
+		mutex_unlock(&sev_cmd_mutex);
+		return -ENODEV;
+	}
+
+	st = kho_alloc_preserve(sizeof(*st));
+	if (IS_ERR(st)) {
+		mutex_unlock(&sev_cmd_mutex);
+		return PTR_ERR(st);
+	}
+
+	st->magic = SEV_SNP_LUO_FLB_MAGIC;
+	st->flags = SEV_SNP_LUO_FLB_F_ACTIVE_VMS;
+	snp_get_rmp_range(&st->rmp_base, &st->rmp_end);
+
+	ret = amd_iommu_luo_preserve(st);
+	if (ret) {
+		kho_unpreserve_free(st);
+		mutex_unlock(&sev_cmd_mutex);
+		return ret;
+	}
+
+	list_for_each_entry(entry, &snp_hv_fixed_pages, list) {
+		if (i >= ARRAY_SIZE(st->hv_fixed_pa)) {
+			ret = -ENOSPC;
+			goto err_unpreserve_hv;
+		}
+		ret = kho_preserve_pages(entry->page, 1UL << entry->order);
+		if (ret)
+			goto err_unpreserve_hv;
+		st->hv_fixed_pa[i] = page_to_phys(entry->page);
+		st->hv_fixed_order[i] = entry->order;
+		i++;
+	}
+	st->nr_hv_fixed_pages = i;
+
+	if (sev_es_tmr) {
+		u32 order = get_order(sev_es_tmr_size);
+
+		ret = kho_preserve_pages(virt_to_page(sev_es_tmr), 1UL << order);
+		if (ret)
+			goto err_unpreserve_hv;
+		st->sev_es_tmr_pa = __pa(sev_es_tmr);
+		st->sev_es_tmr_order = order;
+	}
+
+	if (sev_init_ex_buffer) {
+		u32 order = get_order(NV_LENGTH);
+
+		ret = kho_preserve_pages(virt_to_page(sev_init_ex_buffer),
+					 1UL << order);
+		if (ret)
+			goto err_unpreserve_tmr;
+		st->sev_init_ex_pa = __pa(sev_init_ex_buffer);
+		st->sev_init_ex_order = order;
+	}
+
+	sev->luo_preserved = true;
+	sev_snp_luo_outgoing = st;
+	mutex_unlock(&sev_cmd_mutex);
+
+	args->obj = st;
+	args->data = virt_to_phys(st);
+	return 0;
+
+err_unpreserve_tmr:
+	if (st->sev_es_tmr_pa)
+		kho_unpreserve_pages(phys_to_page(st->sev_es_tmr_pa),
+				     1UL << st->sev_es_tmr_order);
+err_unpreserve_hv:
+	while (i--)
+		kho_unpreserve_pages(phys_to_page(st->hv_fixed_pa[i]),
+				     1UL << st->hv_fixed_order[i]);
+	mutex_unlock(&sev_cmd_mutex);
+	amd_iommu_luo_unpreserve(st);
+	kho_unpreserve_free(st);
+	return ret;
+}
+EXPORT_SYMBOL_FOR_MODULES(sev_snp_luo_preserve, "kvm-amd");
+
+void sev_snp_luo_unpreserve(struct liveupdate_flb_op_args *args)
+{
+	struct sev_snp_luo_flb_state *st = args->obj;
+	unsigned int i;
+
+	if (!st)
+		return;
+
+	mutex_lock(&sev_cmd_mutex);
+	sev_snp_luo_outgoing = NULL;
+	if (psp_master && psp_master->sev_data) {
+		struct sev_device *sev = psp_master->sev_data;
+
+		sev->luo_preserved = false;
+	}
+
+	if (st->sev_init_ex_pa)
+		kho_unpreserve_pages(phys_to_page(st->sev_init_ex_pa),
+				     1UL << st->sev_init_ex_order);
+
+	if (st->sev_es_tmr_pa)
+		kho_unpreserve_pages(phys_to_page(st->sev_es_tmr_pa),
+				     1UL << st->sev_es_tmr_order);
+
+	for (i = 0; i < st->nr_hv_fixed_pages; i++)
+		kho_unpreserve_pages(phys_to_page(st->hv_fixed_pa[i]),
+				     1UL << st->hv_fixed_order[i]);
+	mutex_unlock(&sev_cmd_mutex);
+
+	amd_iommu_luo_unpreserve(st);
+	kho_unpreserve_free(st);
+}
+EXPORT_SYMBOL_FOR_MODULES(sev_snp_luo_unpreserve, "kvm-amd");
+
+int sev_snp_luo_retrieve(struct liveupdate_flb_op_args *args)
+{
+	struct sev_snp_luo_flb_state *st;
+	bool init_ex_restored = false;
+	bool init_ex_handled = false;
+	bool tmr_restored = false;
+	bool tmr_handled = false;
+	u64 rmp_base, rmp_end;
+	unsigned int i = 0;
+	bool rmp_match;
+	bool adopted;
+	int ret;
+
+	if (!args->data)
+		return -EINVAL;
+
+	st = phys_to_virt(args->data);
+	if (st->magic != SEV_SNP_LUO_FLB_MAGIC) {
+		kho_restore_free(st);
+		return -EINVAL;
+	}
+
+	snp_get_rmp_range(&rmp_base, &rmp_end);
+	rmp_match = (st->rmp_base == rmp_base && st->rmp_end == rmp_end);
+
+	/*
+	 * When not adopted (or on error unwind below), the PSP may still be in
+	 * SEV_STATE_INIT using the preserved TMR and INIT_EX buffers as
+	 * Firmware pages in the RMP, and retrieval may run from sfs_dev_init()
+	 * before the PSP mailbox is initialized.  Leak unadopted Firmware and
+	 * HV_Fixed pages directly via __snp_leak_pages() without issuing
+	 * SNP_PAGE_RECLAIM.  Keep snp_luo_is_adopted() set if ACTIVE_VMS was
+	 * set so sev_pci_init() queries and shuts down the ASP on error.
+	 */
+	if (!(st->flags & SEV_SNP_LUO_FLB_F_ACTIVE_VMS))
+		snp_luo_clear_adopted();
+	adopted = rmp_match && snp_luo_is_adopted();
+
+	ret = amd_iommu_luo_retrieve(st);
+	if (ret || ((st->flags & SEV_SNP_LUO_FLB_F_ACTIVE_VMS) && !rmp_match)) {
+		if (!ret)
+			ret = -EINVAL;
+		mutex_lock(&sev_cmd_mutex);
+		goto err_unwind;
+	}
+
+	mutex_lock(&sev_cmd_mutex);
+	for (i = 0; i < st->nr_hv_fixed_pages; i++) {
+		unsigned long npages = 1UL << st->hv_fixed_order[i];
+		struct snp_hv_fixed_pages_entry *entry = NULL;
+		struct page *page;
+
+		entry = kzalloc_obj(*entry, GFP_KERNEL);
+		if (!entry) {
+			ret = -ENOMEM;
+			goto err_unwind;
+		}
+
+		page = kho_restore_pages(st->hv_fixed_pa[i], npages);
+		if (!page) {
+			kfree(entry);
+			ret = -EFAULT;
+			goto err_unwind;
+		}
+
+		entry->page = page;
+		entry->order = st->hv_fixed_order[i];
+		entry->page_state = HV_FIXED;
+		entry->free = true;
+		list_add_tail(&entry->list, &snp_hv_fixed_pages);
+	}
+
+	if (st->sev_es_tmr_pa) {
+		unsigned long npages = 1UL << st->sev_es_tmr_order;
+		struct page *tmr_page;
+
+		tmr_page = kho_restore_pages(st->sev_es_tmr_pa, npages);
+		if (!tmr_page) {
+			ret = -EFAULT;
+			goto err_unwind;
+		}
+		tmr_handled = true;
+		if (adopted && !sev_es_tmr) {
+			sev_es_tmr = page_address(tmr_page);
+			sev_es_tmr_size = PAGE_SIZE << st->sev_es_tmr_order;
+			tmr_restored = true;
+		} else {
+			__snp_leak_pages(page_to_pfn(tmr_page), npages, false);
+		}
+	}
+
+	if (st->sev_init_ex_pa) {
+		unsigned long npages = 1UL << st->sev_init_ex_order;
+		struct page *init_ex_page;
+
+		init_ex_page = kho_restore_pages(st->sev_init_ex_pa, npages);
+		if (!init_ex_page) {
+			ret = -EFAULT;
+			goto err_unwind;
+		}
+		init_ex_handled = true;
+		if (adopted && !sev_init_ex_buffer) {
+			sev_init_ex_buffer = page_address(init_ex_page);
+			init_ex_restored = true;
+		} else {
+			__snp_leak_pages(page_to_pfn(init_ex_page), npages, false);
+		}
+	}
+
+	if (!adopted)
+		snp_leak_hv_fixed_pages();
+	mutex_unlock(&sev_cmd_mutex);
+
+	args->obj = st;
+	return 0;
+
+err_unwind:
+	for (; i < st->nr_hv_fixed_pages; i++) {
+		unsigned long npages = 1UL << st->hv_fixed_order[i];
+		struct page *page;
+
+		page = kho_restore_pages(st->hv_fixed_pa[i], npages);
+		if (page)
+			__snp_leak_pages(page_to_pfn(page), npages, false);
+	}
+	if (st->sev_es_tmr_pa && !tmr_handled) {
+		unsigned long npages = 1UL << st->sev_es_tmr_order;
+		struct page *tmr_page;
+
+		tmr_page = kho_restore_pages(st->sev_es_tmr_pa, npages);
+		if (tmr_page)
+			__snp_leak_pages(page_to_pfn(tmr_page), npages, false);
+	}
+	if (st->sev_init_ex_pa && !init_ex_handled) {
+		unsigned long npages = 1UL << st->sev_init_ex_order;
+		struct page *init_ex_page;
+
+		init_ex_page = kho_restore_pages(st->sev_init_ex_pa, npages);
+		if (init_ex_page)
+			__snp_leak_pages(page_to_pfn(init_ex_page), npages, false);
+	}
+	if (init_ex_restored) {
+		__snp_leak_pages(page_to_pfn(virt_to_page(sev_init_ex_buffer)),
+				 1UL << st->sev_init_ex_order, false);
+		sev_init_ex_buffer = NULL;
+	}
+	if (tmr_restored) {
+		__snp_leak_pages(page_to_pfn(virt_to_page(sev_es_tmr)),
+				 1UL << st->sev_es_tmr_order, false);
+		sev_es_tmr = NULL;
+		sev_es_tmr_size = SEV_TMR_SIZE;
+	}
+	snp_leak_hv_fixed_pages();
+	mutex_unlock(&sev_cmd_mutex);
+	/* args->obj stays NULL, so sev_snp_luo_finish() will not free st. */
+	kho_restore_free(st);
+	return ret;
+}
+EXPORT_SYMBOL_FOR_MODULES(sev_snp_luo_retrieve, "kvm-amd");
+
+void sev_snp_luo_finish(struct liveupdate_flb_op_args *args)
+{
+	if (!args->obj)
+		return;
+
+	kho_restore_free(args->obj);
+	args->obj = NULL;
+}
+EXPORT_SYMBOL_FOR_MODULES(sev_snp_luo_finish, "kvm-amd");
+
+static const struct liveupdate_flb_ops sev_snp_luo_flb_ops = {
+	.preserve	= sev_snp_luo_preserve,
+	.unpreserve	= sev_snp_luo_unpreserve,
+	.retrieve	= sev_snp_luo_retrieve,
+	.finish		= sev_snp_luo_finish,
+	.owner		= THIS_MODULE,
+};
+
+struct liveupdate_flb sev_snp_luo_flb = {
+	.ops = &sev_snp_luo_flb_ops,
+	.name = SEV_SNP_LUO_FLB_NAME,
+};
+EXPORT_SYMBOL_FOR_MODULES(sev_snp_luo_flb, "kvm-amd");

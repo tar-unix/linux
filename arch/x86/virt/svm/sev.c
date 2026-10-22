@@ -9,6 +9,7 @@
  */
 
 #include <linux/cc_platform.h>
+#include <linux/crash_dump.h>
 #include <linux/printk.h>
 #include <linux/mm_types.h>
 #include <linux/set_memory.h>
@@ -18,6 +19,7 @@
 #include <linux/cpumask.h>
 #include <linux/iommu.h>
 #include <linux/amd-iommu.h>
+#include <linux/kexec_handover.h>
 #include <linux/nospec.h>
 
 #include <asm/sev.h>
@@ -123,6 +125,26 @@ static void *rmp_bookkeeping __ro_after_init;
 #define PFN_PMD_MASK	GENMASK_ULL(63, PMD_SHIFT - PAGE_SHIFT)
 
 static u64 probed_rmp_base, probed_rmp_size;
+static bool snp_luo_adopted;
+
+void snp_get_rmp_range(u64 *base, u64 *end)
+{
+	*base = probed_rmp_base;
+	*end = probed_rmp_size ? probed_rmp_base + probed_rmp_size - 1 : 0;
+}
+EXPORT_SYMBOL_GPL(snp_get_rmp_range);
+
+bool snp_luo_is_adopted(void)
+{
+	return snp_luo_adopted;
+}
+EXPORT_SYMBOL_GPL(snp_luo_is_adopted);
+
+void snp_luo_clear_adopted(void)
+{
+	snp_luo_adopted = false;
+}
+EXPORT_SYMBOL_GPL(snp_luo_clear_adopted);
 
 static LIST_HEAD(snp_leaked_pages_list);
 static DEFINE_SPINLOCK(snp_leaked_pages_list_lock);
@@ -236,12 +258,24 @@ static void __init fixup_e820_tables_for_contiguous_rmp(void)
 	__snp_fixup_e820_tables(probed_rmp_base + probed_rmp_size);
 }
 
+static bool __init snp_reserve_rmp_2m_regions_early(void);
+
 void __init snp_fixup_e820_tables(void)
 {
+	u64 val;
+
 	if (rmp_cfg & MSR_AMD64_SEG_RMP_ENABLED) {
 		fixup_e820_tables_for_segmented_rmp();
 	} else {
 		fixup_e820_tables_for_contiguous_rmp();
+	}
+
+	rdmsrq(MSR_AMD64_SYSCFG, val);
+	if ((val & MSR_AMD64_SYSCFG_SNP_EN) && !is_kdump_kernel() &&
+	    kho_is_enabled() && is_kho_boot() &&
+	    snp_reserve_rmp_2m_regions_early()) {
+		snp_luo_adopted = true;
+		pr_info("Active RMP detected across liveupdate kexec\n");
 	}
 }
 
@@ -487,6 +521,9 @@ e_free:
 
 static bool __init setup_rmptable(void)
 {
+	if (rmp_bookkeeping)
+		return true;
+
 	if (rmp_cfg & MSR_AMD64_SEG_RMP_ENABLED) {
 		if (!setup_segmented_rmptable())
 			return false;
@@ -521,10 +558,12 @@ int snp_prepare(void)
 	 * kexec boot.
 	 */
 	rdmsrq(MSR_AMD64_SYSCFG, val);
-	if (val & MSR_AMD64_SYSCFG_SNP_EN)
-		return 0;
-
-	clear_rmp();
+	if (val & MSR_AMD64_SYSCFG_SNP_EN) {
+		if (!snp_luo_adopted)
+			return 0;
+	} else {
+		clear_rmp();
+	}
 
 	cpus_read_lock();
 
@@ -569,6 +608,21 @@ void snp_shutdown(void)
 	on_each_cpu(mfd_reconfigure, NULL, 1);
 }
 EXPORT_SYMBOL_FOR_MODULES(snp_shutdown, "ccp");
+
+static void __init snp_quarantine_rmp_2m_regions(void);
+
+int __init snp_rmptable_luo_early_init(void)
+{
+	if (!cc_platform_has(CC_ATTR_HOST_SEV_SNP) || !snp_luo_adopted ||
+	    rmp_bookkeeping)
+		return 0;
+
+	if (setup_rmptable())
+		snp_quarantine_rmp_2m_regions();
+
+	return 0;
+}
+early_initcall(snp_rmptable_luo_early_init);
 
 /*
  * Do the necessary preparations which are verified by the firmware as
@@ -985,6 +1039,212 @@ static int adjust_direct_map(u64 pfn, int rmp_level)
 			pfn, ret);
 
 	return ret;
+}
+
+static u64 cached_rst_page_pa __initdata = U64_MAX;
+static void *cached_rst_page __initdata;
+static u64 cached_rmp_page_pa __initdata = U64_MAX;
+static void *cached_rmp_page __initdata;
+
+static void __init snp_rmp_pfn_lookup_early_cleanup(void)
+{
+	if (cached_rmp_page) {
+		early_memunmap(cached_rmp_page, PAGE_SIZE);
+		cached_rmp_page = NULL;
+		cached_rmp_page_pa = U64_MAX;
+	}
+	if (cached_rst_page) {
+		early_memunmap(cached_rst_page, PAGE_SIZE);
+		cached_rst_page = NULL;
+		cached_rst_page_pa = U64_MAX;
+	}
+}
+
+static bool __init snp_rmp_pfn_lookup_early(u64 pfn, bool *assigned,
+					    bool *pagesize)
+{
+	u64 paddr = PFN_PHYS(pfn);
+	struct rmpentry_raw *e_raw;
+	u64 entry_pa, page_pa;
+	struct rmpentry e;
+
+	if (cpu_feature_enabled(X86_FEATURE_RMPREAD)) {
+		if (get_rmpentry(pfn, &e))
+			return false;
+		*assigned = e.assigned;
+		*pagesize = e.pagesize;
+		return true;
+	}
+
+	if (!probed_rmp_base)
+		return false;
+
+	if (rmp_cfg & MSR_AMD64_SEG_RMP_ENABLED) {
+		u64 rst_pa = probed_rmp_base + RMPTABLE_CPU_BOOKKEEPING_SZ;
+		u64 rst_idx = RST_ENTRY_INDEX(paddr);
+		u64 rst_entry_pa = rst_pa + rst_idx * sizeof(u64);
+		u64 seg_pa, mapped_sz, rst_val;
+
+		if (rst_idx >= rst_max_index)
+			return false;
+
+		page_pa = rst_entry_pa & PAGE_MASK;
+		if (page_pa != cached_rst_page_pa) {
+			if (cached_rst_page)
+				early_memunmap(cached_rst_page, PAGE_SIZE);
+			cached_rst_page = early_memremap(page_pa, PAGE_SIZE);
+			cached_rst_page_pa = cached_rst_page ? page_pa : U64_MAX;
+		}
+		if (!cached_rst_page)
+			return false;
+
+		rst_val = *(u64 *)(cached_rst_page + (rst_entry_pa & ~PAGE_MASK));
+
+		mapped_sz = RST_ENTRY_MAPPED_SIZE(rst_val) << 30;
+		if (!mapped_sz)
+			return false;
+		if (mapped_sz > rmp_segment_size)
+			mapped_sz = rmp_segment_size;
+		if ((paddr & rmp_segment_mask) >= mapped_sz)
+			return false;
+
+		seg_pa = RST_ENTRY_SEGMENT_BASE(rst_val);
+		entry_pa = seg_pa + RMP_ENTRY_INDEX(paddr) * sizeof(*e_raw);
+	} else {
+		if ((pfn << 4) + RMPTABLE_CPU_BOOKKEEPING_SZ >= probed_rmp_size)
+			return false;
+
+		entry_pa = probed_rmp_base + RMPTABLE_CPU_BOOKKEEPING_SZ +
+			   pfn * sizeof(*e_raw);
+	}
+
+	page_pa = entry_pa & PAGE_MASK;
+	if (page_pa != cached_rmp_page_pa) {
+		if (cached_rmp_page)
+			early_memunmap(cached_rmp_page, PAGE_SIZE);
+		cached_rmp_page = early_memremap(page_pa, PAGE_SIZE);
+		cached_rmp_page_pa = cached_rmp_page ? page_pa : U64_MAX;
+	}
+	if (!cached_rmp_page)
+		return false;
+
+	e_raw = cached_rmp_page + (entry_pa & ~PAGE_MASK);
+	*assigned = e_raw->assigned;
+	*pagesize = e_raw->pagesize;
+	return true;
+}
+
+/*
+ * After a liveupdate kexec, the new kernel rebuilds its direct map using 2M/1G
+ * huge pages, while the RMP table retains 4K Assigned entries (guest pages,
+ * VMSAs, context pages, and firmware pages).  A host write through a 2M
+ * mapping that covers any 4K Assigned page raises an RMP #PF.
+ *
+ * Reserve every 2M region containing a 4K Assigned RMP entry in memblock so
+ * memblock_free_all() does not release its neighbor 4K pages to the buddy
+ * allocator, and split those 2M direct-map ranges to 4K PTEs at early_initcall
+ * so the Assigned pages and any KHO-preserved neighbors can be accessed safely.
+ *
+ * The unassigned neighbors stay reserved for the lifetime of this kernel: the
+ * leak is bounded by the number of 2M regions holding 4K Assigned entries, and
+ * is released again by the next kexec.  They are deliberately never handed
+ * back to the page allocator, because this reservation runs before the rest of
+ * setup_arch() (EFI, ACPI, real mode, ...) has made its own reservations, and
+ * memblock merges overlapping reservations, so the neighbors that are safe to
+ * free cannot be told apart later.
+ *
+ * [0, 2M) is skipped: x86 always reserves the first 1M (reserve_real_mode()),
+ * so the previous kernel never handed it to a guest, and [1M, 2M) is the
+ * unaligned head of a memory range and so is always mapped with 4K PTEs by
+ * init_mem_mapping(), so no 2M direct-map PMD can cover an Assigned page there.
+ * Likewise, only Assigned entries inside the current memory range are
+ * considered, so a hole in the 2M block cannot reserve unrelated ranges.
+ */
+static bool __init snp_reserve_rmp_2m_regions_early(void)
+{
+	unsigned long start_pfn, end_pfn;
+	unsigned long nr_regions = 0;
+	u64 nr_pages = 0;
+	int nid_idx;
+
+	for_each_mem_pfn_range(nid_idx, MAX_NUMNODES, &start_pfn, &end_pfn, NULL) {
+		u64 pfn = ALIGN_DOWN(start_pfn, PTRS_PER_PMD);
+
+		for (; pfn < end_pfn; pfn += PTRS_PER_PMD) {
+			unsigned int i;
+
+			if (pfn < PFN_UP(SZ_2M))
+				continue;
+
+			for (i = 0; i < PTRS_PER_PMD && (pfn + i) < max_pfn; i++) {
+				bool assigned = false, pagesize = false;
+				u64 r_start, r_end;
+
+				if (pfn + i < start_pfn || pfn + i >= end_pfn)
+					continue;
+				if (!snp_rmp_pfn_lookup_early(pfn + i, &assigned,
+							      &pagesize) ||
+				    !assigned)
+					continue;
+				if (pagesize) {
+					if (i == 0)
+						break;
+					continue;
+				}
+
+				r_start = max_t(u64, pfn, start_pfn);
+				r_end = min_t(u64, pfn + PTRS_PER_PMD, end_pfn);
+				memblock_reserve(PFN_PHYS(r_start),
+						 PFN_PHYS(r_end - r_start));
+				nr_pages += r_end - r_start;
+				nr_regions++;
+				break;
+			}
+		}
+	}
+
+	snp_rmp_pfn_lookup_early_cleanup();
+
+	if (nr_regions)
+		pr_info("Reserved %llu KiB in %lu 2M regions holding 4K Assigned RMP entries\n",
+			nr_pages * (PAGE_SIZE / SZ_1K), nr_regions);
+
+	return nr_regions != 0;
+}
+
+static void __init snp_quarantine_rmp_2m_regions(void)
+{
+	unsigned long start_pfn, end_pfn;
+	int nid_idx;
+
+	for_each_mem_pfn_range(nid_idx, MAX_NUMNODES, &start_pfn, &end_pfn, NULL) {
+		u64 pfn = ALIGN_DOWN(start_pfn, PTRS_PER_PMD);
+
+		for (; pfn < end_pfn; pfn += PTRS_PER_PMD) {
+			unsigned int i;
+
+			if (pfn < PFN_UP(SZ_2M))
+				continue;
+
+			for (i = 0; i < PTRS_PER_PMD && (pfn + i) < max_pfn; i++) {
+				struct rmpentry e;
+
+				if (pfn + i < start_pfn || pfn + i >= end_pfn)
+					continue;
+				if (get_rmpentry(pfn + i, &e) || !e.assigned)
+					continue;
+				if (e.pagesize) {
+					if (i == 0)
+						break;
+					continue;
+				}
+
+				adjust_direct_map(max_t(u64, pfn, start_pfn),
+						  PG_LEVEL_4K);
+				break;
+			}
+		}
+	}
 }
 
 /*
