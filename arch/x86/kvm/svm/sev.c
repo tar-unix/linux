@@ -5260,12 +5260,12 @@ int sev_gmem_make_private(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn, kvm_pfn_t n
 	return 0;
 }
 
-void sev_gmem_make_shared(kvm_pfn_t pfn, kvm_pfn_t nr_pages)
+int sev_gmem_make_shared(kvm_pfn_t pfn, kvm_pfn_t nr_pages, bool reclaim)
 {
 	kvm_pfn_t end = pfn + nr_pages;
 
 	if (!cc_platform_has(CC_ATTR_HOST_SEV_SNP))
-		return;
+		return 0;
 
 	pr_debug("%s: PFN start 0x%llx PFN end 0x%llx\n", __func__, pfn, end);
 
@@ -5321,6 +5321,8 @@ next_pfn:
 		pfn += use_2m_update ? PTRS_PER_PMD : 1;
 		cond_resched();
 	}
+
+	return 0;
 }
 
 void sev_gmem_invalidate_range(struct kvm *kvm, struct kvm_gfn_range *range)

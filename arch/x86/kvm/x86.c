@@ -10044,6 +10044,11 @@ int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type)
 			return -EOPNOTSUPP;
 		*type = KVM_X86_SW_PROTECTED_VM;
 		return KVM_VM_LUO_FEAT_SW_PROTECTED;
+	case KVM_X86_TDX_VM:
+		if (!kvm_x86_ops.vm_luo_preserve)
+			return -EOPNOTSUPP;
+		*type = KVM_X86_TDX_VM;
+		return KVM_VM_LUO_FEAT_TDX;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -10865,16 +10870,16 @@ int kvm_arch_gmem_make_private(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
 	return kvm_x86_call(gmem_make_private)(kvm, gfn, pfn, nr_pages);
 }
 
-void kvm_arch_gmem_make_shared(kvm_pfn_t pfn, kvm_pfn_t nr_pages)
+int kvm_arch_gmem_make_shared(kvm_pfn_t pfn, kvm_pfn_t nr_pages)
 {
-	kvm_x86_call(gmem_make_shared)(pfn, nr_pages);
+	return kvm_x86_call(gmem_make_shared)(pfn, nr_pages, false);
 }
 #endif
 
 #ifdef CONFIG_HAVE_KVM_ARCH_GMEM_RECLAIM
 void kvm_arch_gmem_reclaim(kvm_pfn_t pfn, kvm_pfn_t nr_pages)
 {
-	kvm_x86_call(gmem_make_shared)(pfn, nr_pages);
+	kvm_x86_call(gmem_make_shared)(pfn, nr_pages, true);
 }
 #endif
 

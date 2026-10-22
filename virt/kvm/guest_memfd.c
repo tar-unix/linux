@@ -668,11 +668,12 @@ static bool kvm_gmem_has_outstanding_references(struct inode *inode,
 }
 
 #ifdef CONFIG_HAVE_KVM_ARCH_GMEM_CONVERT
-static void kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end)
+static int kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end,
+				pgoff_t *err_index)
 {
 	struct folio_batch fbatch;
 	pgoff_t next = start;
-	int i;
+	int i, r = 0;
 
 	folio_batch_init(&fbatch);
 	while (filemap_get_folios(inode->i_mapping, &next, end - 1, &fbatch)) {
@@ -693,15 +694,26 @@ static void kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end
 			start_pfn = folio_file_pfn(folio, start_index);
 			nr_pages = end_index - start_index;
 
-			kvm_arch_gmem_make_shared(start_pfn, nr_pages);
+			r = kvm_arch_gmem_make_shared(start_pfn, nr_pages);
+			if (r) {
+				*err_index = start_index;
+				folio_batch_release(&fbatch);
+				return r;
+			}
 		}
 
 		folio_batch_release(&fbatch);
 		cond_resched();
 	}
+
+	return 0;
 }
 #else
-static void kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end) {}
+static int kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end,
+				pgoff_t *err_index)
+{
+	return 0;
+}
 #endif
 
 static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
@@ -763,8 +775,14 @@ static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
 	filter = to_private ? KVM_FILTER_SHARED : KVM_FILTER_PRIVATE;
 	kvm_gmem_invalidate_start(inode, start, end, filter);
 
-	if (!to_private && kvm_arch_has_gmem_convert())
-		kvm_gmem_make_shared(inode, start, end);
+	if (!to_private && kvm_arch_has_gmem_convert()) {
+		r = kvm_gmem_make_shared(inode, start, end, err_index);
+		if (r) {
+			mas_destroy(&mas);
+			kvm_gmem_invalidate_end(inode, start, end);
+			goto out;
+		}
+	}
 
 	mas_store_prealloc(&mas, xa_mk_value(attrs));
 

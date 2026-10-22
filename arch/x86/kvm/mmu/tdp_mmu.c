@@ -1131,6 +1131,10 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 	if (WARN_ON_ONCE(sp->role.level != fault->goal_level))
 		return RET_PF_RETRY;
 
+	if (is_shadow_present_pte(iter->old_spte) && is_mirror_sp(sp) &&
+	    unlikely(fault->pfn != spte_to_pfn(iter->old_spte)))
+		return -EIO;
+
 	if (is_shadow_present_pte(iter->old_spte) &&
 	    (fault->prefetch || !spte_permission_fault(mmu, iter->old_spte, fault)) &&
 	    is_last_spte(iter->old_spte, iter->level)) {
@@ -1223,6 +1227,9 @@ int kvm_tdp_mmu_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 	int ret = RET_PF_RETRY;
 
 	KVM_MMU_WARN_ON(!root || root->role.invalid);
+
+	if (unlikely(READ_ONCE(kvm->arch.luo_frozen)))
+		return RET_PF_RETRY;
 
 	kvm_mmu_hugepage_adjust(vcpu, fault);
 

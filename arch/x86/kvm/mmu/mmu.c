@@ -5115,6 +5115,9 @@ static int kvm_tdp_page_prefault(struct kvm_vcpu *vcpu, gpa_t gpa,
 		if (kvm_test_request(KVM_REQ_VM_DEAD, vcpu))
 			return -EIO;
 
+		if (READ_ONCE(vcpu->kvm->arch.luo_frozen))
+			return -EBUSY;
+
 		r = kvm_mmu_reload(vcpu);
 		if (r)
 			return r;
@@ -5155,6 +5158,9 @@ long kvm_arch_vcpu_pre_fault_memory(struct kvm_vcpu *vcpu,
 
 	if (!vcpu->kvm->arch.pre_fault_allowed)
 		return -EOPNOTSUPP;
+
+	if (kvm_x86_call(vcpu_needs_initialization)(vcpu))
+		return -EINVAL;
 
 	if (kvm_is_gfn_alias(vcpu->kvm, gpa_to_gfn(range->gpa)))
 		return -EINVAL;
@@ -5269,6 +5275,9 @@ int kvm_tdp_mmu_map_private_pfn(struct kvm_vcpu *vcpu, gfn_t gfn, kvm_pfn_t pfn)
 
 		if (kvm_test_request(KVM_REQ_VM_DEAD, vcpu))
 			return -EIO;
+
+		if (READ_ONCE(vcpu->kvm->arch.luo_frozen))
+			return -EBUSY;
 
 		r = kvm_mmu_reload(vcpu);
 		if (r)

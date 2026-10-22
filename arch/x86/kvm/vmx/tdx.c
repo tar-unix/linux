@@ -17,6 +17,13 @@
 #include "common.h"
 #include "posted_intr.h"
 #include "irq.h"
+#ifdef CONFIG_LIVEUPDATE
+#include <linux/kexec_handover.h>
+#include <linux/kho/abi/kvm.h>
+#include <linux/liveupdate.h>
+#include <linux/vmalloc.h>
+#include "mmu/tdp_mmu.h"
+#endif
 #include <trace/events/kvm.h>
 #include "trace.h"
 
@@ -499,6 +506,9 @@ void tdx_mmu_release_hkid(struct kvm *kvm)
 	 */
 	mutex_lock(&tdx_lock);
 
+	if (kvm_tdx->luo_retrieved)
+		kvm_zap_gfn_range(kvm, gpa_to_gfn(0), gpa_to_gfn(~0ULL));
+
 	/*
 	 * Releasing HKID is in vm_destroy().
 	 * After the above flushing vps, there should be no more vCPU
@@ -544,6 +554,20 @@ out:
 	free_cpumask_var(packages);
 }
 
+#ifdef CONFIG_LIVEUPDATE
+static bool tdx_luo_try_defer_tdr_reclaim(struct page *tdr_page);
+static void tdx_luo_drop_deferred_gmem_page(kvm_pfn_t pfn);
+#else
+static inline bool tdx_luo_try_defer_tdr_reclaim(struct page *tdr_page)
+{
+	return false;
+}
+
+static inline void tdx_luo_drop_deferred_gmem_page(kvm_pfn_t pfn)
+{
+}
+#endif
+
 static void tdx_reclaim_td_control_pages(struct kvm *kvm)
 {
 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
@@ -571,6 +595,12 @@ static void tdx_reclaim_td_control_pages(struct kvm *kvm)
 
 	if (!kvm_tdx->td.tdr_page)
 		return;
+
+	if (kvm_tdx->luo_retrieved &&
+	    tdx_luo_try_defer_tdr_reclaim(kvm_tdx->td.tdr_page)) {
+		kvm_tdx->td.tdr_page = NULL;
+		return;
+	}
 
 	if (__tdx_reclaim_page(kvm_tdx->td.tdr_page))
 		return;
@@ -668,7 +698,11 @@ int tdx_vcpu_create(struct kvm_vcpu *vcpu)
 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
 	struct vcpu_tdx *tdx = to_tdx(vcpu);
 
-	if (kvm_tdx->state != TD_STATE_INITIALIZED)
+	if (kvm_tdx->luo_preserved)
+		return -EBUSY;
+
+	if (kvm_tdx->state != TD_STATE_INITIALIZED &&
+	    !(kvm_tdx->luo_retrieved && kvm_tdx->state == TD_STATE_RUNNABLE))
 		return -EIO;
 
 	/*
@@ -1632,6 +1666,9 @@ void tdx_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa, int pgd_level)
 	if (KVM_BUG_ON(pgd_level != vcpu->kvm->arch.mirror_root_level, vcpu->kvm))
 		return;
 
+	if (to_tdx(vcpu)->state != VCPU_TD_STATE_INITIALIZED)
+		return;
+
 	td_vmcs_write64(to_tdx(vcpu), SHARED_EPT_POINTER, root_hpa);
 }
 
@@ -1836,6 +1873,12 @@ static int tdx_sept_remove_leaf_spte(struct kvm *kvm, gfn_t gfn,
 		return -EIO;
 
 	tdx_quirk_reset_paddr(PFN_PHYS(pfn), PAGE_SIZE);
+	/*
+	 * Only now, with the page PT_NDA and reset, may a concurrent
+	 * tdx_gmem_make_shared() see it untracked and let it be freed.
+	 */
+	if (kvm_tdx->luo_retrieved)
+		tdx_luo_drop_deferred_gmem_page(pfn);
 	return 0;
 }
 
@@ -1863,6 +1906,9 @@ static int tdx_sept_set_private_spte(struct kvm *kvm, gfn_t gfn, u64 old_spte,
 
 	if (is_shadow_present_pte(old_spte))
 		return tdx_sept_remove_leaf_spte(kvm, gfn, level, old_spte);
+
+	if (READ_ONCE(kvm->arch.luo_frozen))
+		return -EBUSY;
 
 	if (KVM_BUG_ON(!is_shadow_present_pte(new_spte), kvm))
 		return -EIO;
@@ -2006,7 +2052,8 @@ static int tdx_handle_ept_violation(struct kvm_vcpu *vcpu)
 
 		ret = __vt_handle_ept_violation(vcpu, gpa, exit_qual);
 
-		if (ret != RET_PF_RETRY || !local_retry)
+		if (ret != RET_PF_RETRY || !local_retry ||
+		    READ_ONCE(vcpu->kvm->arch.luo_frozen))
 			break;
 
 		if (kvm_vcpu_has_events(vcpu) || signal_pending(current))
@@ -3535,4 +3582,836 @@ int __init tdx_hardware_setup(void)
 success_disable_tdx:
 	enable_tdx = 0;
 	return 0;
+}
+
+#ifdef CONFIG_LIVEUPDATE
+static LIST_HEAD(tdx_luo_deferred_ctrl_pages);
+static LIST_HEAD(tdx_luo_deferred_tdr_pages);
+static DEFINE_XARRAY(tdx_luo_deferred_gmem_pages);
+static void tdx_luo_drain_deferred_pages(void);
+
+int tdx_luo_init(void)
+{
+	if (!enable_tdx && !tdx_luo_is_adopted())
+		return 0;
+
+	return kvm_luo_register_flb(&tdx_host_luo_flb);
+}
+
+void tdx_luo_exit(void)
+{
+	struct page *page, *tmp;
+
+	if (!enable_tdx && !tdx_luo_is_adopted())
+		return;
+
+	kvm_luo_unregister_flb(&tdx_host_luo_flb);
+	mutex_lock(&tdx_lock);
+	if (tdx_luo_is_adopted())
+		tdx_luo_drain_deferred_pages();
+	list_for_each_entry_safe(page, tmp, &tdx_luo_deferred_ctrl_pages, lru)
+		list_del_init(&page->lru);
+	list_for_each_entry_safe(page, tmp, &tdx_luo_deferred_tdr_pages, lru)
+		list_del_init(&page->lru);
+	xa_destroy(&tdx_luo_deferred_gmem_pages);
+	mutex_unlock(&tdx_lock);
+}
+
+static int tdx_luo_verify_sept_entry(struct kvm *kvm, gfn_t gfn, int level,
+				     u64 mirror_spte)
+{
+	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
+	u64 err, sept_entry = 0, level_state = 0;
+	u8 sept_state;
+
+	err = tdh_mem_sept_rd(&kvm_tdx->td, gfn_to_gpa(gfn), level,
+			      &sept_entry, &level_state);
+	if (TDX_BUG_ON_2(err, TDH_MEM_SEPT_RD, sept_entry, level_state, kvm))
+		return -EIO;
+
+	sept_state = tdx_get_sept_state(level_state);
+	if (KVM_BUG_ON(tdx_get_sept_level(level_state) != level - 1, kvm))
+		return -EIO;
+	if (level == PG_LEVEL_4K) {
+		if (KVM_BUG_ON(sept_state != TDX_SEPT_PRESENT &&
+			       sept_state != TDX_SEPT_PENDING, kvm))
+			return -EIO;
+	} else {
+		if (KVM_BUG_ON(sept_state != TDX_SEPT_PRESENT, kvm))
+			return -EIO;
+	}
+	if (sept_state == TDX_SEPT_PRESENT &&
+	    KVM_BUG_ON(!(sept_entry & VMX_EPT_RWX_MASK), kvm))
+		return -EIO;
+	/*
+	 * On non-debug TDs, TDH.MEM.SEPT.RD redacts the HPA (returning 0 in
+	 * SPTE_BASE_ADDR_MASK), so only cross-check the HPA when visible.
+	 */
+	if ((sept_entry & SPTE_BASE_ADDR_MASK) &&
+	    KVM_BUG_ON((sept_entry & SPTE_BASE_ADDR_MASK) !=
+		       (mirror_spte & SPTE_BASE_ADDR_MASK), kvm))
+		return -EIO;
+
+	return 0;
+}
+
+static bool tdx_luo_update_active_hkid(int hkid, bool incoming, bool set)
+{
+	struct tdx_luo_flb_state *flb_st;
+	void *flb_obj = NULL;
+	bool ret = true;
+
+	if (hkid <= 0 || hkid >= TDX_LUO_MAX_HKIDS)
+		return false;
+	if ((incoming ? liveupdate_flb_get_incoming(&tdx_host_luo_flb, &flb_obj) :
+			liveupdate_flb_get_outgoing(&tdx_host_luo_flb, &flb_obj)) ||
+	    !flb_obj)
+		return false;
+	flb_st = flb_obj;
+	if (set)
+		set_bit(hkid, (unsigned long *)flb_st->active_hkids);
+	else
+		ret = test_and_clear_bit(hkid, (unsigned long *)flb_st->active_hkids);
+	if (incoming)
+		liveupdate_flb_put_incoming(&tdx_host_luo_flb);
+	else
+		liveupdate_flb_put_outgoing(&tdx_host_luo_flb);
+	return ret;
+}
+
+int kvm_tdx_luo_vm_preserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
+{
+	struct kvm_tdx_luo_sept_page *sept_pages = NULL;
+	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
+	long nr_sept;
+	int ret, i;
+
+	if (!is_td(kvm) || (kvm_tdx->attributes & TDX_TD_ATTR_DEBUG))
+		return -EOPNOTSUPP;
+
+	if (!is_hkid_assigned(kvm_tdx) || kvm_tdx->hkid >= TDX_LUO_MAX_HKIDS ||
+	    kvm_tdx->state != TD_STATE_RUNNABLE ||
+	    !kvm_tdx->td.tdr_page || !kvm_tdx->td.tdcs_pages)
+		return -EINVAL;
+
+	if (kvm_tdx->td.tdcs_nr_pages > TDX_LUO_MAX_TDCS_PAGES)
+		return -E2BIG;
+
+	memset(&s->tdx, 0, sizeof(s->tdx));
+
+	if (!tdx_luo_update_active_hkid(kvm_tdx->hkid, false, true))
+		return -EIO;
+
+	ret = kho_preserve_folio(page_folio(kvm_tdx->td.tdr_page));
+	if (ret)
+		goto err_clear_hkid;
+
+	for (i = 0; i < kvm_tdx->td.tdcs_nr_pages; i++) {
+		ret = kho_preserve_folio(page_folio(kvm_tdx->td.tdcs_pages[i]));
+		if (ret)
+			goto err_unpreserve_tdcs;
+	}
+
+	nr_sept = kvm_tdp_mmu_luo_count_mirror_pages(kvm);
+	if (nr_sept < 0) {
+		ret = nr_sept;
+		goto err_unpreserve_tdcs;
+	}
+
+	if (nr_sept > 0) {
+		sept_pages = vzalloc(array_size(nr_sept, sizeof(*sept_pages)));
+		if (!sept_pages) {
+			ret = -ENOMEM;
+			goto err_unpreserve_tdcs;
+		}
+
+		ret = kvm_tdp_mmu_luo_preserve_mirror(kvm, sept_pages, nr_sept,
+						      &s->tdx.nr_sept_pages);
+		if (ret) {
+			vfree(sept_pages);
+			goto err_unpreserve_tdcs;
+		}
+
+		ret = kho_preserve_vmalloc(sept_pages, &s->tdx.sept_pages);
+		if (ret) {
+			kvm_tdp_mmu_luo_unpreserve_mirror(sept_pages,
+							  s->tdx.nr_sept_pages);
+			vfree(sept_pages);
+			goto err_unpreserve_tdcs;
+		}
+
+		kvm_tdx->luo_sept_pages = sept_pages;
+	}
+
+	s->tdx.tdr_pfn = page_to_pfn(kvm_tdx->td.tdr_page);
+	for (i = 0; i < kvm_tdx->td.tdcs_nr_pages; i++)
+		s->tdx.tdcs_pfns[i] = page_to_pfn(kvm_tdx->td.tdcs_pages[i]);
+	s->tdx.nr_tdcs_pages = kvm_tdx->td.tdcs_nr_pages;
+	s->tdx.hkid = kvm_tdx->hkid;
+	s->tdx.tdx_state = kvm_tdx->state;
+	s->tdx.root_level = kvm->arch.mirror_root_level;
+	s->tdx.attributes = kvm_tdx->attributes;
+	s->tdx.xfam = kvm_tdx->xfam;
+	s->tdx.tsc_offset = kvm_tdx->tsc_offset;
+	s->tdx.tsc_multiplier = kvm_tdx->tsc_multiplier;
+	kvm_tdx->luo_preserved = true;
+	kvm->arch.luo_gmem_vm_id = (kvm->arch.luo_gmem_vm_id &
+				    KVM_X86_LUO_GMEM_TAG_MASK) |
+				   ((u64)KVM_VM_LUO_FEAT_TDX << 32) |
+				   (u32)kvm_tdx->hkid;
+
+	return 0;
+
+err_unpreserve_tdcs:
+	while (--i >= 0)
+		kho_unpreserve_folio(page_folio(kvm_tdx->td.tdcs_pages[i]));
+	kho_unpreserve_folio(page_folio(kvm_tdx->td.tdr_page));
+err_clear_hkid:
+	tdx_luo_update_active_hkid(kvm_tdx->hkid, false, false);
+	return ret;
+}
+
+int kvm_tdx_luo_vm_freeze(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
+{
+	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
+	struct kvm_memory_slot *memslot;
+	long nr_sept;
+	size_t bkt;
+	u64 i;
+	int e;
+
+	if (!is_td(kvm))
+		return -EOPNOTSUPP;
+
+	if (!is_hkid_assigned(kvm_tdx) || kvm_tdx->state != TD_STATE_RUNNABLE)
+		return -EINVAL;
+
+	if (READ_ONCE(kvm_tdx->wait_for_sept_zap))
+		return -EBUSY;
+
+	guard(mutex)(&kvm->slots_lock);
+	WRITE_ONCE(kvm->arch.luo_frozen, true);
+	nr_sept = kvm_tdp_mmu_luo_count_mirror_pages(kvm);
+	if (nr_sept < 0 || (u64)nr_sept != s->tdx.nr_sept_pages)
+		goto err_unfreeze;
+
+	kvm_for_each_memslot(memslot, bkt, __kvm_memslots(kvm, 0)) {
+		if (kvm_slot_has_gmem(memslot) &&
+		    !kvm_gmem_file_is_frozen(READ_ONCE(memslot->gmem.file)))
+			goto err_unfreeze;
+	}
+	for (i = 0; i < s->tdx.nr_sept_pages; i++) {
+		const struct kvm_tdx_luo_sept_page *sp = &kvm_tdx->luo_sept_pages[i];
+		const u64 *spt;
+
+		if (sp->level != PG_LEVEL_4K || !sp->spt_pfn)
+			continue;
+		spt = __va(PFN_PHYS(sp->spt_pfn));
+		for (e = 0; e < SPTE_ENT_PER_PAGE; e++) {
+			if (!is_shadow_present_pte(spt[e]))
+				continue;
+			if (!kvm_gmem_pfn_is_frozen(kvm, spte_to_pfn(spt[e])))
+				goto err_unfreeze;
+		}
+	}
+
+	return 0;
+
+err_unfreeze:
+	WRITE_ONCE(kvm->arch.luo_frozen, false);
+	return -EBUSY;
+}
+
+void kvm_tdx_luo_vm_unpreserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
+{
+	struct kvm_tdx *kvm_tdx = kvm ? to_kvm_tdx(kvm) : NULL;
+	u32 i;
+
+	if (kvm && !is_td(kvm))
+		return;
+
+	if (kvm_tdx)
+		kvm_tdx->luo_preserved = false;
+
+	tdx_luo_update_active_hkid(s->tdx.hkid, false, false);
+
+	if (kvm_tdx && kvm_tdx->luo_sept_pages) {
+		kho_unpreserve_vmalloc(&s->tdx.sept_pages);
+		kvm_tdp_mmu_luo_unpreserve_mirror(kvm_tdx->luo_sept_pages,
+						  s->tdx.nr_sept_pages);
+		vfree(kvm_tdx->luo_sept_pages);
+		kvm_tdx->luo_sept_pages = NULL;
+	}
+
+	for (i = 0; i < s->tdx.nr_tdcs_pages && i < TDX_LUO_MAX_TDCS_PAGES; i++) {
+		if (s->tdx.tdcs_pfns[i])
+			kho_unpreserve_folio(pfn_folio(s->tdx.tdcs_pfns[i]));
+	}
+
+	if (s->tdx.tdr_pfn)
+		kho_unpreserve_folio(pfn_folio(s->tdx.tdr_pfn));
+
+	memset(&s->tdx, 0, sizeof(s->tdx));
+}
+
+static void tdx_luo_finish_unclaimed_vm(struct kvm_tdx *kvm_tdx,
+					struct kvm_luo_vm_x86_state *s,
+					struct kvm_tdx_luo_sept_page *sept_pages);
+
+/*
+ * tdx_luo_deferred_gmem_pages is indexed by pfn. TDX_LUO_GMEM_MAPPED marks a
+ * leaf of a luo-retrieved TD's S-EPT (set at retrieve, erased by
+ * tdx_sept_remove_leaf_spte() once the page is removed and reset);
+ * TDX_LUO_GMEM_PINNED marks a guest_memfd page that was freed while still
+ * TD-private and is pinned until it is removed or reclaimed.
+ */
+#define TDX_LUO_GMEM_PINNED	xa_mk_value(1)
+#define TDX_LUO_GMEM_MAPPED	xa_mk_value(2)
+
+static void __tdx_luo_untrack_mirror_leaves(const struct kvm_tdx_luo_sept_page *pages,
+					    u64 last_page, int last_idx)
+{
+	u64 i;
+	int idx, limit;
+
+	lockdep_assert_held(&tdx_lock);
+
+	for (i = 0; i <= last_page; i++) {
+		const u64 *spt;
+
+		if (pages[i].level != PG_LEVEL_4K)
+			continue;
+		spt = __va(PFN_PHYS(pages[i].spt_pfn));
+		limit = (i == last_page) ? last_idx : SPTE_ENT_PER_PAGE;
+		for (idx = 0; idx < limit; idx++) {
+			if (!is_shadow_present_pte(spt[idx]))
+				continue;
+			xa_cmpxchg(&tdx_luo_deferred_gmem_pages,
+				   spte_to_pfn(spt[idx]), TDX_LUO_GMEM_MAPPED,
+				   NULL, 0);
+		}
+	}
+}
+
+/*
+ * Track (or, on failure, untrack) every leaf of the preserved mirror S-EPT
+ * before the TD can run or be zapped, so that freeing a guest_memfd page
+ * backing it pins the page instead of reclaiming it while still mapped.
+ */
+static int tdx_luo_track_mirror_leaves(const struct kvm_tdx_luo_sept_page *pages,
+				       u64 nr_pages, bool track)
+{
+	u64 i;
+	int idx;
+
+	guard(mutex)(&tdx_lock);
+
+	if (!track) {
+		if (nr_pages)
+			__tdx_luo_untrack_mirror_leaves(pages, nr_pages - 1,
+							SPTE_ENT_PER_PAGE);
+		return 0;
+	}
+
+	for (i = 0; i < nr_pages; i++) {
+		const u64 *spt;
+
+		if (pages[i].level != PG_LEVEL_4K)
+			continue;
+		spt = __va(PFN_PHYS(pages[i].spt_pfn));
+		for (idx = 0; idx < SPTE_ENT_PER_PAGE; idx++) {
+			kvm_pfn_t pfn;
+			void *old;
+
+			if (!is_shadow_present_pte(spt[idx]))
+				continue;
+			pfn = spte_to_pfn(spt[idx]);
+			if (!pfn_to_online_page(pfn)) {
+				__tdx_luo_untrack_mirror_leaves(pages, i, idx);
+				return -EINVAL;
+			}
+			old = xa_cmpxchg(&tdx_luo_deferred_gmem_pages, pfn, NULL,
+					 TDX_LUO_GMEM_MAPPED, GFP_KERNEL_ACCOUNT);
+			if (old) {
+				__tdx_luo_untrack_mirror_leaves(pages, i, idx);
+				return xa_is_err(old) ? xa_err(old) : -EINVAL;
+			}
+		}
+	}
+	return 0;
+}
+
+static struct kvm_tdx_luo_sept_page *
+tdx_luo_restore_sept_pages(struct kvm_luo_vm_x86_state *s, bool *valid)
+{
+	struct kvm_tdx_luo_sept_page *pages;
+	bool ok = true;
+	u64 j;
+
+	if (!s->tdx.nr_sept_pages || !s->tdx.sept_pages.total_pages)
+		return NULL;
+	pages = kho_restore_vmalloc(&s->tdx.sept_pages);
+	memset(&s->tdx.sept_pages, 0, sizeof(s->tdx.sept_pages));
+	for (j = 0; pages && j < s->tdx.nr_sept_pages; j++) {
+		if (pages[j].reserved[0] || pages[j].reserved[1] ||
+		    pages[j].reserved[2])
+			ok = false;
+		if (!pages[j].spt_pfn ||
+		    !kho_restore_folio(PFN_PHYS(pages[j].spt_pfn))) {
+			pages[j].spt_pfn = 0;
+			ok = false;
+		}
+		if (pages[j].ext_spt_pfn &&
+		    !kho_restore_folio(PFN_PHYS(pages[j].ext_spt_pfn))) {
+			pages[j].ext_spt_pfn = 0;
+			ok = false;
+		}
+	}
+	if (valid)
+		*valid = pages && ok;
+	return pages;
+}
+
+int kvm_tdx_luo_vm_retrieve(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
+{
+	struct kvm_tdx_luo_sept_page *sept_pages = NULL;
+	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
+	u64 nr_sept_pages = s->tdx.nr_sept_pages;
+	struct folio *folio;
+	u32 expected_tdcs;
+	int ret, i;
+
+	if (!is_td(kvm) || !enable_tdx || !tdx_luo_is_adopted())
+		return -EOPNOTSUPP;
+
+	if (kvm_tdx->state != TD_STATE_UNINITIALIZED)
+		return -EINVAL;
+
+	expected_tdcs = tdx_sysinfo->td_ctrl.tdcs_base_size / PAGE_SIZE;
+	if (s->tdx.tdx_state != TD_STATE_RUNNABLE || s->tdx.hkid <= 0 ||
+	    !s->tdx.tdr_pfn || !pfn_valid(s->tdx.tdr_pfn) ||
+	    s->tdx.nr_tdcs_pages != expected_tdcs ||
+	    s->tdx.nr_tdcs_pages > TDX_LUO_MAX_TDCS_PAGES)
+		return -EINVAL;
+
+	for (i = 0; i < s->tdx.nr_tdcs_pages; i++) {
+		if (!s->tdx.tdcs_pfns[i] || !pfn_valid(s->tdx.tdcs_pfns[i]))
+			return -EINVAL;
+	}
+
+	if (s->tdx.root_level == 5)
+		tdx_set_mirror_root_level(kvm, 5);
+	else if (s->tdx.root_level == 4)
+		tdx_set_mirror_root_level(kvm, 4);
+	else
+		return -EINVAL;
+
+	kvm_tdx->misc_cg = get_current_misc_cg();
+	ret = misc_cg_try_charge(MISC_CG_RES_TDX, kvm_tdx->misc_cg, 1);
+	if (ret) {
+		put_misc_cg(kvm_tdx->misc_cg);
+		kvm_tdx->misc_cg = NULL;
+		return ret;
+	}
+
+	kvm_tdx->td.tdcs_nr_pages = s->tdx.nr_tdcs_pages;
+	kvm_tdx->td.tdcx_nr_pages =
+		tdx_sysinfo->td_ctrl.tdvps_base_size / PAGE_SIZE - 1;
+	kvm_tdx->td.tdcs_pages = kzalloc_objs(*kvm_tdx->td.tdcs_pages,
+					      kvm_tdx->td.tdcs_nr_pages,
+					      GFP_KERNEL_ACCOUNT);
+	ret = !kvm_tdx->td.tdcs_pages ? -ENOMEM :
+	      !tdx_luo_update_active_hkid(s->tdx.hkid, true, false) ? -EBUSY : 0;
+	if (ret) {
+		kfree(kvm_tdx->td.tdcs_pages);
+		kvm_tdx->td.tdcs_pages = NULL;
+		misc_cg_uncharge(MISC_CG_RES_TDX, kvm_tdx->misc_cg, 1);
+		put_misc_cg(kvm_tdx->misc_cg);
+		kvm_tdx->misc_cg = NULL;
+		return ret;
+	}
+	kvm_tdx->hkid = s->tdx.hkid;
+
+	if (nr_sept_pages > 0) {
+		bool valid = false;
+
+		sept_pages = tdx_luo_restore_sept_pages(s, &valid);
+		if (!valid) {
+			ret = -EINVAL;
+			goto err_tdcs;
+		}
+	}
+
+	folio = kho_restore_folio(PFN_PHYS(s->tdx.tdr_pfn));
+	if (!folio) {
+		ret = -EINVAL;
+		goto err_tdcs;
+	}
+	s->tdx.tdr_pfn = 0;
+	kvm_tdx->td.tdr_page = folio_page(folio, 0);
+
+	for (i = 0; i < kvm_tdx->td.tdcs_nr_pages; i++) {
+		folio = kho_restore_folio(PFN_PHYS(s->tdx.tdcs_pfns[i]));
+		if (!folio) {
+			ret = -EINVAL;
+			goto err_tdcs;
+		}
+		s->tdx.tdcs_pfns[i] = 0;
+		kvm_tdx->td.tdcs_pages[i] = folio_page(folio, 0);
+	}
+
+	if (sept_pages) {
+		ret = tdx_luo_track_mirror_leaves(sept_pages, nr_sept_pages,
+						  true);
+		if (ret)
+			goto err_tdcs;
+		ret = kvm_tdp_mmu_luo_retrieve_mirror(kvm, sept_pages,
+						      nr_sept_pages,
+						      tdx_luo_verify_sept_entry);
+		if (ret) {
+			tdx_luo_track_mirror_leaves(sept_pages, nr_sept_pages,
+						    false);
+			goto err_tdcs;
+		}
+		vfree(sept_pages);
+		sept_pages = NULL;
+		s->tdx.nr_sept_pages = 0;
+	}
+
+	kvm_tdx->attributes = s->tdx.attributes;
+	kvm_tdx->xfam = s->tdx.xfam;
+	kvm_tdx->tsc_offset = s->tdx.tsc_offset;
+	kvm_tdx->tsc_multiplier = s->tdx.tsc_multiplier;
+
+	kvm_tdx->state = TD_STATE_RUNNABLE;
+	kvm_tdx->luo_retrieved = true;
+	kvm->arch.luo_gmem_vm_id = ((u64)KVM_VM_LUO_FEAT_TDX << 32) |
+				   (u32)kvm_tdx->hkid;
+	/* TD_STATE_RUNNABLE must be set before 'pre_fault_allowed' */
+	smp_wmb();
+	kvm->arch.pre_fault_allowed = true;
+
+	return 0;
+
+err_tdcs:
+	tdx_luo_finish_unclaimed_vm(kvm_tdx, s, sept_pages);
+	kfree(kvm_tdx->td.tdcs_pages);
+	kvm_tdx->td.tdcs_pages = NULL;
+	return ret;
+}
+
+static void tdx_luo_reclaim_or_defer_ctrl_page(struct page *page)
+{
+	u64 err, rcx, rdx, r8;
+
+	lockdep_assert_held(&tdx_lock);
+
+	err = tdh_phymem_page_reclaim(page, &rcx, &rdx, &r8);
+	if (!err) {
+		tdx_quirk_reset_paddr(page_to_phys(page), PAGE_SIZE);
+		__free_page(page);
+		return;
+	}
+
+	list_add_tail(&page->lru, &tdx_luo_deferred_ctrl_pages);
+}
+
+static void tdx_luo_drain_deferred_pages(void)
+{
+	struct page *page, *tmp;
+	u64 err, rcx, rdx, r8;
+	bool progressed;
+
+	lockdep_assert_held(&tdx_lock);
+
+	do {
+		progressed = false;
+		list_for_each_entry_safe(page, tmp, &tdx_luo_deferred_ctrl_pages, lru) {
+			err = tdh_phymem_page_reclaim(page, &rcx, &rdx, &r8);
+			if (!err) {
+				list_del_init(&page->lru);
+				tdx_quirk_reset_paddr(page_to_phys(page), PAGE_SIZE);
+				__free_page(page);
+				progressed = true;
+			}
+		}
+	} while (progressed);
+
+	list_for_each_entry_safe(page, tmp, &tdx_luo_deferred_tdr_pages, lru) {
+		struct tdx_td td = { .tdr_page = page };
+
+		err = tdh_phymem_page_reclaim(page, &rcx, &rdx, &r8);
+		if (!err) {
+			err = tdh_phymem_page_wbinvd_tdr(&td);
+			if (!WARN_ON_ONCE(err)) {
+				list_del_init(&page->lru);
+				tdx_quirk_reset_paddr(page_to_phys(page),
+						      PAGE_SIZE);
+				__free_page(page);
+			}
+		}
+	}
+}
+
+#define TDX_TD_ASSOCIATED_PAGES_EXIST		0xC000080100000000ULL
+
+static void tdx_luo_drop_deferred_gmem_page(kvm_pfn_t pfn)
+{
+	if (xa_erase(&tdx_luo_deferred_gmem_pages, pfn) == TDX_LUO_GMEM_PINNED)
+		put_page(pfn_to_page(pfn));
+}
+
+static bool tdx_luo_try_defer_tdr_reclaim(struct page *tdr_page)
+{
+	struct tdx_td td = { .tdr_page = tdr_page };
+	u64 err, rcx, rdx, r8;
+
+	guard(mutex)(&tdx_lock);
+	tdx_luo_drain_deferred_pages();
+
+	err = tdh_phymem_page_reclaim(tdr_page, &rcx, &rdx, &r8);
+	if (!err) {
+		err = tdh_phymem_page_wbinvd_tdr(&td);
+		if (!WARN_ON_ONCE(err)) {
+			tdx_quirk_reset_paddr(page_to_phys(tdr_page),
+					      PAGE_SIZE);
+			__free_page(tdr_page);
+		}
+		return true;
+	}
+	if ((err & TDX_SEAMCALL_STATUS_MASK) == TDX_OPERAND_BUSY ||
+	    (err & TDX_SEAMCALL_STATUS_MASK) == TDX_TD_ASSOCIATED_PAGES_EXIST) {
+		list_add_tail(&tdr_page->lru, &tdx_luo_deferred_tdr_pages);
+		return true;
+	}
+	return false;
+}
+
+static void tdx_luo_reclaim_sept_leaf_pages(const u64 *spt)
+{
+	u64 err, rcx, rdx, r8;
+	struct page *page;
+	kvm_pfn_t pfn;
+	int idx;
+
+	lockdep_assert_held(&tdx_lock);
+
+	for (idx = 0; idx < 512; idx++) {
+		if (!(spt[idx] & 1))
+			continue;
+		pfn = (spt[idx] & 0x000ffffffffff000ULL) >> PAGE_SHIFT;
+		page = pfn_to_online_page(pfn);
+		if (!page)
+			continue;
+		err = tdh_phymem_page_reclaim(page, &rcx, &rdx, &r8);
+		if (!err)
+			tdx_quirk_reset_paddr(PFN_PHYS(pfn), PAGE_SIZE);
+		else if ((err & TDX_SEAMCALL_STATUS_MASK) !=
+			 TDX_PAGE_METADATA_INCORRECT)
+			continue;
+		if (xa_erase(&tdx_luo_deferred_gmem_pages, pfn) ==
+		    TDX_LUO_GMEM_PINNED)
+			put_page(page);
+	}
+}
+
+static void tdx_luo_finish_unclaimed_vm(struct kvm_tdx *kvm_tdx,
+					struct kvm_luo_vm_x86_state *s,
+					struct kvm_tdx_luo_sept_page *sept_pages)
+{
+	struct page *tdcs_pages[TDX_LUO_MAX_TDCS_PAGES] = {};
+	bool packages_allocated, targets_allocated;
+	cpumask_var_t packages, targets;
+	bool key_freed = false, has_hkid;
+	struct tdx_td td = {};
+	struct folio *folio;
+	u32 nr_tdcs, i;
+	u64 j, err;
+	int cpu;
+
+	nr_tdcs = min_t(u32, s->tdx.nr_tdcs_pages, TDX_LUO_MAX_TDCS_PAGES);
+	if (kvm_tdx) {
+		td.tdr_page = kvm_tdx->td.tdr_page;
+		kvm_tdx->td.tdr_page = NULL;
+		if (kvm_tdx->td.tdcs_pages) {
+			for (i = 0; i < nr_tdcs; i++) {
+				tdcs_pages[i] = kvm_tdx->td.tdcs_pages[i];
+				kvm_tdx->td.tdcs_pages[i] = NULL;
+			}
+		}
+	}
+
+	if (!td.tdr_page && s->tdx.tdr_pfn) {
+		folio = kho_restore_folio(PFN_PHYS(s->tdx.tdr_pfn));
+		s->tdx.tdr_pfn = 0;
+		if (folio)
+			td.tdr_page = folio_page(folio, 0);
+	}
+
+	for (i = 0; i < nr_tdcs; i++) {
+		if (tdcs_pages[i] || !s->tdx.tdcs_pfns[i])
+			continue;
+		folio = kho_restore_folio(PFN_PHYS(s->tdx.tdcs_pfns[i]));
+		s->tdx.tdcs_pfns[i] = 0;
+		if (folio)
+			tdcs_pages[i] = folio_page(folio, 0);
+	}
+	s->tdx.nr_tdcs_pages = 0;
+
+	if (!sept_pages)
+		sept_pages = tdx_luo_restore_sept_pages(s, NULL);
+
+	has_hkid = (kvm_tdx && is_hkid_assigned(kvm_tdx)) ||
+		   tdx_luo_update_active_hkid(s->tdx.hkid, true, false);
+
+	packages_allocated = zalloc_cpumask_var(&packages, GFP_KERNEL);
+	targets_allocated = zalloc_cpumask_var(&targets, GFP_KERNEL);
+	cpus_read_lock();
+	mutex_lock(&tdx_lock);
+
+	if (tdx_luo_is_adopted() && s->tdx.hkid > 0 && td.tdr_page) {
+		err = tdh_mng_vpflushdone(&td);
+		if (!err) {
+			for_each_online_cpu(cpu) {
+				if (packages_allocated &&
+				    cpumask_test_and_set_cpu(topology_physical_package_id(cpu),
+							     packages))
+					continue;
+				if (targets_allocated)
+					cpumask_set_cpu(cpu, targets);
+			}
+			if (targets_allocated)
+				on_each_cpu_mask(targets, smp_func_do_phymem_cache_wb,
+						 NULL, true);
+			else
+				on_each_cpu(smp_func_do_phymem_cache_wb, NULL, true);
+
+			err = tdh_mng_key_freeid(&td);
+			if (!WARN_ON_ONCE(err)) {
+				key_freed = true;
+				if (has_hkid) {
+					if (kvm_tdx && is_hkid_assigned(kvm_tdx))
+						tdx_hkid_free(kvm_tdx);
+					else
+						tdx_guest_keyid_free(s->tdx.hkid);
+				}
+			}
+		}
+	}
+
+	if (kvm_tdx && is_hkid_assigned(kvm_tdx)) {
+		misc_cg_uncharge(MISC_CG_RES_TDX, kvm_tdx->misc_cg, 1);
+		put_misc_cg(kvm_tdx->misc_cg);
+		kvm_tdx->misc_cg = NULL;
+		kvm_tdx->hkid = -1;
+	}
+
+	if (sept_pages) {
+		for (j = 0; j < s->tdx.nr_sept_pages; j++) {
+			if (sept_pages[j].spt_pfn) {
+				struct page *spt_page = pfn_to_page(sept_pages[j].spt_pfn);
+
+				if (key_freed && sept_pages[j].level == PG_LEVEL_4K)
+					tdx_luo_reclaim_sept_leaf_pages(page_address(spt_page));
+				__free_page(spt_page);
+			}
+			if (key_freed && sept_pages[j].ext_spt_pfn)
+				tdx_luo_reclaim_or_defer_ctrl_page(pfn_to_page(sept_pages[j].ext_spt_pfn));
+			cond_resched();
+		}
+		vfree(sept_pages);
+	}
+	s->tdx.nr_sept_pages = 0;
+
+	if (key_freed) {
+		for (i = 0; i < nr_tdcs; i++) {
+			if (tdcs_pages[i])
+				tdx_luo_reclaim_or_defer_ctrl_page(tdcs_pages[i]);
+		}
+
+		if (td.tdr_page)
+			list_add_tail(&td.tdr_page->lru,
+				      &tdx_luo_deferred_tdr_pages);
+		tdx_luo_drain_deferred_pages();
+	}
+
+	mutex_unlock(&tdx_lock);
+	cpus_read_unlock();
+	free_cpumask_var(targets);
+	free_cpumask_var(packages);
+}
+
+void kvm_tdx_luo_vm_finish(struct kvm_luo_vm_x86_state *s, bool retrieved)
+{
+	if (retrieved || (!s->tdx.tdr_pfn && !s->tdx.nr_sept_pages))
+		return;
+
+	tdx_luo_finish_unclaimed_vm(NULL, s, NULL);
+}
+
+#endif /* CONFIG_LIVEUPDATE */
+
+int tdx_gmem_make_shared(kvm_pfn_t pfn, kvm_pfn_t nr_pages, bool reclaim)
+{
+#ifdef CONFIG_LIVEUPDATE
+	u64 err, rcx, rdx, r8;
+	int ret = 0;
+	kvm_pfn_t i;
+
+	if (!tdx_luo_is_adopted())
+		return 0;
+
+	mutex_lock(&tdx_lock);
+	for (i = 0; i < nr_pages; i++) {
+		struct page *page = pfn_to_page(pfn + i);
+		void *old;
+
+		/*
+		 * A leaf of a retrieved TD is still mapped (possibly being
+		 * removed by tdx_sept_remove_leaf_spte() right now): pin the
+		 * page on reclaim without touching the TDX module so leaf
+		 * removal drops the pin once PT_NDA + reset, or reject
+		 * in-place conversion to shared with -EBUSY.
+		 */
+		xa_lock(&tdx_luo_deferred_gmem_pages);
+		old = xa_load(&tdx_luo_deferred_gmem_pages, pfn + i);
+		if (reclaim && old == TDX_LUO_GMEM_MAPPED) {
+			get_page(page);
+			__xa_store(&tdx_luo_deferred_gmem_pages, pfn + i,
+				   TDX_LUO_GMEM_PINNED, GFP_NOWAIT);
+		}
+		xa_unlock(&tdx_luo_deferred_gmem_pages);
+		if (old) {
+			if (!reclaim) {
+				ret = -EBUSY;
+				break;
+			}
+			continue;
+		}
+
+		err = tdh_phymem_page_reclaim(page, &rcx, &rdx, &r8);
+		if (!err) {
+			tdx_quirk_reset_paddr(PFN_PHYS(pfn + i), PAGE_SIZE);
+			continue;
+		}
+		if ((err & TDX_SEAMCALL_STATUS_MASK) ==
+		    TDX_PAGE_METADATA_INCORRECT)
+			continue;
+		if (!reclaim) {
+			ret = -EBUSY;
+			break;
+		}
+
+		get_page(page);
+		old = xa_store(&tdx_luo_deferred_gmem_pages, pfn + i,
+			       TDX_LUO_GMEM_PINNED, GFP_KERNEL);
+		if (old == TDX_LUO_GMEM_PINNED)
+			put_page(page);
+	}
+	tdx_luo_drain_deferred_pages();
+	mutex_unlock(&tdx_lock);
+	return ret;
+#else
+	return 0;
+#endif
 }

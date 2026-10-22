@@ -71,7 +71,7 @@ static int kvm_x86_luo_save_vm_state(struct kvm *kvm,
 	if (ret)
 		return ret;
 
-	memset(st, 0, sizeof(*st));
+	memset(st, 0, offsetof(struct kvm_luo_vm_x86_state, tdx));
 	st->version = KVM_LUO_X86_VM_STATE_VERSION;
 	st->irqchip_mode = kvm->arch.irqchip_mode;
 	st->nr_ioapic_pins = kvm->arch.nr_reserved_ioapic_pins;

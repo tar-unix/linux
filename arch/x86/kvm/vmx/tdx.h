@@ -47,6 +47,12 @@ struct kvm_tdx {
 	 * Set/unset is protected with kvm->mmu_lock.
 	 */
 	bool wait_for_sept_zap;
+	bool luo_preserved;
+	bool luo_retrieved;
+
+#ifdef CONFIG_LIVEUPDATE
+	struct kvm_tdx_luo_sept_page *luo_sept_pages;
+#endif
 };
 
 /* TDX module vCPU states */
@@ -177,6 +183,23 @@ static __always_inline void td_##lclass##_clearbit##bits(struct vcpu_tdx *tdx,	\
 bool tdx_interrupt_allowed(struct kvm_vcpu *vcpu);
 int tdx_complete_emulated_msr(struct kvm_vcpu *vcpu, int err);
 
+#ifdef CONFIG_LIVEUPDATE
+struct kvm_luo_vm_x86_state;
+
+int tdx_luo_init(void);
+void tdx_luo_exit(void);
+int kvm_tdx_luo_vm_preserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *s);
+int kvm_tdx_luo_vm_freeze(struct kvm *kvm, struct kvm_luo_vm_x86_state *s);
+void kvm_tdx_luo_vm_unpreserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *s);
+int kvm_tdx_luo_vm_retrieve(struct kvm *kvm,
+			    struct kvm_luo_vm_x86_state *s);
+void kvm_tdx_luo_vm_finish(struct kvm_luo_vm_x86_state *s,
+			   bool retrieved);
+#else
+static inline int tdx_luo_init(void) { return 0; }
+static inline void tdx_luo_exit(void) {}
+#endif
+
 TDX_BUILD_TDVPS_ACCESSORS(16, VMCS, vmcs);
 TDX_BUILD_TDVPS_ACCESSORS(32, VMCS, vmcs);
 TDX_BUILD_TDVPS_ACCESSORS(64, VMCS, vmcs);
@@ -197,6 +220,8 @@ struct vcpu_tdx {
 
 static inline bool tdx_interrupt_allowed(struct kvm_vcpu *vcpu) { return false; }
 static inline int tdx_complete_emulated_msr(struct kvm_vcpu *vcpu, int err) { return 0; }
+static inline int tdx_luo_init(void) { return 0; }
+static inline void tdx_luo_exit(void) {}
 
 #endif
 

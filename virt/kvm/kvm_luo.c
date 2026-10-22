@@ -30,12 +30,13 @@
  *
  * In addition to the VM type, architecture-specific VM state (such as
  * in-kernel interrupt controller state, timers, and GSI routing) is carried
- * over. Each VM and vCPU records its kind feature (non-CoCo or
- * software-protected private memory) in its feature header. vCPUs are
- * preserved separately via the "kvm-vcpu" file handler and retrieved against
- * the restored VM file descriptor using struct kvm_vcpu_luo_retrieve. Guest
- * memory is preserved separately by preserving the files that back it, and the
- * VMM re-attaches memory slots after retrieval.
+ * over. Each VM and vCPU records its kind feature (non-CoCo,
+ * software-protected private memory, or Intel TDX) in its feature header.
+ * vCPUs are preserved separately via the "kvm-vcpu" file handler and
+ * retrieved against the restored VM file descriptor using struct
+ * kvm_vcpu_luo_retrieve. Guest memory is preserved separately by preserving
+ * the files that back it, and the VMM re-attaches memory slots after
+ * retrieval.
  *
  * The file handlers are available once KVM is loaded, on x86 together with
  * kvm-intel or kvm-amd. In the new kernel, these modules must be loaded before
@@ -62,11 +63,13 @@ static const u8 kvm_vm_luo_features[KVM_VM_LUO_FEAT_MAX] = {
 	[KVM_VM_LUO_FEAT_CORE]		= LUO_FEAT_REQUIRED,
 	[KVM_VM_LUO_FEAT_NON_COCO]	= LUO_FEAT_OPTIONAL,
 	[KVM_VM_LUO_FEAT_SW_PROTECTED]	= LUO_FEAT_OPTIONAL,
+	[KVM_VM_LUO_FEAT_TDX]		= LUO_FEAT_OPTIONAL,
 };
 
 static const unsigned int kvm_vm_luo_kinds[] = {
 	KVM_VM_LUO_FEAT_NON_COCO,
 	KVM_VM_LUO_FEAT_SW_PROTECTED,
+	KVM_VM_LUO_FEAT_TDX,
 };
 
 static atomic_t kvm_vm_luo_nr_retrieved = ATOMIC_INIT(0);
@@ -124,6 +127,11 @@ static int kvm_vm_luo_get_kind(const struct luo_feature_hdr *hdr)
 	return kind;
 }
 
+static bool kvm_vm_luo_is_hw_coco(int kind)
+{
+	return kind == KVM_VM_LUO_FEAT_TDX;
+}
+
 static bool kvm_vm_luo_can_preserve(struct liveupdate_file_handler *handler,
 				    struct file *file)
 {
@@ -167,6 +175,9 @@ static int kvm_vm_luo_preserve(struct liveupdate_file_op_args *args)
 	luo_feature_hdr_init(&state->features, sizeof(*state), features);
 	state->type = type;
 
+	if (kvm_vm_luo_is_hw_coco(kind))
+		liveupdate_coco_preserve_enter();
+
 	args->serialized_data = __pa(state);
 	return 0;
 }
@@ -209,6 +220,10 @@ static void kvm_vm_luo_unpreserve(struct liveupdate_file_op_args *args)
 {
 	struct kvm_vm_luo_state *state = __va(args->serialized_data);
 	struct kvm *kvm = args->file->private_data;
+	int kind = kvm_vm_luo_get_kind(&state->features);
+
+	if (kind >= 0 && kvm_vm_luo_is_hw_coco(kind))
+		liveupdate_coco_preserve_exit();
 
 	scoped_guard(mutex, &kvm->lock)
 		kvm_arch_luo_vm_unpreserve(kvm, state->arch_state_pa);
@@ -321,11 +336,13 @@ static const u8 kvm_vcpu_luo_features[KVM_VCPU_LUO_FEAT_MAX] = {
 	[KVM_VCPU_LUO_FEAT_CORE]		= LUO_FEAT_REQUIRED,
 	[KVM_VCPU_LUO_FEAT_NON_COCO]		= LUO_FEAT_OPTIONAL,
 	[KVM_VCPU_LUO_FEAT_SW_PROTECTED]	= LUO_FEAT_OPTIONAL,
+	[KVM_VCPU_LUO_FEAT_TDX]			= LUO_FEAT_OPTIONAL,
 };
 
 static const unsigned int kvm_vcpu_luo_kinds[] = {
 	KVM_VCPU_LUO_FEAT_NON_COCO,
 	KVM_VCPU_LUO_FEAT_SW_PROTECTED,
+	KVM_VCPU_LUO_FEAT_TDX,
 };
 
 int __weak kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)

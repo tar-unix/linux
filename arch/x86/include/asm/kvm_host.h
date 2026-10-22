@@ -1764,7 +1764,7 @@ struct kvm_x86_ops {
 				 kvm_pfn_t nr_pages);
 #endif
 #if defined(CONFIG_HAVE_KVM_ARCH_GMEM_CONVERT) || defined(CONFIG_HAVE_KVM_ARCH_GMEM_RECLAIM)
-	void (*gmem_make_shared)(kvm_pfn_t pfn, kvm_pfn_t nr_pages);
+	int (*gmem_make_shared)(kvm_pfn_t pfn, kvm_pfn_t nr_pages, bool reclaim);
 #endif
 #ifdef CONFIG_HAVE_KVM_ARCH_GMEM_INVALIDATE
 	void (*gmem_invalidate_range)(struct kvm *kvm, struct kvm_gfn_range *range);
@@ -1906,7 +1906,7 @@ enum kvm_intr_type {
 #define kvm_arch_has_private_mem(kvm) ((kvm)->arch.has_private_mem)
 #endif
 #ifdef CONFIG_HAVE_KVM_ARCH_GMEM_CONVERT
-#define kvm_arch_has_gmem_convert() (!!kvm_x86_ops.gmem_make_private)
+#define kvm_arch_has_gmem_convert() (kvm_x86_ops.gmem_make_private || kvm_x86_ops.gmem_make_shared)
 #endif
 
 #define kvm_arch_has_readonly_mem(kvm) (!(kvm)->arch.has_protected_state)

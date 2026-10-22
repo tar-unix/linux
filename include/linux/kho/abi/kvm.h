@@ -38,6 +38,8 @@
  *                                fields.
  * @KVM_VM_LUO_FEAT_SW_PROTECTED: Kind of VM with software-protected private
  *                                memory (%KVM_X86_SW_PROTECTED_VM).
+ * @KVM_VM_LUO_FEAT_TDX:          Kind of Intel TDX confidential VM
+ *                                (%KVM_X86_TDX_VM).
  * @KVM_VM_LUO_FEAT_MAX:          Number of defined features.
  *
  * The values are ABI. New features are added before %KVM_VM_LUO_FEAT_MAX,
@@ -47,6 +49,7 @@ enum kvm_vm_luo_feature {
 	KVM_VM_LUO_FEAT_CORE = 0,
 	KVM_VM_LUO_FEAT_NON_COCO = 1,
 	KVM_VM_LUO_FEAT_SW_PROTECTED = 2,
+	KVM_VM_LUO_FEAT_TDX = 3,
 	KVM_VM_LUO_FEAT_MAX,
 };
 
@@ -211,6 +214,8 @@ static_assert(sizeof(struct kvm_gmem_luo_state) == 200);
  * @KVM_VCPU_LUO_FEAT_SW_PROTECTED: Kind of vCPU belonging to a VM with
  *                                  software-protected private memory
  *                                  (%KVM_X86_SW_PROTECTED_VM).
+ * @KVM_VCPU_LUO_FEAT_TDX:          Kind of vCPU belonging to an Intel TDX
+ *                                  confidential VM (%KVM_X86_TDX_VM).
  * @KVM_VCPU_LUO_FEAT_MAX:          Number of defined features.
  *
  * The values are ABI. New features are added before %KVM_VCPU_LUO_FEAT_MAX,
@@ -220,12 +225,14 @@ enum kvm_vcpu_luo_feature {
 	KVM_VCPU_LUO_FEAT_CORE = 0,
 	KVM_VCPU_LUO_FEAT_NON_COCO = 1,
 	KVM_VCPU_LUO_FEAT_SW_PROTECTED = 2,
+	KVM_VCPU_LUO_FEAT_TDX = 3,
 	KVM_VCPU_LUO_FEAT_MAX,
 };
 
 static_assert((int)KVM_VCPU_LUO_FEAT_MAX <= LUO_FEAT_MAX);
 static_assert((int)KVM_VCPU_LUO_FEAT_NON_COCO == (int)KVM_VM_LUO_FEAT_NON_COCO);
 static_assert((int)KVM_VCPU_LUO_FEAT_SW_PROTECTED == (int)KVM_VM_LUO_FEAT_SW_PROTECTED);
+static_assert((int)KVM_VCPU_LUO_FEAT_TDX == (int)KVM_VM_LUO_FEAT_TDX);
 
 /**
  * struct kvm_vcpu_luo_state - Preserved state of a KVM vCPU.
@@ -259,6 +266,7 @@ static_assert(sizeof(struct kvm_vcpu_luo_state) == 144);
 #define TDX_LUO_LP_BITMAP_U64S		(TDX_LUO_MAX_LP_CPUS / 64)
 #define TDX_LUO_MAX_HKIDS		2048
 #define TDX_LUO_HKID_BITMAP_U64S	(TDX_LUO_MAX_HKIDS / 64)
+#define TDX_LUO_MAX_TDCS_PAGES		16
 
 #define TDX_LUO_FLB_MAGIC		0x5444584cU
 #define TDX_LUO_FLB_F_ACTIVE_TDS	BIT(0)
@@ -339,6 +347,38 @@ struct kvm_tdx_luo_sept_page {
 
 static_assert(sizeof(struct kvm_tdx_luo_sept_page) == 32);
 
+/**
+ * struct kvm_tdx_vm_luo_state - Per-TD VM state embedded in kvm_luo_vm_x86_state.
+ * @tdr_pfn:        PFN of the 4KB TDR control page.
+ * @tdcs_pfns:      PFNs of the TDCS control pages.
+ * @nr_tdcs_pages:  Number of valid entries in @tdcs_pfns.
+ * @hkid:           Assigned TDX guest HKID.
+ * @tdx_state:      TD lifecycle state at freeze time.
+ * @root_level:     S-EPT root page table level.
+ * @attributes:     TD attributes.
+ * @xfam:           TD extended feature available mask.
+ * @tsc_offset:     TD TSC offset.
+ * @tsc_multiplier: TD TSC multiplier.
+ * @nr_sept_pages:  Number of preserved S-EPT mirror page nodes.
+ * @sept_pages:     Preserved vmalloc array of struct kvm_tdx_luo_sept_page.
+ */
+struct kvm_tdx_vm_luo_state {
+	u64 tdr_pfn;
+	u64 tdcs_pfns[TDX_LUO_MAX_TDCS_PAGES];
+	u32 nr_tdcs_pages;
+	s32 hkid;
+	u32 tdx_state;
+	u32 root_level;
+	u64 attributes;
+	u64 xfam;
+	u64 tsc_offset;
+	u64 tsc_multiplier;
+	u64 nr_sept_pages;
+	struct kho_vmalloc sept_pages;
+};
+
+static_assert(sizeof(struct kvm_tdx_vm_luo_state) == 208);
+
 #define KVM_LUO_X86_MAX_CPUID_ENTRIES	256
 #define KVM_LUO_X86_MAX_MSR_ENTRIES	512
 #define KVM_LUO_X86_MAX_IRQ_ROUTES	1024
@@ -386,6 +426,7 @@ static_assert(sizeof(struct kvm_tdx_luo_sept_page) == 32);
  * @nr_vcpus:             Number of online vCPUs at freeze time.
  * @disabled_quirks:      Preserved VM disabled_quirks mask.
  * @irq_routes:           Preserved GSI routing table entries.
+ * @tdx:                  Per-TD VM state for %KVM_VM_LUO_FEAT_TDX.
  */
 struct kvm_luo_vm_x86_state {
 	u32 version;
@@ -408,9 +449,10 @@ struct kvm_luo_vm_x86_state {
 	u16 nr_vcpus;
 	u32 disabled_quirks;
 	struct kvm_irq_routing_entry irq_routes[KVM_LUO_X86_MAX_IRQ_ROUTES];
+	struct kvm_tdx_vm_luo_state tdx;
 };
 
-static_assert(sizeof(struct kvm_luo_vm_x86_state) == 50896);
+static_assert(sizeof(struct kvm_luo_vm_x86_state) == 51104);
 
 #define KVM_LUO_X86_VCPU_STATE_VERSION			1
 #define KVM_LUO_X86_VCPU_FLAG_HAS_LAPIC			BIT(0)

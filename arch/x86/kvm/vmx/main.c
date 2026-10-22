@@ -875,6 +875,50 @@ static int vt_gmem_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn,
 	return 0;
 }
 
+static int vt_gmem_make_shared(kvm_pfn_t pfn, kvm_pfn_t nr_pages, bool reclaim)
+{
+	return tdx_gmem_make_shared(pfn, nr_pages, reclaim);
+}
+
+#ifdef CONFIG_LIVEUPDATE
+static int vt_vm_luo_preserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
+{
+	if (!is_td(kvm))
+		return -EOPNOTSUPP;
+
+	return kvm_tdx_luo_vm_preserve(kvm, s);
+}
+
+static int vt_vm_luo_freeze(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
+{
+	if (!is_td(kvm))
+		return -EOPNOTSUPP;
+
+	return kvm_tdx_luo_vm_freeze(kvm, s);
+}
+
+static void vt_vm_luo_unpreserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
+{
+	if (is_td(kvm))
+		kvm_tdx_luo_vm_unpreserve(kvm, s);
+}
+
+static int vt_vm_luo_retrieve(struct kvm *kvm,
+			      struct kvm_luo_vm_x86_state *s)
+{
+	if (!is_td(kvm))
+		return -EOPNOTSUPP;
+
+	return kvm_tdx_luo_vm_retrieve(kvm, s);
+}
+
+static void vt_vm_luo_finish(struct kvm_luo_vm_x86_state *s,
+			     bool retrieved)
+{
+	kvm_tdx_luo_vm_finish(s, retrieved);
+}
+#endif
+
 #define vt_op(name) vt_##name
 #define vt_op_tdx_only(name) vt_##name
 #else /* CONFIG_KVM_INTEL_TDX */
@@ -1149,7 +1193,17 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 	.vcpu_mem_enc_ioctl = vt_op_tdx_only(vcpu_mem_enc_ioctl),
 	.vcpu_mem_enc_unlocked_ioctl = vt_op_tdx_only(vcpu_mem_enc_unlocked_ioctl),
 
-	.gmem_max_mapping_level = vt_op_tdx_only(gmem_max_mapping_level)
+	.gmem_max_mapping_level = vt_op_tdx_only(gmem_max_mapping_level),
+#ifdef CONFIG_KVM_INTEL_TDX
+	.gmem_make_shared = vt_op_tdx_only(gmem_make_shared),
+#endif
+#ifdef CONFIG_LIVEUPDATE
+	.vm_luo_preserve = vt_op_tdx_only(vm_luo_preserve),
+	.vm_luo_freeze = vt_op_tdx_only(vm_luo_freeze),
+	.vm_luo_unpreserve = vt_op_tdx_only(vm_luo_unpreserve),
+	.vm_luo_retrieve = vt_op_tdx_only(vm_luo_retrieve),
+	.vm_luo_finish = vt_op_tdx_only(vm_luo_finish),
+#endif
 };
 
 struct kvm_x86_init_ops vt_init_ops __initdata = {
@@ -1164,6 +1218,7 @@ struct kvm_x86_init_ops vt_init_ops __initdata = {
 static void __exit vt_exit(void)
 {
 	kvm_exit();
+	tdx_luo_exit();
 	vmx_exit();
 }
 module_exit(vt_exit);
@@ -1192,17 +1247,23 @@ static int __init vt_init(void)
 		kvm_caps.supported_vm_types |= BIT(KVM_X86_TDX_VM);
 	}
 
+	r = tdx_luo_init();
+	if (r)
+		goto err_vmx_exit;
+
 	/*
 	 * Common KVM initialization _must_ come last, after this, /dev/kvm is
 	 * exposed to userspace!
 	 */
 	r = kvm_init(vcpu_size, vcpu_align, THIS_MODULE);
 	if (r)
-		goto err_kvm_init;
+		goto err_tdx_luo;
 
 	return 0;
 
-err_kvm_init:
+err_tdx_luo:
+	tdx_luo_exit();
+err_vmx_exit:
 	vmx_exit();
 	return r;
 }
