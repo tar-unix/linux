@@ -256,6 +256,12 @@ bool triage_sysreg_trap(struct kvm_vcpu *vcpu, int *sr_index);
 
 int kvm_finalize_sys_regs(struct kvm_vcpu *vcpu);
 
+struct kvm_luo_arm64_sys_reg;
+u32 kvm_arm_luo_save_sys_regs(struct kvm_vcpu *vcpu,
+			      struct kvm_luo_arm64_sys_reg *out, u32 max);
+int kvm_arm_luo_restore_sys_regs(struct kvm_vcpu *vcpu,
+				 const struct kvm_luo_arm64_sys_reg *in, u32 nr);
+
 #define AA32(_x)	.aarch32_map = AA32_##_x
 #define Op0(_x) 	.Op0 = _x
 #define Op1(_x) 	.Op1 = _x

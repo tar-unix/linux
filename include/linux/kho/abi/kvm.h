@@ -358,6 +358,23 @@ static_assert(sizeof(struct kvm_luo_vcpu_x86_state) == 24704);
 #define KVM_LUO_ARM64_MAX_RD_REGIONS		16
 #define KVM_LUO_ARM64_MAX_SPIS			988
 
+#define KVM_LUO_ARM64_VCPU_STATE_VERSION	1
+#define KVM_LUO_ARM64_MAX_SYS_REGS		512
+#define KVM_LUO_ARM64_SVE_MAX_BYTES		8768
+#define KVM_LUO_ARM64_CSSELR_MAX		14
+
+/**
+ * struct kvm_luo_arm64_sys_reg - Preserved arm64 system register entry.
+ * @id:  Architectural UAPI KVM_REG_ARM64_SYSREG encoding (Op0/Op1/CRn/CRm/Op2).
+ * @val: Register value.
+ */
+struct kvm_luo_arm64_sys_reg {
+	u64 id;
+	u64 val;
+};
+
+static_assert(sizeof(struct kvm_luo_arm64_sys_reg) == 16);
+
 /**
  * struct kvm_luo_vgic_irq_state - Preserved state of one vGICv3 SGI/PPI/SPI.
  * @intid:         Virtual interrupt identifier.
@@ -475,6 +492,100 @@ struct kvm_luo_vm_arm64_state {
 };
 
 static_assert(sizeof(struct kvm_luo_vm_arm64_state) == 24632);
+
+/**
+ * struct kvm_luo_vcpu_arm64_state - Preserved arm64 vCPU architectural state.
+ * @version:              Format version (%KVM_LUO_ARM64_VCPU_STATE_VERSION).
+ * @target:               CPU target type (%KVM_ARM_TARGET_GENERIC_V8).
+ * @features:             vCPU feature bitmap.
+ * @vcpu_flags:           Preserved subset of vcpu->arch.flags.
+ * @mp_state:             vCPU multiprocessing state.
+ * @power_off:            Whether the vCPU is powered off.
+ * @pause:                Whether the vCPU is paused.
+ * @sve_finalized:        Whether SVE state is finalized on this vCPU.
+ * @has_vgic_v3:          Whether vGICv3 CPU interface state is valid.
+ * @gp_regs:              General-purpose registers, SP_EL0, PC, and PSTATE.
+ * @fp_regs:              FPSIMD V0-V31, FPSR, and FPCR registers.
+ * @sp_el1:               Guest SP_EL1 register.
+ * @elr_el1:              Guest ELR_EL1 register.
+ * @spsr_abi:             Guest SPSR_EL1 and AArch32 banked SPSRs.
+ * @nr_sys_regs:          Number of preserved entries in @sys_regs.
+ * @sve_max_vl:           Maximum SVE vector length in bytes.
+ * @sys_regs:             Guest system register array.
+ * @sve_state:            Preserved SVE register buffer.
+ * @vsesr_el2:            Virtual SError syndrome register.
+ * @mdcr_el2:             Monitor debug configuration register.
+ * @vcpu_debug_state:     Guest-owned hardware breakpoint/watchpoint registers.
+ * @external_debug_state: Host-owned hardware debug registers.
+ * @steal_base:           PV steal-time guest physical address.
+ * @vgic_hcr:             vGICv3 ICH_HCR_EL2 shadow register.
+ * @vgic_vmcr:            vGICv3 ICH_VMCR_EL2 shadow register.
+ * @vgic_sre:             vGICv3 ICC_SRE_EL1 shadow register.
+ * @vgic_used_lrs:        Number of active list registers.
+ * @vgic_ap0r:            vGICv3 ICH_AP0Rn_EL2 active priority registers.
+ * @vgic_ap1r:            vGICv3 ICH_AP1Rn_EL2 active priority registers.
+ * @vgic_lr:              vGICv3 ICH_LRn_EL2 list registers.
+ * @vgic_pendbaser:       vGICv3 GICR_PENDBASER register.
+ * @vgic_lpis_enabled:    Whether LPIs are enabled on this redistributor.
+ * @vgic_num_pri_bits:    Number of priority bits implemented.
+ * @vgic_num_id_bits:     Number of interrupt ID bits implemented.
+ * @sflags_serror:        Preserved vcpu->arch.sflags NESTED_SERROR_PENDING state.
+ * @hcr_irq_flags:        Preserved HCR_EL2 virtual interrupt flags (VSE/VI/VF).
+ * @has_ccsidr:           Whether @ccsidr contains a custom per-vCPU CCSIDR override.
+ * @sflags_host_ss:       Preserved vcpu->arch.sflags HOST_SS_ACTIVE_PENDING state.
+ * @vgic_rd_base:         Exact redistributor MMIO GPA for this vCPU.
+ * @guest_debug:          Preserved vcpu->guest_debug control flags.
+ * @reserved1:            Reserved for alignment, must be zero.
+ * @ccsidr:               Per-vCPU CCSIDR override values indexed by CSSELR.
+ * @private_irqs:         Preserved SGI and PPI interrupt states (0..31).
+ */
+struct kvm_luo_vcpu_arm64_state {
+	u32 version;
+	u32 target;
+	u64 features;
+	u64 vcpu_flags;
+	u32 mp_state;
+	u8 power_off;
+	u8 pause;
+	u8 sve_finalized;
+	u8 has_vgic_v3;
+	struct user_pt_regs gp_regs;
+	struct user_fpsimd_state fp_regs;
+	u64 sp_el1;
+	u64 elr_el1;
+	u64 spsr_abi[5];
+	u32 nr_sys_regs;
+	u32 sve_max_vl;
+	struct kvm_luo_arm64_sys_reg sys_regs[KVM_LUO_ARM64_MAX_SYS_REGS];
+	u8 sve_state[KVM_LUO_ARM64_SVE_MAX_BYTES];
+	u64 vsesr_el2;
+	u64 mdcr_el2;
+	struct kvm_guest_debug_arch vcpu_debug_state;
+	struct kvm_guest_debug_arch external_debug_state;
+	u64 steal_base;
+	u32 vgic_hcr;
+	u32 vgic_vmcr;
+	u32 vgic_sre;
+	u32 vgic_used_lrs;
+	u32 vgic_ap0r[4];
+	u32 vgic_ap1r[4];
+	u64 vgic_lr[16];
+	u64 vgic_pendbaser;
+	u8 vgic_lpis_enabled;
+	u8 vgic_num_pri_bits;
+	u8 vgic_num_id_bits;
+	u8 sflags_serror;
+	u16 hcr_irq_flags;
+	u8 has_ccsidr;
+	u8 sflags_host_ss;
+	u64 vgic_rd_base;
+	u32 guest_debug;
+	u32 reserved1;
+	u32 ccsidr[KVM_LUO_ARM64_CSSELR_MAX];
+	struct kvm_luo_vgic_irq_state private_irqs[32];
+};
+
+static_assert(sizeof(struct kvm_luo_vcpu_arm64_state) == 19936);
 
 #endif /* CONFIG_ARM64 */
 

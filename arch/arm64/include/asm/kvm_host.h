@@ -957,6 +957,9 @@ struct kvm_vcpu_arch {
 
 	/* Realm meta data */
 	struct realm_rec rec;
+
+	/* True while kvm_arch_luo_vcpu_retrieve() is restoring vCPU state */
+	bool luo_retrieving;
 };
 
 /*
@@ -1518,6 +1521,8 @@ struct kvm *kvm_arch_alloc_vm(void);
 
 #define kvm_arch_has_private_mem(kvm) ((kvm)->arch.is_realm)
 
+int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
+				  struct kvm_vcpu_init *init);
 int kvm_arm_vcpu_finalize(struct kvm_vcpu *vcpu, int feature);
 bool kvm_arm_vcpu_is_finalized(struct kvm_vcpu *vcpu);
 
@@ -1555,6 +1560,7 @@ static inline void kvm_hyp_reserve(void) { }
 
 void kvm_arm_vcpu_power_off(struct kvm_vcpu *vcpu);
 bool kvm_arm_vcpu_stopped(struct kvm_vcpu *vcpu);
+void kvm_destroy_mpidr_data(struct kvm *kvm);
 
 static inline u64 *__vm_id_reg(struct kvm_arch *ka, u32 reg)
 {

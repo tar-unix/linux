@@ -374,7 +374,7 @@ void kvm_arch_create_vm_debugfs(struct kvm *kvm)
 	kvm_s2_ptdump_create_debugfs(kvm);
 }
 
-static void kvm_destroy_mpidr_data(struct kvm *kvm)
+void kvm_destroy_mpidr_data(struct kvm *kvm)
 {
 	struct kvm_mpidr_data *data;
 
@@ -976,11 +976,17 @@ static void kvm_init_mpidr_data(struct kvm *kvm)
 	mutex_lock(&kvm->arch.config_lock);
 
 	if (rcu_access_pointer(kvm->arch.mpidr_data) ||
+	    kvm->created_vcpus != atomic_read(&kvm->online_vcpus) ||
 	    atomic_read(&kvm->online_vcpus) == 1)
 		goto out;
 
 	kvm_for_each_vcpu(c, vcpu, kvm) {
-		u64 aff = kvm_vcpu_get_mpidr_aff(vcpu);
+		u64 aff;
+
+		if (!kvm_vcpu_initialized(vcpu) ||
+		    READ_ONCE(vcpu->arch.luo_retrieving))
+			goto out;
+		aff = kvm_vcpu_get_mpidr_aff(vcpu);
 		aff_set |= aff;
 		aff_clr &= aff;
 	}
@@ -1857,8 +1863,8 @@ static int kvm_vcpu_set_target(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
-					 struct kvm_vcpu_init *init)
+int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
+				  struct kvm_vcpu_init *init)
 {
 	bool power_off = false;
 	int ret;

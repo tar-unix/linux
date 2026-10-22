@@ -766,6 +766,18 @@ unsigned int vgic_v3_init_dist_iodev(struct vgic_io_device *dev)
 	return SZ_64K;
 }
 
+static bool vgic_v3_rdist_slot_in_use(struct kvm *kvm, gpa_t rd_base)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long c;
+
+	kvm_for_each_vcpu(c, vcpu, kvm) {
+		if (vcpu->arch.vgic_cpu.rd_iodev.base_addr == rd_base)
+			return true;
+	}
+	return false;
+}
+
 /**
  * vgic_register_redist_iodev - register a single redist iodev
  * @vcpu:    The VCPU to which the redistributor belongs
@@ -797,7 +809,12 @@ int vgic_register_redist_iodev(struct kvm_vcpu *vcpu)
 	 * function for all VCPUs when the base address is set.  Just return
 	 * without doing any work for now.
 	 */
-	rdreg = vgic_v3_rdist_free_slot(&vgic->rd_regions);
+	while ((rdreg = vgic_v3_rdist_free_slot(&vgic->rd_regions))) {
+		rd_base = rdreg->base + rdreg->free_index * KVM_VGIC_V3_REDIST_SIZE;
+		if (!vgic_v3_rdist_slot_in_use(kvm, rd_base))
+			break;
+		rdreg->free_index++;
+	}
 	if (!rdreg)
 		goto out_unlock;
 
@@ -808,8 +825,6 @@ int vgic_register_redist_iodev(struct kvm_vcpu *vcpu)
 
 	vgic_cpu->rdreg = rdreg;
 	vgic_cpu->rdreg_index = rdreg->free_index;
-
-	rd_base = rdreg->base + rdreg->free_index * KVM_VGIC_V3_REDIST_SIZE;
 
 	kvm_iodevice_init(&rd_dev->dev, &kvm_io_gic_ops);
 	rd_dev->base_addr = rd_base;
@@ -822,16 +837,114 @@ int vgic_register_redist_iodev(struct kvm_vcpu *vcpu)
 
 	ret = kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, rd_base,
 				      2 * SZ_64K, &rd_dev->dev);
-	if (ret)
+	if (ret) {
+		mutex_lock(&kvm->arch.config_lock);
+		rd_dev->base_addr = VGIC_ADDR_UNDEF;
+		vgic_cpu->rdreg = NULL;
+		mutex_unlock(&kvm->arch.config_lock);
 		return ret;
+	}
 
 	/* Protected by slots_lock */
+	mutex_lock(&kvm->arch.config_lock);
 	rdreg->free_index++;
+	while (!vgic_v3_redist_region_full(rdreg) &&
+	       vgic_v3_rdist_slot_in_use(kvm, rdreg->base +
+					 (gpa_t)rdreg->free_index *
+					 KVM_VGIC_V3_REDIST_SIZE))
+		rdreg->free_index++;
+	mutex_unlock(&kvm->arch.config_lock);
 	return 0;
 
 out_unlock:
 	mutex_unlock(&kvm->arch.config_lock);
 	return ret;
+}
+
+int vgic_register_redist_iodev_at(struct kvm_vcpu *vcpu, gpa_t rd_base)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct vgic_dist *vgic = &kvm->arch.vgic;
+	struct vgic_cpu *vgic_cpu = &vcpu->arch.vgic_cpu;
+	struct vgic_io_device *rd_dev = &vcpu->arch.vgic_cpu.rd_iodev;
+	struct vgic_redist_region *rdreg = NULL, *iter;
+	u32 rdreg_index = 0;
+	int ret;
+
+	if (IS_VGIC_ADDR_UNDEF(rd_base))
+		return 0;
+
+	lockdep_assert_held(&kvm->slots_lock);
+	mutex_lock(&kvm->arch.config_lock);
+
+	if (!IS_VGIC_ADDR_UNDEF(vgic_cpu->rd_iodev.base_addr)) {
+		ret = (vgic_cpu->rd_iodev.base_addr == rd_base) ? 0 : -EINVAL;
+		mutex_unlock(&kvm->arch.config_lock);
+		return ret;
+	}
+
+	list_for_each_entry(iter, &vgic->rd_regions, list) {
+		u64 offset;
+
+		if (rd_base < iter->base)
+			continue;
+		offset = rd_base - iter->base;
+		if (offset % KVM_VGIC_V3_REDIST_SIZE)
+			continue;
+		if (offset / KVM_VGIC_V3_REDIST_SIZE >= KVM_MAX_VCPUS)
+			continue;
+		rdreg_index = offset / KVM_VGIC_V3_REDIST_SIZE;
+		if (iter->count && rdreg_index >= iter->count)
+			continue;
+		rdreg = iter;
+		break;
+	}
+
+	if (!rdreg || vgic_v3_rdist_slot_in_use(kvm, rd_base) ||
+	    vgic_check_iorange(kvm, VGIC_ADDR_UNDEF, rd_base,
+			       SZ_64K, KVM_VGIC_V3_REDIST_SIZE) ||
+	    (!IS_VGIC_ADDR_UNDEF(vgic->vgic_dist_base) &&
+	     vgic_dist_overlap(kvm, rd_base, KVM_VGIC_V3_REDIST_SIZE)) ||
+	    !vgic_v3_check_base(kvm)) {
+		mutex_unlock(&kvm->arch.config_lock);
+		return -EINVAL;
+	}
+
+	vgic_cpu->rdreg = rdreg;
+	vgic_cpu->rdreg_index = rdreg_index;
+
+	kvm_iodevice_init(&rd_dev->dev, &kvm_io_gic_ops);
+	rd_dev->base_addr = rd_base;
+	rd_dev->iodev_type = IODEV_REDIST;
+	rd_dev->regions = vgic_v3_rd_registers;
+	rd_dev->nr_regions = ARRAY_SIZE(vgic_v3_rd_registers);
+	rd_dev->redist_vcpu = vcpu;
+
+	mutex_unlock(&kvm->arch.config_lock);
+
+	ret = kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, rd_base,
+				      2 * SZ_64K, &rd_dev->dev);
+	if (ret) {
+		mutex_lock(&kvm->arch.config_lock);
+		rd_dev->base_addr = VGIC_ADDR_UNDEF;
+		vgic_cpu->rdreg = NULL;
+		mutex_unlock(&kvm->arch.config_lock);
+		return ret;
+	}
+
+	/*
+	 * Advance free_index only across contiguously claimed slots so that
+	 * slots below a vCPU retrieved out of order stay allocatable, and so
+	 * vgic_mmio_vcpu_rdist_is_last() sees the final layout once every
+	 * vCPU has been retrieved. free_index is protected by slots_lock.
+	 */
+	mutex_lock(&kvm->arch.config_lock);
+	while (!vgic_v3_redist_region_full(rdreg) &&
+	       vgic_v3_rdist_slot_in_use(kvm, rdreg->base + rdreg->free_index *
+					      KVM_VGIC_V3_REDIST_SIZE))
+		rdreg->free_index++;
+	mutex_unlock(&kvm->arch.config_lock);
+	return 0;
 }
 
 void vgic_unregister_redist_iodev(struct kvm_vcpu *vcpu)

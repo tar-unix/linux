@@ -13,6 +13,7 @@
 #include <linux/bsearch.h>
 #include <linux/cacheinfo.h>
 #include <linux/debugfs.h>
+#include <linux/kho/abi/kvm.h>
 #include <linux/kvm_host.h>
 #include <linux/mm.h>
 #include <linux/printk.h>
@@ -5990,3 +5991,45 @@ int __init kvm_sys_reg_table_init(void)
 
 	return ret;
 }
+
+#ifdef CONFIG_LIVEUPDATE
+u32 kvm_arm_luo_save_sys_regs(struct kvm_vcpu *vcpu,
+			      struct kvm_luo_arm64_sys_reg *out, u32 max)
+{
+	u32 i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(sys_reg_descs); i++) {
+		const struct sys_reg_desc *r = &sys_reg_descs[i];
+
+		if (!r->reg || r->reg >= NR_SYS_REGS)
+			continue;
+		if (n && out[n - 1].id == sys_reg_to_index(r))
+			continue;
+		if (WARN_ON_ONCE(n >= max))
+			break;
+		out[n].id = sys_reg_to_index(r);
+		out[n].val = __vcpu_sys_reg(vcpu, r->reg);
+		n++;
+	}
+
+	return n;
+}
+
+int kvm_arm_luo_restore_sys_regs(struct kvm_vcpu *vcpu,
+				 const struct kvm_luo_arm64_sys_reg *in, u32 nr)
+{
+	u32 i;
+
+	for (i = 0; i < nr; i++) {
+		const struct sys_reg_desc *r;
+
+		r = get_reg_by_id(in[i].id, sys_reg_descs,
+				  ARRAY_SIZE(sys_reg_descs));
+		if (!r || !r->reg || r->reg >= NR_SYS_REGS)
+			return -EINVAL;
+		__vcpu_assign_sys_reg(vcpu, r->reg, in[i].val);
+	}
+
+	return 0;
+}
+#endif

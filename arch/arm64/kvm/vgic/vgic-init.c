@@ -657,6 +657,19 @@ int kvm_vgic_map_resources(struct kvm *kvm)
 		goto out;
 	}
 
+	if (dist->from_liveupdate) {
+		struct kvm_vcpu *vcpu;
+		unsigned long c;
+
+		kvm_for_each_vcpu(c, vcpu, kvm) {
+			if (!kvm_vcpu_initialized(vcpu) ||
+			    READ_ONCE(vcpu->arch.luo_retrieving)) {
+				ret = -EBUSY;
+				goto out;
+			}
+		}
+	}
+
 	if (dist->from_liveupdate &&
 	    dist->vgic_model == KVM_DEV_TYPE_ARM_VGIC_V3) {
 		struct kvm_vcpu *vcpu;
@@ -676,6 +689,13 @@ int kvm_vgic_map_resources(struct kvm *kvm)
 		if (kvm->created_vcpus != atomic_read(&kvm->online_vcpus)) {
 			ret = -EBUSY;
 			goto out;
+		}
+		kvm_for_each_vcpu(c, vcpu, kvm) {
+			if (!kvm_vcpu_initialized(vcpu) ||
+			    READ_ONCE(vcpu->arch.luo_retrieving)) {
+				ret = -EBUSY;
+				goto out;
+			}
 		}
 	}
 
