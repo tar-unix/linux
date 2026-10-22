@@ -249,7 +249,75 @@ static_assert(sizeof(struct kvm_vcpu_luo_state) == 144);
 /* The name of the live update file handler for KVM vCPU files. */
 #define KVM_VCPU_LUO_FH_NAME	"kvm-vcpu"
 
+/* Global CoCo FLB handler names. */
+#define TDX_HOST_LUO_FLB_NAME	"tdx-host"
+
 #ifdef CONFIG_X86
+
+#define TDX_LUO_MAX_TDMRS		64
+#define TDX_LUO_MAX_LP_CPUS		8192
+#define TDX_LUO_LP_BITMAP_U64S		(TDX_LUO_MAX_LP_CPUS / 64)
+#define TDX_LUO_MAX_HKIDS		2048
+#define TDX_LUO_HKID_BITMAP_U64S	(TDX_LUO_MAX_HKIDS / 64)
+
+#define TDX_LUO_FLB_MAGIC		0x5444584cU
+#define TDX_LUO_FLB_F_ACTIVE_TDS	BIT(0)
+
+/**
+ * struct tdx_luo_tdmr_pamt - Preserved PAMT physical ranges for one TDMR.
+ * @base:         Physical base address of the TDMR.
+ * @size:         Size of the TDMR in bytes.
+ * @pamt_1g_base: Physical base address of the 1G PAMT table.
+ * @pamt_1g_size: Size of the 1G PAMT table in bytes.
+ * @pamt_2m_base: Physical base address of the 2M PAMT table.
+ * @pamt_2m_size: Size of the 2M PAMT table in bytes.
+ * @pamt_4k_base: Physical base address of the 4K PAMT table.
+ * @pamt_4k_size: Size of the 4K PAMT table in bytes.
+ */
+struct tdx_luo_tdmr_pamt {
+	u64 base;
+	u64 size;
+	u64 pamt_1g_base;
+	u64 pamt_1g_size;
+	u64 pamt_2m_base;
+	u64 pamt_2m_size;
+	u64 pamt_4k_base;
+	u64 pamt_4k_size;
+};
+
+static_assert(sizeof(struct tdx_luo_tdmr_pamt) == 64);
+
+/**
+ * struct tdx_luo_flb_state - Preserved global state for "tdx-host" FLB.
+ * @magic:           Magic value (%TDX_LUO_FLB_MAGIC).
+ * @flags:           %TDX_LUO_FLB_F_* flags.
+ * @global_keyid:    Preserved TDX global HKID.
+ * @nr_tdmrs:        Number of consumed TDMR entries.
+ * @tdmr_list_pa:    Physical address of the preserved tdmr_list pages.
+ * @tdmr_list_order: Page allocation order of @tdmr_list_pa.
+ * @tdmr_sz:         Size in bytes of one TDMR info entry.
+ * @max_tdmrs:       Maximum number of TDMR entries allocated.
+ * @reserved0:       Reserved for alignment, must be zero.
+ * @lp_init_bitmap:  Bitmap of logical processors initialized via TDH.SYS.LP.INIT.
+ * @active_hkids:    Bitmap of preserved active TDX guest HKIDs.
+ * @pamts:           Preserved PAMT physical ranges for each TDMR.
+ */
+struct tdx_luo_flb_state {
+	u32 magic;
+	u32 flags;
+	u32 global_keyid;
+	u32 nr_tdmrs;
+	u64 tdmr_list_pa;
+	u32 tdmr_list_order;
+	u32 tdmr_sz;
+	u32 max_tdmrs;
+	u32 reserved0;
+	u64 lp_init_bitmap[TDX_LUO_LP_BITMAP_U64S];
+	u64 active_hkids[TDX_LUO_HKID_BITMAP_U64S];
+	struct tdx_luo_tdmr_pamt pamts[TDX_LUO_MAX_TDMRS];
+};
+
+static_assert(sizeof(struct tdx_luo_flb_state) == 5416);
 
 #define KVM_LUO_X86_MAX_CPUID_ENTRIES	256
 #define KVM_LUO_X86_MAX_MSR_ENTRIES	512

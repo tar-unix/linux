@@ -9,6 +9,7 @@
 #define pr_fmt(fmt)	"virt/tdx: " fmt
 
 #include <linux/types.h>
+#include <linux/bitmap.h>
 #include <linux/cache.h>
 #include <linux/init.h>
 #include <linux/errno.h>
@@ -27,6 +28,9 @@
 #include <linux/sort.h>
 #include <linux/log2.h>
 #include <linux/acpi.h>
+#include <linux/kexec_handover.h>
+#include <linux/kho/abi/kvm.h>
+#include <linux/liveupdate.h>
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
 #include <linux/idr.h>
@@ -56,10 +60,42 @@ static struct tdx_module_state tdx_module_state;
 static u32 tdx_global_keyid __ro_after_init;
 static u32 tdx_guest_keyid_start __ro_after_init;
 static u32 tdx_nr_guest_keyids __ro_after_init;
-
-static DEFINE_IDA(tdx_guest_keyid_pool);
+static bool tdx_luo_adopted;
 
 static DEFINE_PER_CPU(bool, tdx_lp_initialized);
+
+#ifdef CONFIG_LIVEUPDATE
+static struct tdx_luo_flb_state *tdx_luo_outgoing_state;
+static struct tdx_luo_flb_state *tdx_luo_incoming_state;
+static DECLARE_BITMAP(tdx_luo_lp_init_mask, TDX_LUO_MAX_LP_CPUS);
+
+static bool tdx_luo_cpu_can_adopt(unsigned int cpu)
+{
+	return tdx_luo_adopted && cpu < TDX_LUO_MAX_LP_CPUS &&
+	       test_bit(cpu, tdx_luo_lp_init_mask);
+}
+
+static void tdx_luo_sync_lp_bitmap(struct tdx_luo_flb_state *s)
+{
+	int cpu;
+
+	memset(s->lp_init_bitmap, 0, sizeof(s->lp_init_bitmap));
+	for_each_possible_cpu(cpu) {
+		if (cpu >= TDX_LUO_MAX_LP_CPUS)
+			break;
+		if (per_cpu(tdx_lp_initialized, cpu) ||
+		    test_bit(cpu, tdx_luo_lp_init_mask))
+			s->lp_init_bitmap[cpu / 64] |= BIT_ULL(cpu % 64);
+	}
+}
+#else
+static inline bool tdx_luo_cpu_can_adopt(unsigned int cpu)
+{
+	return false;
+}
+#endif
+
+static DEFINE_IDA(tdx_guest_keyid_pool);
 
 static struct tdmr_info_list tdx_tdmr_list;
 
@@ -129,9 +165,21 @@ int tdx_cpu_enable(void)
 	if (ret)
 		return ret;
 
-	ret = seamcall_prerr(TDH_SYS_LP_INIT, &args);
-	if (ret)
-		return ret;
+	if (tdx_luo_cpu_can_adopt(smp_processor_id())) {
+		u64 sret = seamcall(TDH_SYS_LP_INIT, &args);
+		u64 status = sret & TDX_SEAMCALL_STATUS_MASK;
+
+		if (sret &&
+		    status != TDX_SYS_LP_INIT_NOT_PENDING &&
+		    status != TDX_SYS_LP_INIT_DONE) {
+			seamcall_err(TDH_SYS_LP_INIT, sret, &args);
+			return -EFAULT;
+		}
+	} else {
+		ret = seamcall_prerr(TDH_SYS_LP_INIT, &args);
+		if (ret)
+			return ret;
+	}
 
 	__this_cpu_write(tdx_lp_initialized, true);
 
@@ -227,6 +275,17 @@ static void tdx_shutdown_cpu(void *ign)
 
 static void tdx_shutdown(void *ign)
 {
+#ifdef CONFIG_LIVEUPDATE
+	if (liveupdate_coco_is_preserving() &&
+	    tdx_luo_outgoing_state &&
+	    (tdx_luo_outgoing_state->flags & TDX_LUO_FLB_F_ACTIVE_TDS)) {
+		tdx_luo_sync_lp_bitmap(tdx_luo_outgoing_state);
+		on_each_cpu(tdx_shutdown_cpu, NULL, 1);
+		return;
+	}
+	if (tdx_luo_outgoing_state)
+		tdx_luo_outgoing_state->flags &= ~TDX_LUO_FLB_F_ACTIVE_TDS;
+#endif
 	tdx_sys_disable();
 	on_each_cpu(tdx_shutdown_cpu, NULL, 1);
 }
@@ -1142,6 +1201,386 @@ static __init int init_tdmrs(struct tdmr_info_list *tdmr_list)
 	return 0;
 }
 
+#ifdef CONFIG_LIVEUPDATE
+static void tdx_luo_unpreserve_pamt_entry(const struct tdx_luo_tdmr_pamt *p)
+{
+	if (p->pamt_4k_size)
+		kho_unpreserve_pages(pfn_to_page(p->pamt_4k_base >> PAGE_SHIFT),
+				     p->pamt_4k_size >> PAGE_SHIFT);
+	if (p->pamt_2m_size)
+		kho_unpreserve_pages(pfn_to_page(p->pamt_2m_base >> PAGE_SHIFT),
+				     p->pamt_2m_size >> PAGE_SHIFT);
+	if (p->pamt_1g_size)
+		kho_unpreserve_pages(pfn_to_page(p->pamt_1g_base >> PAGE_SHIFT),
+				     p->pamt_1g_size >> PAGE_SHIFT);
+}
+
+static int tdx_luo_flb_preserve(struct liveupdate_flb_op_args *args)
+{
+	struct tdx_luo_flb_state *s;
+	unsigned long nr_tdmr_pages;
+	int i, order, ret;
+
+	if (!tdx_module_state.initialized)
+		return -ENODEV;
+
+	if (tdx_tdmr_list.nr_consumed_tdmrs > TDX_LUO_MAX_TDMRS)
+		return -E2BIG;
+
+	s = kho_alloc_preserve(sizeof(*s));
+	if (IS_ERR(s))
+		return PTR_ERR(s);
+
+	s->magic = TDX_LUO_FLB_MAGIC;
+	s->flags = TDX_LUO_FLB_F_ACTIVE_TDS;
+	s->global_keyid = tdx_global_keyid;
+	s->nr_tdmrs = tdx_tdmr_list.nr_consumed_tdmrs;
+	s->tdmr_sz = tdx_tdmr_list.tdmr_sz;
+	s->max_tdmrs = tdx_tdmr_list.max_tdmrs;
+
+	order = get_order(tdx_tdmr_list.max_tdmrs * tdx_tdmr_list.tdmr_sz);
+	nr_tdmr_pages = PAGE_ALIGN(tdx_tdmr_list.max_tdmrs *
+				   tdx_tdmr_list.tdmr_sz) >> PAGE_SHIFT;
+	s->tdmr_list_pa = __pa(tdx_tdmr_list.tdmrs);
+	s->tdmr_list_order = order;
+
+	ret = kho_preserve_pages(virt_to_page(tdx_tdmr_list.tdmrs), nr_tdmr_pages);
+	if (ret)
+		goto err_free_state;
+
+	for (i = 0; i < tdx_tdmr_list.nr_consumed_tdmrs; i++) {
+		struct tdmr_info *tdmr = tdmr_entry(&tdx_tdmr_list, i);
+		struct tdx_luo_tdmr_pamt *p = &s->pamts[i];
+
+		p->base = tdmr->base;
+		p->size = tdmr->size;
+		p->pamt_1g_base = tdmr->pamt_1g_base;
+		p->pamt_1g_size = tdmr->pamt_1g_size;
+		p->pamt_2m_base = tdmr->pamt_2m_base;
+		p->pamt_2m_size = tdmr->pamt_2m_size;
+		p->pamt_4k_base = tdmr->pamt_4k_base;
+		p->pamt_4k_size = tdmr->pamt_4k_size;
+
+		ret = kho_preserve_pages(pfn_to_page(p->pamt_1g_base >> PAGE_SHIFT),
+					 p->pamt_1g_size >> PAGE_SHIFT);
+		if (ret)
+			goto err_unpreserve_pamts;
+
+		ret = kho_preserve_pages(pfn_to_page(p->pamt_2m_base >> PAGE_SHIFT),
+					 p->pamt_2m_size >> PAGE_SHIFT);
+		if (ret) {
+			kho_unpreserve_pages(pfn_to_page(p->pamt_1g_base >> PAGE_SHIFT),
+					     p->pamt_1g_size >> PAGE_SHIFT);
+			goto err_unpreserve_pamts;
+		}
+
+		ret = kho_preserve_pages(pfn_to_page(p->pamt_4k_base >> PAGE_SHIFT),
+					 p->pamt_4k_size >> PAGE_SHIFT);
+		if (ret) {
+			kho_unpreserve_pages(pfn_to_page(p->pamt_2m_base >> PAGE_SHIFT),
+					     p->pamt_2m_size >> PAGE_SHIFT);
+			kho_unpreserve_pages(pfn_to_page(p->pamt_1g_base >> PAGE_SHIFT),
+					     p->pamt_1g_size >> PAGE_SHIFT);
+			goto err_unpreserve_pamts;
+		}
+	}
+
+	tdx_luo_sync_lp_bitmap(s);
+	tdx_luo_outgoing_state = s;
+	args->data = __pa(s);
+	args->obj = s;
+	return 0;
+
+err_unpreserve_pamts:
+	while (--i >= 0)
+		tdx_luo_unpreserve_pamt_entry(&s->pamts[i]);
+	kho_unpreserve_pages(virt_to_page(tdx_tdmr_list.tdmrs), nr_tdmr_pages);
+err_free_state:
+	kho_unpreserve_free(s);
+	return ret;
+}
+
+static void tdx_luo_flb_unpreserve(struct liveupdate_flb_op_args *args)
+{
+	struct tdx_luo_flb_state *s = args->obj;
+	unsigned long nr_tdmr_pages;
+	u32 i;
+
+	if (!s)
+		return;
+
+	tdx_luo_outgoing_state = NULL;
+	for (i = 0; i < s->nr_tdmrs && i < TDX_LUO_MAX_TDMRS; i++)
+		tdx_luo_unpreserve_pamt_entry(&s->pamts[i]);
+
+	nr_tdmr_pages = PAGE_ALIGN(s->max_tdmrs * s->tdmr_sz) >> PAGE_SHIFT;
+	kho_unpreserve_pages(phys_to_page(s->tdmr_list_pa),
+			     nr_tdmr_pages);
+	kho_unpreserve_free(s);
+}
+
+static int tdx_luo_flb_retrieve(struct liveupdate_flb_op_args *args)
+{
+	struct tdx_luo_flb_state *s;
+
+	if (!args->data)
+		return -EINVAL;
+
+	s = phys_to_virt(args->data);
+	if (s->magic != TDX_LUO_FLB_MAGIC || s->nr_tdmrs > TDX_LUO_MAX_TDMRS)
+		return -EINVAL;
+
+	args->obj = s;
+	return 0;
+}
+
+static void tdx_luo_sys_disable_with_vmx(void)
+{
+	int err;
+
+	migrate_disable();
+	err = x86_virt_get_ref(X86_FEATURE_VMX);
+	if (!err) {
+		tdx_sys_disable();
+		x86_virt_put_ref(X86_FEATURE_VMX);
+	}
+	migrate_enable();
+}
+
+static void tdx_luo_free_unadopted_pamts(struct tdx_luo_flb_state *s)
+{
+	u32 i;
+
+	wbinvd_on_all_cpus();
+
+	for (i = 0; i < s->nr_tdmrs && i < TDX_LUO_MAX_TDMRS; i++) {
+		struct tdx_luo_tdmr_pamt *p = &s->pamts[i];
+
+		if (p->pamt_4k_size &&
+		    kho_restore_pages(p->pamt_4k_base,
+				      p->pamt_4k_size >> PAGE_SHIFT)) {
+			tdx_quirk_reset_paddr(p->pamt_4k_base,
+					      p->pamt_4k_size);
+			free_contig_range(p->pamt_4k_base >> PAGE_SHIFT,
+					  p->pamt_4k_size >> PAGE_SHIFT);
+			p->pamt_4k_size = 0;
+		}
+		if (p->pamt_2m_size &&
+		    kho_restore_pages(p->pamt_2m_base,
+				      p->pamt_2m_size >> PAGE_SHIFT)) {
+			tdx_quirk_reset_paddr(p->pamt_2m_base,
+					      p->pamt_2m_size);
+			free_contig_range(p->pamt_2m_base >> PAGE_SHIFT,
+					  p->pamt_2m_size >> PAGE_SHIFT);
+			p->pamt_2m_size = 0;
+		}
+		if (p->pamt_1g_size &&
+		    kho_restore_pages(p->pamt_1g_base,
+				      p->pamt_1g_size >> PAGE_SHIFT)) {
+			tdx_quirk_reset_paddr(p->pamt_1g_base,
+					      p->pamt_1g_size);
+			free_contig_range(p->pamt_1g_base >> PAGE_SHIFT,
+					  p->pamt_1g_size >> PAGE_SHIFT);
+			p->pamt_1g_size = 0;
+		}
+	}
+	s->nr_tdmrs = 0;
+
+	if (s->tdmr_list_pa) {
+		size_t sz = s->max_tdmrs * s->tdmr_sz;
+		struct page *p = kho_restore_pages(s->tdmr_list_pa,
+						   PAGE_ALIGN(sz) >> PAGE_SHIFT);
+		if (p)
+			free_pages_exact(page_address(p), sz);
+		s->tdmr_list_pa = 0;
+	}
+}
+
+static void tdx_luo_flb_finish(struct liveupdate_flb_op_args *args)
+{
+	struct tdx_luo_flb_state *s = args->obj;
+
+	if (!s)
+		return;
+
+	if (!tdx_luo_adopted) {
+		if (s->flags & TDX_LUO_FLB_F_ACTIVE_TDS)
+			tdx_luo_sys_disable_with_vmx();
+		tdx_luo_free_unadopted_pamts(s);
+	}
+
+	kho_restore_free(s);
+}
+
+static const struct liveupdate_flb_ops tdx_host_luo_flb_ops = {
+	.preserve = tdx_luo_flb_preserve,
+	.unpreserve = tdx_luo_flb_unpreserve,
+	.retrieve = tdx_luo_flb_retrieve,
+	.finish = tdx_luo_flb_finish,
+	.owner = THIS_MODULE,
+};
+
+struct liveupdate_flb tdx_host_luo_flb = {
+	.ops = &tdx_host_luo_flb_ops,
+	.name = TDX_HOST_LUO_FLB_NAME,
+};
+EXPORT_SYMBOL_GPL(tdx_host_luo_flb);
+
+static void __init check_tdx_pw_mce_erratum(void);
+
+static __init void tdx_luo_check_incoming(void)
+{
+	struct tdx_luo_flb_state *s = NULL;
+	int ret;
+
+	if (!liveupdate_enabled())
+		return;
+
+	ret = liveupdate_flb_get_incoming(&tdx_host_luo_flb, (void **)&s);
+	if (ret || !s)
+		return;
+
+	/*
+	 * tdx_init() may have bailed out before check_tdx_erratum(), but the
+	 * preserved PAMTs are TDX private memory and must still be reset by
+	 * tdx_quirk_reset_paddr() before they are freed.
+	 */
+	check_tdx_pw_mce_erratum();
+	tdx_luo_incoming_state = s;
+	if (s->flags & TDX_LUO_FLB_F_ACTIVE_TDS) {
+		bitmap_from_arr64(tdx_luo_lp_init_mask, s->lp_init_bitmap,
+				  TDX_LUO_MAX_LP_CPUS);
+		tdx_luo_adopted = true;
+		tdx_global_keyid = s->global_keyid;
+		tdx_module_state.sysinit_done = true;
+		tdx_module_state.sysinit_ret = 0;
+	} else {
+		tdx_luo_free_unadopted_pamts(s);
+	}
+}
+
+static __init void tdx_luo_abort_incoming(void)
+{
+	if (!tdx_luo_adopted)
+		return;
+
+	tdx_luo_sys_disable_with_vmx();
+	tdx_luo_adopted = false;
+	bitmap_zero(tdx_luo_lp_init_mask, TDX_LUO_MAX_LP_CPUS);
+	tdx_module_state.sysinit_done = false;
+	if (tdx_luo_incoming_state) {
+		tdx_luo_incoming_state->flags &= ~TDX_LUO_FLB_F_ACTIVE_TDS;
+		tdx_luo_free_unadopted_pamts(tdx_luo_incoming_state);
+	}
+}
+
+static __init void tdx_luo_put_incoming(void)
+{
+	if (!tdx_luo_incoming_state)
+		return;
+
+	tdx_luo_incoming_state = NULL;
+	liveupdate_flb_put_incoming(&tdx_host_luo_flb);
+}
+
+static __init int adopt_tdx_module(void)
+{
+	struct tdx_luo_flb_state *s = tdx_luo_incoming_state;
+	unsigned long nr_tdmr_pages;
+	struct page *tdmrs_page;
+	unsigned int hkid;
+	u32 i;
+
+	if (!s || s->nr_tdmrs > TDX_LUO_MAX_TDMRS || !s->tdmr_sz || !s->max_tdmrs)
+		return -EINVAL;
+
+	nr_tdmr_pages = PAGE_ALIGN(s->max_tdmrs * s->tdmr_sz) >> PAGE_SHIFT;
+	tdmrs_page = kho_restore_pages(s->tdmr_list_pa, nr_tdmr_pages);
+	if (!tdmrs_page)
+		return -ENOMEM;
+	s->tdmr_list_pa = 0;
+
+	tdx_tdmr_list.tdmrs = page_address(tdmrs_page);
+	tdx_tdmr_list.nr_consumed_tdmrs = 0;
+	tdx_tdmr_list.tdmr_sz = s->tdmr_sz;
+	tdx_tdmr_list.max_tdmrs = s->max_tdmrs;
+
+	for (i = 0; i < s->nr_tdmrs; i++) {
+		struct tdmr_info *tdmr = tdmr_entry(&tdx_tdmr_list, i);
+		struct tdx_luo_tdmr_pamt *p = &s->pamts[i];
+
+		tdmr->base = p->base;
+		tdmr->size = p->size;
+		tdmr->pamt_4k_base = p->pamt_4k_base;
+		tdmr->pamt_4k_size = 0;
+		tdmr->pamt_2m_base = p->pamt_2m_base;
+		tdmr->pamt_2m_size = 0;
+		tdmr->pamt_1g_base = p->pamt_1g_base;
+		tdmr->pamt_1g_size = 0;
+
+		if (p->pamt_4k_size) {
+			if (!kho_restore_pages(p->pamt_4k_base,
+					       p->pamt_4k_size >> PAGE_SHIFT))
+				goto err_free_pamts;
+			tdmr->pamt_4k_size = p->pamt_4k_size;
+			p->pamt_4k_size = 0;
+		}
+
+		if (p->pamt_2m_size) {
+			if (!kho_restore_pages(p->pamt_2m_base,
+					       p->pamt_2m_size >> PAGE_SHIFT))
+				goto err_free_pamts;
+			tdmr->pamt_2m_size = p->pamt_2m_size;
+			p->pamt_2m_size = 0;
+		}
+
+		if (p->pamt_1g_size) {
+			if (!kho_restore_pages(p->pamt_1g_base,
+					       p->pamt_1g_size >> PAGE_SHIFT))
+				goto err_free_pamts;
+			tdmr->pamt_1g_size = p->pamt_1g_size;
+			p->pamt_1g_size = 0;
+		}
+	}
+
+	for_each_set_bit(hkid, (const unsigned long *)s->active_hkids,
+			 TDX_LUO_MAX_HKIDS) {
+		if (hkid < tdx_guest_keyid_start ||
+		    hkid >= tdx_guest_keyid_start + tdx_nr_guest_keyids ||
+		    ida_alloc_range(&tdx_guest_keyid_pool, hkid, hkid,
+				    GFP_KERNEL) < 0)
+			clear_bit(hkid, (unsigned long *)s->active_hkids);
+	}
+
+	/*
+	 * Ensure all TDMR/PAMT entries are visible before publishing
+	 * nr_consumed_tdmrs; pairs with smp_rmb() in is_pamt_page().
+	 */
+	smp_wmb();
+	WRITE_ONCE(tdx_tdmr_list.nr_consumed_tdmrs, s->nr_tdmrs);
+	s->flags &= ~TDX_LUO_FLB_F_ACTIVE_TDS;
+
+	pr_info("%lu KB adopted for PAMT via liveupdate\n",
+		tdmrs_count_pamt_kb(&tdx_tdmr_list));
+	return 0;
+
+err_free_pamts:
+	tdx_tdmr_list.nr_consumed_tdmrs = i + 1;
+	tdx_luo_abort_incoming();
+	wbinvd_on_all_cpus();
+	tdmrs_quirk_reset_pamt_all(&tdx_tdmr_list);
+	tdmrs_free_pamt_all(&tdx_tdmr_list);
+	free_tdmr_list(&tdx_tdmr_list);
+	memset(&tdx_tdmr_list, 0, sizeof(tdx_tdmr_list));
+	return -ENOMEM;
+}
+#else
+static inline void tdx_luo_check_incoming(void) { }
+static inline void tdx_luo_abort_incoming(void) { }
+static inline void tdx_luo_put_incoming(void) { }
+static inline int adopt_tdx_module(void) { return -EOPNOTSUPP; }
+#endif /* CONFIG_LIVEUPDATE */
+
 static __init int init_tdx_module(void)
 {
 	int ret;
@@ -1170,6 +1609,13 @@ static __init int init_tdx_module(void)
 	ret = build_tdx_memlist(&tdx_memlist);
 	if (ret)
 		goto out_put_tdxmem;
+
+	if (tdx_luo_adopted) {
+		ret = adopt_tdx_module();
+		if (ret)
+			goto err_free_tdxmem;
+		goto out_put_tdxmem;
+	}
 
 	/* Allocate enough space for constructing TDMRs */
 	ret = alloc_tdmr_list(&tdx_tdmr_list, &tdx_sysinfo.tdmr);
@@ -1228,32 +1674,43 @@ static __init int tdx_enable(void)
 	enum cpuhp_state state;
 	int ret;
 
+	tdx_luo_check_incoming();
+
 	if (!cpu_feature_enabled(X86_FEATURE_TDX_HOST_PLATFORM)) {
 		pr_err("TDX not supported by the host platform\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err_luo;
 	}
 
 	if (!cpu_feature_enabled(X86_FEATURE_XSAVE)) {
 		pr_err("XSAVE is required for TDX\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_luo;
 	}
 
 	if (!cpu_feature_enabled(X86_FEATURE_MOVDIR64B)) {
 		pr_err("MOVDIR64B is required for TDX\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_luo;
 	}
 
 	if (!cpu_feature_enabled(X86_FEATURE_SELFSNOOP)) {
 		pr_err("Self-snoop is required for TDX\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err_luo;
 	}
 
 	state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "virt/tdx:online",
 				  tdx_online_cpu, tdx_offline_cpu);
-	if (state < 0)
-		return state;
+	if (state < 0) {
+		ret = state;
+		goto err_luo;
+	}
 
 	ret = init_tdx_module();
+	if (ret)
+		tdx_luo_abort_incoming();
+	tdx_luo_put_incoming();
 	if (ret) {
 		pr_err("TDX-Module initialization failed (%d)\n", ret);
 		cpuhp_remove_state(state);
@@ -1265,6 +1722,11 @@ static __init int tdx_enable(void)
 	tdx_module_state.initialized = true;
 	pr_info("TDX-Module initialized\n");
 	return 0;
+
+err_luo:
+	tdx_luo_abort_incoming();
+	tdx_luo_put_incoming();
+	return ret;
 }
 subsys_initcall(tdx_enable);
 
@@ -1300,6 +1762,9 @@ int tdx_module_shutdown(void)
 	 * No locks needed as no concurrent accesses can occur here.
 	 */
 	memset(&tdx_module_state, 0, sizeof(tdx_module_state));
+#ifdef CONFIG_LIVEUPDATE
+	bitmap_zero(tdx_luo_lp_init_mask, TDX_LUO_MAX_LP_CPUS);
+#endif
 	for_each_possible_cpu(cpu)
 		per_cpu(tdx_lp_initialized, cpu) = false;
 
@@ -1503,10 +1968,8 @@ static struct notifier_block tdx_memory_nb = {
 	.notifier_call = tdx_memory_notifier,
 };
 
-static void __init check_tdx_erratum(void)
+static void __init check_tdx_pw_mce_erratum(void)
 {
-	u64 basic_msr;
-
 	/*
 	 * These CPUs have an erratum.  A partial write from non-TD
 	 * software (e.g. via MOVNTI variants or UC/WC mapping) to TDX
@@ -1518,6 +1981,13 @@ static void __init check_tdx_erratum(void)
 	case INTEL_EMERALDRAPIDS_X:
 		setup_force_cpu_bug(X86_BUG_TDX_PW_MCE);
 	}
+}
+
+static void __init check_tdx_erratum(void)
+{
+	u64 basic_msr;
+
+	check_tdx_pw_mce_erratum();
 
 	/*
 	 * Some TDX-capable CPUs have an erratum where the current VMCS is
@@ -1614,6 +2084,12 @@ void tdx_guest_keyid_free(unsigned int keyid)
 }
 EXPORT_SYMBOL_FOR_KVM(tdx_guest_keyid_free);
 
+bool tdx_luo_is_adopted(void)
+{
+	return tdx_luo_adopted;
+}
+EXPORT_SYMBOL_GPL(tdx_luo_is_adopted);
+
 static inline u64 tdx_tdr_pa(struct tdx_td *td)
 {
 	return page_to_phys(td->tdr_page);
@@ -1701,6 +2177,24 @@ u64 tdh_mem_sept_add(struct tdx_td *td, u64 gpa, enum pg_level level,
 	return ret;
 }
 EXPORT_SYMBOL_FOR_KVM(tdh_mem_sept_add);
+
+u64 tdh_mem_sept_rd(struct tdx_td *td, u64 gpa, enum pg_level level,
+		    u64 *entry, u64 *level_state)
+{
+	struct tdx_module_args args = {
+		.rcx = gpa | pg_level_to_tdx_sept_level(level),
+		.rdx = tdx_tdr_pa(td),
+	};
+	u64 ret;
+
+	ret = seamcall_ret(TDH_MEM_SEPT_RD, &args);
+
+	*entry = args.rcx;
+	*level_state = args.rdx;
+
+	return ret;
+}
+EXPORT_SYMBOL_FOR_KVM(tdh_mem_sept_rd);
 
 u64 tdh_vp_addcx(struct tdx_vp *vp, struct page *tdcx_page)
 {

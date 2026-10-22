@@ -121,6 +121,12 @@ static inline bool tdx_supports_runtime_update(const struct tdx_sys_info *sysinf
 int tdx_guest_keyid_alloc(void);
 u32 tdx_get_nr_guest_keyids(void);
 void tdx_guest_keyid_free(unsigned int keyid);
+bool tdx_luo_is_adopted(void);
+
+#ifdef CONFIG_LIVEUPDATE
+struct liveupdate_flb;
+extern struct liveupdate_flb tdx_host_luo_flb;
+#endif
 
 void tdx_quirk_reset_paddr(unsigned long base, unsigned long size);
 
@@ -153,6 +159,7 @@ u64 tdh_mng_addcx(struct tdx_td *td, struct page *tdcs_page);
 u64 tdh_mem_page_add(struct tdx_td *td, u64 gpa, kvm_pfn_t pfn, struct page *source,
 		     u64 *ext_err1, u64 *ext_err2);
 u64 tdh_mem_sept_add(struct tdx_td *td, u64 gpa, enum pg_level level, struct page *page, u64 *ext_err1, u64 *ext_err2);
+u64 tdh_mem_sept_rd(struct tdx_td *td, u64 gpa, enum pg_level level, u64 *entry, u64 *level_state);
 u64 tdh_vp_addcx(struct tdx_vp *vp, struct page *tdcx_page);
 u64 tdh_mem_page_aug(struct tdx_td *td, u64 gpa, enum pg_level level, kvm_pfn_t pfn,
 		     u64 *ext_err1, u64 *ext_err2);
@@ -179,6 +186,7 @@ u64 tdh_phymem_page_wbinvd_hkid(u64 hkid, kvm_pfn_t pfn);
 #else
 static inline void tdx_init(void) { }
 static inline u32 tdx_get_nr_guest_keyids(void) { return 0; }
+static inline bool tdx_luo_is_adopted(void) { return false; }
 static inline const char *tdx_dump_mce_info(struct mce *m) { return NULL; }
 static inline const struct tdx_sys_info *tdx_get_sysinfo(void) { return NULL; }
 static inline void tdx_sys_disable(void) { }
