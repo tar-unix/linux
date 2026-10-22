@@ -10049,6 +10049,11 @@ int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type)
 			return -EOPNOTSUPP;
 		*type = KVM_X86_TDX_VM;
 		return KVM_VM_LUO_FEAT_TDX;
+	case KVM_X86_SNP_VM:
+		if (!kvm_x86_ops.vm_luo_preserve)
+			return -EOPNOTSUPP;
+		*type = KVM_X86_SNP_VM;
+		return KVM_VM_LUO_FEAT_SEV_SNP;
 	default:
 		return -EOPNOTSUPP;
 	}

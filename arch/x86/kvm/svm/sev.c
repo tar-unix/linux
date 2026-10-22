@@ -19,6 +19,9 @@
 #include <linux/misc_cgroup.h>
 #include <linux/processor.h>
 #include <linux/trace_events.h>
+#include <linux/kexec_handover.h>
+#include <linux/kho/abi/kvm.h>
+#include <linux/liveupdate.h>
 #include <uapi/linux/sev-guest.h>
 
 #include <asm/pkru.h>
@@ -327,7 +330,14 @@ static void sev_asid_free(struct kvm_sev_info *sev)
 
 	mutex_lock(&sev_bitmap_lock);
 
-	__set_bit(sev->asid, sev_reclaim_asid_bitmap);
+	/*
+	 * Keep @sev->asid reserved in sev_asid_bitmap for preserved or
+	 * retrieved SNP VMs: kvm-vm, kvm-vcpu, and guest_memfd are decoupled
+	 * LUO file handlers that may be torn down in any order, so RMP entries
+	 * tagged with @sev->asid may remain Assigned after VM destruction.
+	 */
+	if (!sev->luo_preserved && !sev->luo_retrieved)
+		__set_bit(sev->asid, sev_reclaim_asid_bitmap);
 
 	for_each_possible_cpu(cpu) {
 		sd = per_cpu_ptr(&svm_data, cpu);
@@ -453,25 +463,39 @@ static void sev_unbind_asid(struct kvm *kvm, unsigned int handle)
  *     details on Firmware-owned pages, along with "RMP and VMPL Access Checks"
  *     in the APM for details on the related RMP restrictions.
  */
+static int __snp_guest_req_alloc_locked(struct kvm_sev_info *sev)
+{
+	struct page *req_page;
+
+	if (sev->guest_req_buf && sev->guest_resp_buf)
+		return 0;
+
+	if (!sev->guest_req_buf) {
+		req_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+		if (!req_page)
+			return -ENOMEM;
+		sev->guest_req_buf = page_address(req_page);
+	}
+
+	if (!sev->guest_resp_buf) {
+		sev->guest_resp_buf =
+			snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+		if (!sev->guest_resp_buf) {
+			__free_page(virt_to_page(sev->guest_req_buf));
+			sev->guest_req_buf = NULL;
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
 static int snp_guest_req_init(struct kvm *kvm)
 {
 	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
-	struct page *req_page;
 
-	req_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
-	if (!req_page)
-		return -ENOMEM;
-
-	sev->guest_resp_buf = snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
-	if (!sev->guest_resp_buf) {
-		__free_page(req_page);
-		return -EIO;
-	}
-
-	sev->guest_req_buf = page_address(req_page);
 	mutex_init(&sev->guest_req_mutex);
-
-	return 0;
+	return __snp_guest_req_alloc_locked(sev);
 }
 
 static void snp_guest_req_cleanup(struct kvm *kvm)
@@ -660,6 +684,9 @@ static int __sev_issue_cmd(int fd, int id, void *data, int *error)
 static int sev_issue_cmd(struct kvm *kvm, int id, void *data, int *error)
 {
 	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
+
+	if (sev->luo_retrieved && sev->fd < 0)
+		return sev_do_cmd(id, data, error);
 
 	return __sev_issue_cmd(sev->fd, id, data, error);
 }
@@ -2446,7 +2473,8 @@ static int snp_launch_update(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	long npages, count;
 	void __user *src;
 
-	if (!sev_snp_guest(kvm) || !sev->snp_context)
+	if (!sev_snp_guest(kvm) || !sev->snp_context ||
+	    kvm->arch.pre_fault_allowed)
 		return -EINVAL;
 
 	if (copy_from_user(&params, u64_to_user_ptr(argp->data), sizeof(params)))
@@ -2587,7 +2615,7 @@ static int snp_launch_finish(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	if (!sev_snp_guest(kvm))
 		return -ENOTTY;
 
-	if (!sev->snp_context)
+	if (!sev->snp_context || kvm->arch.pre_fault_allowed)
 		return -EINVAL;
 
 	if (copy_from_user(&params, u64_to_user_ptr(argp->data), sizeof(params)))
@@ -2990,6 +3018,7 @@ void sev_vm_init(struct kvm *kvm)
 		kvm->arch.has_protected_page_tables = true;
 		kvm->arch.pre_fault_allowed = !kvm->arch.has_private_mem;
 		to_kvm_sev_info(kvm)->need_init = true;
+		to_kvm_sev_info(kvm)->fd = -1;
 		break;
 	default:
 		WARN_ONCE(1, "Unsupported VM type %u", kvm->arch.vm_type);
@@ -3057,7 +3086,7 @@ void sev_vm_destroy(struct kvm *kvm)
 		 * Decomission handles unbinding of the ASID. If it fails for
 		 * some unexpected reason, just leak the ASID.
 		 */
-		if (snp_decommission_context(kvm))
+		if (!sev->luo_preserved && snp_decommission_context(kvm))
 			return;
 	} else {
 		sev_unbind_asid(kvm, sev->handle);
@@ -4251,6 +4280,12 @@ static int snp_handle_guest_req(struct vcpu_svm *svm, gpa_t req_gpa, gpa_t resp_
 		return -EINVAL;
 
 	guard(mutex)(&sev->guest_req_mutex);
+	if (unlikely(READ_ONCE(kvm->arch.luo_frozen)))
+		return -EBUSY;
+
+	ret = __snp_guest_req_alloc_locked(sev);
+	if (ret)
+		return ret;
 
 	if (kvm_read_guest(kvm, req_gpa, sev->guest_req_buf, PAGE_SIZE)) {
 		svm_vmgexit_bad_input(svm, GHCB_ERR_INVALID_INPUT);
@@ -4912,6 +4947,10 @@ int sev_vcpu_create(struct kvm_vcpu *vcpu)
 	struct vcpu_svm *svm = to_svm(vcpu);
 	struct page *vmsa_page;
 
+	if (sev_snp_guest(vcpu->kvm) &&
+	    to_kvm_sev_info(vcpu->kvm)->luo_preserved)
+		return -EBUSY;
+
 	mutex_init(&svm->sev_es.snp_vmsa_mutex);
 
 	if (!is_sev_es_guest(vcpu))
@@ -5215,16 +5254,17 @@ int sev_gmem_make_private(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn, kvm_pfn_t n
 	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
 	kvm_pfn_t pfn_aligned;
 	gfn_t gfn_aligned;
-	int level, rc;
+	int level, rmp_level, rc;
 	bool assigned;
 
 	if (!sev_snp_guest(kvm))
 		return 0;
 
-	if (WARN_ON_ONCE(nr_pages != 1))
+	if (WARN_ON_ONCE(nr_pages != 1 &&
+			 nr_pages != KVM_PAGES_PER_HPAGE(PG_LEVEL_2M)))
 		return -EIO;
 
-	rc = snp_lookup_rmpentry(pfn, &assigned, &level);
+	rc = snp_lookup_rmpentry(pfn, &assigned, &rmp_level);
 	if (rc) {
 		pr_err_ratelimited("SEV: Failed to look up RMP entry: GFN %llx PFN %llx error %d\n",
 				   gfn, pfn, rc);
@@ -5232,10 +5272,17 @@ int sev_gmem_make_private(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn, kvm_pfn_t n
 	}
 
 	if (assigned) {
+		level = nr_pages >= KVM_PAGES_PER_HPAGE(PG_LEVEL_2M) ?
+			PG_LEVEL_2M : PG_LEVEL_4K;
+		if (rmp_level < level)
+			return -EINVAL;
 		pr_debug("%s: already assigned: gfn %llx pfn %llx nr_pages %llx level %d\n",
-			 __func__, gfn, pfn, nr_pages, level);
+			 __func__, gfn, pfn, nr_pages, rmp_level);
 		return 0;
 	}
+
+	if (unlikely(READ_ONCE(kvm->arch.luo_frozen)))
+		return -EBUSY;
 
 	if (is_large_rmp_possible(pfn, nr_pages)) {
 		level = PG_LEVEL_2M;
@@ -5468,3 +5515,347 @@ void sev_free_decrypted_vmsa(struct kvm_vcpu *vcpu, struct vmcb_save_area *vmsa)
 
 	free_page((unsigned long)vmsa);
 }
+
+#ifdef CONFIG_LIVEUPDATE
+#define KVM_SNP_VM_LUO_F_VALID		BIT(31)
+#define KVM_SNP_VM_LUO_F_CERTS_EN	BIT(16)
+#define KVM_SNP_VM_LUO_GHCB_VER_MASK	GENMASK(15, 0)
+#define KVM_SNP_VM_LUO_VMSA_FEAT_SHIFT	17
+#define KVM_SNP_VM_LUO_VMSA_FEAT_MASK	GENMASK(30, 17)
+
+static bool sev_snp_flb_registered;
+
+int sev_luo_init(void)
+{
+	const struct sev_snp_luo_flb_state *flb_st;
+	void *flb_obj;
+	int ret;
+
+	if (!sev_snp_enabled && !snp_luo_is_adopted())
+		return 0;
+
+	ret = kvm_luo_register_flb(&sev_snp_luo_flb);
+	if (ret)
+		return ret;
+
+	if (sev_asid_bitmap &&
+	    liveupdate_flb_get_incoming(&sev_snp_luo_flb, &flb_obj) == 0) {
+		flb_st = flb_obj;
+		if (flb_st && (flb_st->flags & SEV_SNP_LUO_FLB_F_ACTIVE_VMS)) {
+			unsigned int asid;
+
+			mutex_lock(&sev_bitmap_lock);
+			for_each_set_bit(asid,
+					 (const unsigned long *)flb_st->active_asids,
+					 SEV_SNP_LUO_MAX_ASIDS) {
+				if (asid >= 1 && asid < nr_asids)
+					__set_bit(asid, sev_asid_bitmap);
+			}
+			mutex_unlock(&sev_bitmap_lock);
+		}
+		liveupdate_flb_put_incoming(&sev_snp_luo_flb);
+	}
+
+	sev_snp_flb_registered = true;
+	return 0;
+}
+
+void sev_luo_exit(void)
+{
+	if (!sev_snp_flb_registered)
+		return;
+
+	kvm_luo_unregister_flb(&sev_snp_luo_flb);
+	sev_snp_flb_registered = false;
+}
+
+int sev_vm_luo_preserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *state)
+{
+	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
+	struct kvm_snp_vm_luo_state *s = &state->snp;
+	struct sev_snp_luo_flb_state *flb_st;
+	struct page *ctx_page;
+	void *flb_obj;
+	int ret;
+
+	if (kvm->arch.vm_type == KVM_X86_DEFAULT_VM ||
+	    kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM)
+		return 0;
+
+	if (!sev_snp_guest(kvm) || sev->need_init || !sev->snp_context ||
+	    !kvm->arch.pre_fault_allowed ||
+	    sev->asid >= SEV_SNP_LUO_MAX_ASIDS)
+		return -EOPNOTSUPP;
+
+	ret = liveupdate_flb_get_outgoing(&sev_snp_luo_flb, &flb_obj);
+	if (ret)
+		return ret;
+	flb_st = flb_obj;
+
+	ctx_page = virt_to_page(sev->snp_context);
+	ret = kho_preserve_pages(ctx_page, 1);
+	if (ret) {
+		liveupdate_flb_put_outgoing(&sev_snp_luo_flb);
+		return ret;
+	}
+
+	set_bit(sev->asid, (unsigned long *)flb_st->active_asids);
+	liveupdate_flb_put_outgoing(&sev_snp_luo_flb);
+
+	s->gctx_pfn = page_to_pfn(ctx_page);
+	s->asid = sev->asid;
+	s->ap_jump_table = sev->ap_jump_table;
+	s->policy = sev->policy;
+	s->flags = KVM_SNP_VM_LUO_F_VALID |
+		   (sev->ghcb_version & KVM_SNP_VM_LUO_GHCB_VER_MASK) |
+		   (sev->snp_certs_enabled ? KVM_SNP_VM_LUO_F_CERTS_EN : 0) |
+		   (((u32)sev->vmsa_features << KVM_SNP_VM_LUO_VMSA_FEAT_SHIFT) &
+		    KVM_SNP_VM_LUO_VMSA_FEAT_MASK);
+
+	sev->luo_preserved = true;
+	kvm->arch.luo_gmem_vm_id = (kvm->arch.luo_gmem_vm_id &
+				    KVM_X86_LUO_GMEM_TAG_MASK) |
+				   ((u64)KVM_VM_LUO_FEAT_SEV_SNP << 32) |
+				   (u32)sev->asid;
+	return 0;
+}
+
+int sev_vm_luo_freeze(struct kvm *kvm, struct kvm_luo_vm_x86_state *state)
+{
+	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
+	struct kvm_snp_vm_luo_state *s = &state->snp;
+
+	if (!sev_snp_guest(kvm))
+		return 0;
+
+	if (!sev->luo_preserved)
+		return -EINVAL;
+
+	WRITE_ONCE(kvm->arch.luo_frozen, true);
+	s->ap_jump_table = sev->ap_jump_table;
+	s->flags = KVM_SNP_VM_LUO_F_VALID |
+		   (sev->ghcb_version & KVM_SNP_VM_LUO_GHCB_VER_MASK) |
+		   (sev->snp_certs_enabled ? KVM_SNP_VM_LUO_F_CERTS_EN : 0) |
+		   (((u32)sev->vmsa_features << KVM_SNP_VM_LUO_VMSA_FEAT_SHIFT) &
+		    KVM_SNP_VM_LUO_VMSA_FEAT_MASK);
+
+	scoped_guard(mutex, &sev->guest_req_mutex)
+		snp_guest_req_cleanup(kvm);
+
+	wbinvd_on_all_cpus();
+
+	return 0;
+}
+
+void sev_vm_luo_unpreserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *state)
+{
+	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
+	void *flb_obj;
+
+	if (!sev_snp_guest(kvm) || !sev->luo_preserved)
+		return;
+
+	if (sev->asid < SEV_SNP_LUO_MAX_ASIDS &&
+	    liveupdate_flb_get_outgoing(&sev_snp_luo_flb, &flb_obj) == 0) {
+		struct sev_snp_luo_flb_state *flb_st = flb_obj;
+
+		clear_bit(sev->asid, (unsigned long *)flb_st->active_asids);
+		liveupdate_flb_put_outgoing(&sev_snp_luo_flb);
+	}
+
+	if (sev->snp_context)
+		kho_unpreserve_pages(virt_to_page(sev->snp_context), 1);
+
+	sev->luo_preserved = false;
+}
+
+int sev_vm_luo_retrieve(struct kvm *kvm,
+			struct kvm_luo_vm_x86_state *state)
+{
+	struct kvm_snp_vm_luo_state *s = &state->snp;
+	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
+	struct sev_snp_luo_flb_state *flb_st;
+	struct page *ctx_page;
+	u64 vmsa_features;
+	u64 gctx_pfn;
+	void *flb_obj;
+	int ret;
+
+	if (kvm->arch.vm_type == KVM_X86_DEFAULT_VM ||
+	    kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM) {
+		if (s->flags & KVM_SNP_VM_LUO_F_VALID)
+			return -EINVAL;
+		return 0;
+	}
+
+	if (kvm->arch.vm_type != KVM_X86_SNP_VM)
+		return -EOPNOTSUPP;
+
+	if (!sev->need_init || sev->active)
+		return -EINVAL;
+
+	if (!sev_snp_enabled || !snp_luo_is_adopted())
+		return -ENODEV;
+
+	if (!(s->flags & KVM_SNP_VM_LUO_F_VALID) || !s->gctx_pfn)
+		return -EINVAL;
+
+	vmsa_features = (s->flags & KVM_SNP_VM_LUO_VMSA_FEAT_MASK) >>
+			KVM_SNP_VM_LUO_VMSA_FEAT_SHIFT;
+	if (!(vmsa_features & SVM_SEV_FEAT_SNP_ACTIVE))
+		return -EINVAL;
+
+	if (s->asid < min_snp_asid || s->asid > max_snp_asid ||
+	    s->asid >= SEV_SNP_LUO_MAX_ASIDS)
+		return -EINVAL;
+
+	ret = liveupdate_flb_get_incoming(&sev_snp_luo_flb, &flb_obj);
+	if (ret)
+		return ret;
+	flb_st = flb_obj;
+	if (!flb_st || !(flb_st->flags & SEV_SNP_LUO_FLB_F_ACTIVE_VMS)) {
+		liveupdate_flb_put_incoming(&sev_snp_luo_flb);
+		return -ENODEV;
+	}
+
+	mutex_lock(&sev_bitmap_lock);
+	if (!__test_and_clear_bit(s->asid,
+				  (unsigned long *)flb_st->active_asids)) {
+		mutex_unlock(&sev_bitmap_lock);
+		liveupdate_flb_put_incoming(&sev_snp_luo_flb);
+		return -EBUSY;
+	}
+	__set_bit(s->asid, sev_asid_bitmap);
+	mutex_unlock(&sev_bitmap_lock);
+	liveupdate_flb_put_incoming(&sev_snp_luo_flb);
+
+	sev->active = true;
+	sev->es_active = true;
+	sev->misc_cg = get_current_misc_cg();
+	ret = sev_misc_cg_try_charge(sev);
+	if (ret) {
+		put_misc_cg(sev->misc_cg);
+		sev->misc_cg = NULL;
+		sev->active = false;
+		sev->es_active = false;
+		goto err_clear_asid;
+	}
+
+	ret = sev_alloc_have_run_cpus(sev);
+	if (ret)
+		goto err_uncharge;
+
+	ret = snp_guest_req_init(kvm);
+	if (ret)
+		goto err_free_cpus;
+
+	gctx_pfn = s->gctx_pfn;
+	s->gctx_pfn = 0;
+	ctx_page = kho_restore_pages(PFN_PHYS(gctx_pfn), 1);
+	if (!ctx_page) {
+		ret = -ENOMEM;
+		goto err_cleanup_req;
+	}
+
+	INIT_LIST_HEAD(&sev->regions_list);
+	INIT_LIST_HEAD(&sev->mirror_vms);
+	sev->snp_context = page_address(ctx_page);
+	sev->asid = s->asid;
+	sev->fd = -1;
+	sev->policy = s->policy;
+	sev->vmsa_features = vmsa_features;
+	sev->ap_jump_table = s->ap_jump_table;
+	sev->ghcb_version = s->flags & KVM_SNP_VM_LUO_GHCB_VER_MASK;
+	sev->snp_certs_enabled = !!(s->flags & KVM_SNP_VM_LUO_F_CERTS_EN);
+	sev->need_init = false;
+	sev->luo_retrieved = true;
+	kvm->arch.luo_gmem_vm_id = ((u64)KVM_VM_LUO_FEAT_SEV_SNP << 32) |
+				   (u32)sev->asid;
+	kvm->arch.pre_fault_allowed = true;
+	kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_SEV);
+
+	return 0;
+
+err_cleanup_req:
+	snp_guest_req_cleanup(kvm);
+err_free_cpus:
+	sev_free_have_run_cpus(sev);
+err_uncharge:
+	sev_misc_cg_uncharge(sev);
+	put_misc_cg(sev->misc_cg);
+	sev->misc_cg = NULL;
+	sev->active = false;
+	sev->es_active = false;
+err_clear_asid:
+	if (liveupdate_flb_get_incoming(&sev_snp_luo_flb, &flb_obj) == 0) {
+		flb_st = flb_obj;
+		if (flb_st) {
+			mutex_lock(&sev_bitmap_lock);
+			__set_bit(s->asid,
+				  (unsigned long *)flb_st->active_asids);
+			mutex_unlock(&sev_bitmap_lock);
+		}
+		liveupdate_flb_put_incoming(&sev_snp_luo_flb);
+	}
+	return ret;
+}
+
+void sev_vm_luo_finish(struct kvm_luo_vm_x86_state *state,
+		       bool retrieved)
+{
+	struct kvm_snp_vm_luo_state *s = &state->snp;
+	struct sev_data_snp_addr addr = {};
+	struct page *ctx_page;
+	int ret, df_ret, error = 0;
+	u64 gctx_pfn;
+
+	if (retrieved)
+		return;
+
+	if (!(s->flags & KVM_SNP_VM_LUO_F_VALID) || !s->gctx_pfn)
+		return;
+
+	gctx_pfn = s->gctx_pfn;
+	s->gctx_pfn = 0;
+	ctx_page = kho_restore_pages(PFN_PHYS(gctx_pfn), 1);
+	if (!ctx_page)
+		return;
+
+	if (!sev_snp_enabled || !snp_luo_is_adopted()) {
+		snp_leak_pages(gctx_pfn, 1);
+		return;
+	}
+
+	down_write(&sev_deactivate_lock);
+
+	addr.address = __sme_pa(page_address(ctx_page));
+	ret = sev_do_cmd(SEV_CMD_SNP_DECOMMISSION, &addr, &error);
+	if (ret) {
+		up_write(&sev_deactivate_lock);
+		pr_err("SEV: DECOMMISSION failed on LUO abort ret=%d, fw_error=%d\n",
+		       ret, error);
+		snp_leak_pages(gctx_pfn, 1);
+		return;
+	}
+
+	wbinvd_on_all_cpus();
+	df_ret = sev_do_cmd(SEV_CMD_SNP_DF_FLUSH, NULL, &error);
+	if (df_ret)
+		pr_err("SEV: DF_FLUSH failed on LUO abort ret=%d, fw_error=%d\n",
+		       df_ret, error);
+
+	up_write(&sev_deactivate_lock);
+
+	snp_free_firmware_page(page_address(ctx_page));
+}
+
+#else
+int sev_luo_init(void)
+{
+	return 0;
+}
+
+void sev_luo_exit(void)
+{
+}
+#endif

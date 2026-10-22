@@ -40,6 +40,8 @@
  *                                memory (%KVM_X86_SW_PROTECTED_VM).
  * @KVM_VM_LUO_FEAT_TDX:          Kind of Intel TDX confidential VM
  *                                (%KVM_X86_TDX_VM).
+ * @KVM_VM_LUO_FEAT_SEV_SNP:      Kind of AMD SEV-SNP confidential VM
+ *                                (%KVM_X86_SNP_VM).
  * @KVM_VM_LUO_FEAT_MAX:          Number of defined features.
  *
  * The values are ABI. New features are added before %KVM_VM_LUO_FEAT_MAX,
@@ -50,6 +52,7 @@ enum kvm_vm_luo_feature {
 	KVM_VM_LUO_FEAT_NON_COCO = 1,
 	KVM_VM_LUO_FEAT_SW_PROTECTED = 2,
 	KVM_VM_LUO_FEAT_TDX = 3,
+	KVM_VM_LUO_FEAT_SEV_SNP = 4,
 	KVM_VM_LUO_FEAT_MAX,
 };
 
@@ -216,6 +219,8 @@ static_assert(sizeof(struct kvm_gmem_luo_state) == 200);
  *                                  (%KVM_X86_SW_PROTECTED_VM).
  * @KVM_VCPU_LUO_FEAT_TDX:          Kind of vCPU belonging to an Intel TDX
  *                                  confidential VM (%KVM_X86_TDX_VM).
+ * @KVM_VCPU_LUO_FEAT_SEV_SNP:      Kind of vCPU belonging to an AMD SEV-SNP
+ *                                  confidential VM (%KVM_X86_SNP_VM).
  * @KVM_VCPU_LUO_FEAT_MAX:          Number of defined features.
  *
  * The values are ABI. New features are added before %KVM_VCPU_LUO_FEAT_MAX,
@@ -226,6 +231,7 @@ enum kvm_vcpu_luo_feature {
 	KVM_VCPU_LUO_FEAT_NON_COCO = 1,
 	KVM_VCPU_LUO_FEAT_SW_PROTECTED = 2,
 	KVM_VCPU_LUO_FEAT_TDX = 3,
+	KVM_VCPU_LUO_FEAT_SEV_SNP = 4,
 	KVM_VCPU_LUO_FEAT_MAX,
 };
 
@@ -233,6 +239,7 @@ static_assert((int)KVM_VCPU_LUO_FEAT_MAX <= LUO_FEAT_MAX);
 static_assert((int)KVM_VCPU_LUO_FEAT_NON_COCO == (int)KVM_VM_LUO_FEAT_NON_COCO);
 static_assert((int)KVM_VCPU_LUO_FEAT_SW_PROTECTED == (int)KVM_VM_LUO_FEAT_SW_PROTECTED);
 static_assert((int)KVM_VCPU_LUO_FEAT_TDX == (int)KVM_VM_LUO_FEAT_TDX);
+static_assert((int)KVM_VCPU_LUO_FEAT_SEV_SNP == (int)KVM_VM_LUO_FEAT_SEV_SNP);
 
 /**
  * struct kvm_vcpu_luo_state - Preserved state of a KVM vCPU.
@@ -512,6 +519,24 @@ struct sev_snp_luo_flb_state {
 
 static_assert(sizeof(struct sev_snp_luo_flb_state) == 2104);
 
+/**
+ * struct kvm_snp_vm_luo_state - Per-SNP VM state embedded in kvm_luo_vm_x86_state.
+ * @gctx_pfn:      PFN of the PSP SNP guest context page.
+ * @asid:          Assigned SEV-SNP ASID.
+ * @flags:         Preserved SNP VM state flags.
+ * @ap_jump_table: Guest physical address of the AP jump table.
+ * @policy:        64-bit SEV-SNP guest policy configured at launch.
+ */
+struct kvm_snp_vm_luo_state {
+	u64 gctx_pfn;
+	u32 asid;
+	u32 flags;
+	u64 ap_jump_table;
+	u64 policy;
+};
+
+static_assert(sizeof(struct kvm_snp_vm_luo_state) == 32);
+
 #define KVM_LUO_X86_MAX_CPUID_ENTRIES	256
 #define KVM_LUO_X86_MAX_MSR_ENTRIES	512
 #define KVM_LUO_X86_MAX_IRQ_ROUTES	1024
@@ -560,6 +585,7 @@ static_assert(sizeof(struct sev_snp_luo_flb_state) == 2104);
  * @disabled_quirks:      Preserved VM disabled_quirks mask.
  * @irq_routes:           Preserved GSI routing table entries.
  * @tdx:                  Per-TD VM state for %KVM_VM_LUO_FEAT_TDX.
+ * @snp:                  Per-SNP VM state for %KVM_VM_LUO_FEAT_SEV_SNP.
  */
 struct kvm_luo_vm_x86_state {
 	u32 version;
@@ -583,9 +609,10 @@ struct kvm_luo_vm_x86_state {
 	u32 disabled_quirks;
 	struct kvm_irq_routing_entry irq_routes[KVM_LUO_X86_MAX_IRQ_ROUTES];
 	struct kvm_tdx_vm_luo_state tdx;
+	struct kvm_snp_vm_luo_state snp;
 };
 
-static_assert(sizeof(struct kvm_luo_vm_x86_state) == 51104);
+static_assert(sizeof(struct kvm_luo_vm_x86_state) == 51136);
 
 #define KVM_LUO_X86_VCPU_STATE_VERSION			1
 #define KVM_LUO_X86_VCPU_FLAG_HAS_LAPIC			BIT(0)

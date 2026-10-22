@@ -122,6 +122,8 @@ struct kvm_sev_info {
 	struct mutex guest_req_mutex; /* Must acquire before using bounce buffers */
 	cpumask_var_t have_run_cpus; /* CPUs that have done VMRUN for this VM. */
 	bool snp_certs_enabled;	/* SNP certificate-fetching support. */
+	bool luo_preserved;	/* Preserved across liveupdate kexec. */
+	bool luo_retrieved;	/* Retrieved after liveupdate kexec. */
 };
 #endif
 
@@ -1029,6 +1031,17 @@ void sev_gmem_invalidate_range(struct kvm *kvm, struct kvm_gfn_range *range);
 int sev_gmem_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn, bool is_private);
 struct vmcb_save_area *sev_decrypt_vmsa(struct kvm_vcpu *vcpu);
 void sev_free_decrypted_vmsa(struct kvm_vcpu *vcpu, struct vmcb_save_area *vmsa);
+int sev_luo_init(void);
+void sev_luo_exit(void);
+#ifdef CONFIG_LIVEUPDATE
+int sev_vm_luo_preserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *state);
+int sev_vm_luo_freeze(struct kvm *kvm, struct kvm_luo_vm_x86_state *state);
+void sev_vm_luo_unpreserve(struct kvm *kvm, struct kvm_luo_vm_x86_state *state);
+int sev_vm_luo_retrieve(struct kvm *kvm,
+			struct kvm_luo_vm_x86_state *state);
+void sev_vm_luo_finish(struct kvm_luo_vm_x86_state *state,
+		       bool retrieved);
+#endif
 #else
 static inline struct page *snp_safe_alloc_page_node(int node, gfp_t gfp)
 {
@@ -1056,6 +1069,8 @@ static inline struct vmcb_save_area *sev_decrypt_vmsa(struct kvm_vcpu *vcpu)
 	return NULL;
 }
 static inline void sev_free_decrypted_vmsa(struct kvm_vcpu *vcpu, struct vmcb_save_area *vmsa) {}
+static inline int sev_luo_init(void) { return 0; }
+static inline void sev_luo_exit(void) {}
 #endif
 
 /* vmenter.S */

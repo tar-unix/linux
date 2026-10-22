@@ -31,9 +31,9 @@
  * In addition to the VM type, architecture-specific VM state (such as
  * in-kernel interrupt controller state, timers, and GSI routing) is carried
  * over. Each VM and vCPU records its kind feature (non-CoCo,
- * software-protected private memory, or Intel TDX) in its feature header.
- * vCPUs are preserved separately via the "kvm-vcpu" file handler and
- * retrieved against the restored VM file descriptor using struct
+ * software-protected private memory, Intel TDX, or AMD SEV-SNP) in its
+ * feature header. vCPUs are preserved separately via the "kvm-vcpu" file
+ * handler and retrieved against the restored VM file descriptor using struct
  * kvm_vcpu_luo_retrieve. Guest memory is preserved separately by preserving
  * the files that back it, and the VMM re-attaches memory slots after
  * retrieval.
@@ -64,12 +64,14 @@ static const u8 kvm_vm_luo_features[KVM_VM_LUO_FEAT_MAX] = {
 	[KVM_VM_LUO_FEAT_NON_COCO]	= LUO_FEAT_OPTIONAL,
 	[KVM_VM_LUO_FEAT_SW_PROTECTED]	= LUO_FEAT_OPTIONAL,
 	[KVM_VM_LUO_FEAT_TDX]		= LUO_FEAT_OPTIONAL,
+	[KVM_VM_LUO_FEAT_SEV_SNP]	= LUO_FEAT_OPTIONAL,
 };
 
 static const unsigned int kvm_vm_luo_kinds[] = {
 	KVM_VM_LUO_FEAT_NON_COCO,
 	KVM_VM_LUO_FEAT_SW_PROTECTED,
 	KVM_VM_LUO_FEAT_TDX,
+	KVM_VM_LUO_FEAT_SEV_SNP,
 };
 
 static atomic_t kvm_vm_luo_nr_retrieved = ATOMIC_INIT(0);
@@ -129,7 +131,8 @@ static int kvm_vm_luo_get_kind(const struct luo_feature_hdr *hdr)
 
 static bool kvm_vm_luo_is_hw_coco(int kind)
 {
-	return kind == KVM_VM_LUO_FEAT_TDX;
+	return kind == KVM_VM_LUO_FEAT_TDX ||
+	       kind == KVM_VM_LUO_FEAT_SEV_SNP;
 }
 
 static bool kvm_vm_luo_can_preserve(struct liveupdate_file_handler *handler,
@@ -337,12 +340,14 @@ static const u8 kvm_vcpu_luo_features[KVM_VCPU_LUO_FEAT_MAX] = {
 	[KVM_VCPU_LUO_FEAT_NON_COCO]		= LUO_FEAT_OPTIONAL,
 	[KVM_VCPU_LUO_FEAT_SW_PROTECTED]	= LUO_FEAT_OPTIONAL,
 	[KVM_VCPU_LUO_FEAT_TDX]			= LUO_FEAT_OPTIONAL,
+	[KVM_VCPU_LUO_FEAT_SEV_SNP]		= LUO_FEAT_OPTIONAL,
 };
 
 static const unsigned int kvm_vcpu_luo_kinds[] = {
 	KVM_VCPU_LUO_FEAT_NON_COCO,
 	KVM_VCPU_LUO_FEAT_SW_PROTECTED,
 	KVM_VCPU_LUO_FEAT_TDX,
+	KVM_VCPU_LUO_FEAT_SEV_SNP,
 };
 
 int __weak kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)

@@ -5592,6 +5592,13 @@ struct kvm_x86_ops svm_x86_ops __initdata = {
 	.gmem_make_shared = sev_gmem_make_shared,
 	.gmem_invalidate_range = sev_gmem_invalidate_range,
 	.gmem_max_mapping_level = sev_gmem_max_mapping_level,
+#ifdef CONFIG_LIVEUPDATE
+	.vm_luo_preserve = sev_vm_luo_preserve,
+	.vm_luo_freeze = sev_vm_luo_freeze,
+	.vm_luo_unpreserve = sev_vm_luo_unpreserve,
+	.vm_luo_retrieve = sev_vm_luo_retrieve,
+	.vm_luo_finish = sev_vm_luo_finish,
+#endif
 #endif
 	.check_emulate_instruction = svm_check_emulate_instruction,
 
@@ -5957,6 +5964,10 @@ static int __init svm_init(void)
 	if (r)
 		return r;
 
+	r = sev_luo_init();
+	if (r)
+		goto err_vendor_exit;
+
 	/*
 	 * Common KVM initialization _must_ come last, after this, /dev/kvm is
 	 * exposed to userspace!
@@ -5964,11 +5975,13 @@ static int __init svm_init(void)
 	r = kvm_init(sizeof(struct vcpu_svm), __alignof__(struct vcpu_svm),
 		     THIS_MODULE);
 	if (r)
-		goto err_kvm_init;
+		goto err_sev_luo;
 
 	return 0;
 
-err_kvm_init:
+err_sev_luo:
+	sev_luo_exit();
+err_vendor_exit:
 	__svm_exit();
 	return r;
 }
@@ -5976,6 +5989,7 @@ err_kvm_init:
 static void __exit svm_exit(void)
 {
 	kvm_exit();
+	sev_luo_exit();
 	__svm_exit();
 }
 
