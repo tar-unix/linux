@@ -3775,6 +3775,8 @@ int kvm_tdx_luo_vm_freeze(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
 {
 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
 	struct kvm_memory_slot *memslot;
+	struct kvm_vcpu *vcpu;
+	unsigned long idx;
 	long nr_sept;
 	size_t bkt;
 	u64 i;
@@ -3788,6 +3790,11 @@ int kvm_tdx_luo_vm_freeze(struct kvm *kvm, struct kvm_luo_vm_x86_state *s)
 
 	if (READ_ONCE(kvm_tdx->wait_for_sept_zap))
 		return -EBUSY;
+
+	kvm_for_each_vcpu(idx, vcpu, kvm) {
+		if (!to_tdx(vcpu)->luo_preserved)
+			return -EBUSY;
+	}
 
 	guard(mutex)(&kvm->slots_lock);
 	WRITE_ONCE(kvm->arch.luo_frozen, true);
@@ -4349,6 +4356,364 @@ void kvm_tdx_luo_vm_finish(struct kvm_luo_vm_x86_state *s, bool retrieved)
 	tdx_luo_finish_unclaimed_vm(NULL, s, NULL);
 }
 
+static void tdx_luo_save_vcpu_volatile(struct vcpu_tdx *tdx,
+				       struct kvm_luo_vcpu_x86_state *s)
+{
+	s->tdx.state = tdx->state;
+	s->tdx.exit_reason = tdx->vt.exit_reason.full;
+	s->tdx.vp_enter_ret = tdx->vp_enter_ret;
+	s->tdx.rcx = tdx->vp_enter_args.rcx;
+	s->tdx.rdx = tdx->vp_enter_args.rdx;
+	s->tdx.r8 = tdx->vp_enter_args.r8;
+	s->tdx.r9 = tdx->vp_enter_args.r9;
+	s->tdx.r10 = tdx->vp_enter_args.r10;
+	s->tdx.r11 = tdx->vp_enter_args.r11;
+	s->tdx.r12 = tdx->vp_enter_args.r12;
+	s->tdx.r13 = tdx->vp_enter_args.r13;
+	s->tdx.r14 = tdx->vp_enter_args.r14;
+	s->tdx.r15 = tdx->vp_enter_args.r15;
+	s->tdx.rbx = tdx->vp_enter_args.rbx;
+	s->tdx.rdi = tdx->vp_enter_args.rdi;
+	s->tdx.rsi = tdx->vp_enter_args.rsi;
+	s->tdx.map_gpa_next = tdx->map_gpa_next;
+	s->tdx.map_gpa_end = tdx->map_gpa_end;
+	memcpy(s->tdx.pi_pir, tdx->vt.pi_desc.pir, sizeof(s->tdx.pi_pir));
+	s->tdx.pi_control = READ_ONCE(tdx->vt.pi_desc.control);
+}
+
+int kvm_tdx_luo_vcpu_preserve(struct kvm_vcpu *vcpu,
+			      struct kvm_luo_vcpu_x86_state *s)
+{
+	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
+	struct vcpu_tdx *tdx = to_tdx(vcpu);
+	int ret, i;
+
+	if (!is_td_vcpu(vcpu))
+		return -EOPNOTSUPP;
+
+	if (tdx->state != VCPU_TD_STATE_INITIALIZED ||
+	    kvm_tdx->state != TD_STATE_RUNNABLE || !kvm_tdx->td.tdr_page ||
+	    !tdx->vp.tdvpr_page || !tdx->vp.tdcx_pages)
+		return -EINVAL;
+
+	if (kvm_tdx->td.tdcx_nr_pages > TDX_LUO_MAX_TDCX_PAGES)
+		return -E2BIG;
+
+	memset(&s->tdx, 0, sizeof(s->tdx));
+
+	ret = kho_preserve_folio(page_folio(tdx->vp.tdvpr_page));
+	if (ret)
+		return ret;
+
+	for (i = 0; i < kvm_tdx->td.tdcx_nr_pages; i++) {
+		ret = kho_preserve_folio(page_folio(tdx->vp.tdcx_pages[i]));
+		if (ret)
+			goto err_unpreserve_tdcx;
+	}
+
+	s->tdx.tdr_pfn = page_to_pfn(kvm_tdx->td.tdr_page);
+	s->tdx.tdvpr_pfn = page_to_pfn(tdx->vp.tdvpr_page);
+	for (i = 0; i < kvm_tdx->td.tdcx_nr_pages; i++)
+		s->tdx.tdcx_pfns[i] = page_to_pfn(tdx->vp.tdcx_pages[i]);
+	s->tdx.nr_tdcx_pages = kvm_tdx->td.tdcx_nr_pages;
+	tdx_luo_save_vcpu_volatile(tdx, s);
+	tdx->luo_preserved = true;
+
+	return 0;
+
+err_unpreserve_tdcx:
+	while (--i >= 0)
+		kho_unpreserve_folio(page_folio(tdx->vp.tdcx_pages[i]));
+	kho_unpreserve_folio(page_folio(tdx->vp.tdvpr_page));
+	return ret;
+}
+
+static int tdx_luo_apply_userspace_io(struct kvm_vcpu *vcpu,
+				      struct kvm_luo_vcpu_x86_state *s)
+{
+	int (*cui)(struct kvm_vcpu *vcpu) = vcpu->arch.complete_userspace_io;
+	struct vcpu_tdx *tdx = to_tdx(vcpu);
+	unsigned long val = 0;
+
+	if (!cui)
+		return 0;
+
+	if (!vcpu->run)
+		return -EBUSY;
+
+	if (cui == complete_hypercall_exit) {
+		s->tdx.r10 = vcpu->run->hypercall.ret;
+		return 0;
+	}
+
+	if (cui == tdx_complete_pio_out)
+		return 0;
+
+	if (cui == tdx_complete_pio_in) {
+		if (vcpu->arch.pio.count != 1 || !vcpu->arch.pio.size ||
+		    vcpu->arch.pio.size > sizeof(val))
+			return -EBUSY;
+		memcpy(&val, vcpu->arch.pio_data, vcpu->arch.pio.size);
+		s->tdx.r10 = TDVMCALL_STATUS_SUCCESS;
+		s->tdx.r11 = val;
+		return 0;
+	}
+
+	if (cui == tdx_complete_mmio_read) {
+		int size = vcpu->mmio_fragments[0].len;
+
+		if (size <= 0 || size > sizeof(val) ||
+		    size > sizeof(vcpu->run->mmio.data))
+			return -EBUSY;
+		memcpy(&val, vcpu->run->mmio.data, size);
+		s->tdx.r10 = TDVMCALL_STATUS_SUCCESS;
+		s->tdx.r11 = val;
+		return 0;
+	}
+
+	if (cui == tdx_complete_get_td_vm_call_info) {
+		s->tdx.r10 = vcpu->run->tdx.get_tdvmcall_info.ret;
+		s->tdx.r11 = vcpu->run->tdx.get_tdvmcall_info.r11;
+		s->tdx.r12 = vcpu->run->tdx.get_tdvmcall_info.r12;
+		s->tdx.r13 = vcpu->run->tdx.get_tdvmcall_info.r13;
+		s->tdx.r14 = vcpu->run->tdx.get_tdvmcall_info.r14;
+		return 0;
+	}
+
+	if (cui == tdx_complete_simple) {
+		s->tdx.r10 = vcpu->run->tdx.unknown.ret;
+		return 0;
+	}
+
+	if (cui == tdx_complete_vmcall_map_gpa) {
+		u64 hypercall_ret = READ_ONCE(vcpu->run->hypercall.ret);
+		u64 next = tdx->map_gpa_next;
+
+		switch (hypercall_ret) {
+		case 0:
+			next += TDX_MAP_GPA_MAX_LEN;
+			s->tdx.map_gpa_next = next;
+			if (next < tdx->map_gpa_end) {
+				s->tdx.r10 = TDVMCALL_STATUS_RETRY;
+				s->tdx.r11 = next;
+			}
+			return 0;
+		case EAGAIN:
+			s->tdx.r10 = TDVMCALL_STATUS_RETRY;
+			s->tdx.r11 = next;
+			return 0;
+		case EINVAL:
+			s->tdx.r10 = TDVMCALL_STATUS_INVALID_OPERAND;
+			s->tdx.r11 = next;
+			return 0;
+		default:
+			return -EINVAL;
+		}
+	}
+
+	return -EBUSY;
+}
+
+int kvm_tdx_luo_vcpu_freeze(struct kvm_vcpu *vcpu,
+			    struct kvm_luo_vcpu_x86_state *s)
+{
+	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
+	struct vcpu_tdx *tdx = to_tdx(vcpu);
+	int ret;
+
+	if (!is_td_vcpu(vcpu))
+		return -EOPNOTSUPP;
+
+	if (tdx->state != VCPU_TD_STATE_INITIALIZED ||
+	    kvm_tdx->state != TD_STATE_RUNNABLE)
+		return -EINVAL;
+
+	if (!kvm_tdx->luo_preserved)
+		return -EBUSY;
+
+	if (atomic_read(&vcpu->arch.nmi_queued) || vcpu->arch.nmi_pending ||
+	    vcpu->arch.nmi_injected)
+		return -EBUSY;
+
+	tdx_luo_save_vcpu_volatile(tdx, s);
+	ret = tdx_luo_apply_userspace_io(vcpu, s);
+	if (ret)
+		return ret;
+	tdx_flush_vp_on_cpu(vcpu);
+
+	return 0;
+}
+
+void kvm_tdx_luo_vcpu_unpreserve(struct kvm_vcpu *vcpu,
+				 struct kvm_luo_vcpu_x86_state *s)
+{
+	u32 i;
+
+	if (vcpu && !is_td_vcpu(vcpu))
+		return;
+
+	if (vcpu)
+		to_tdx(vcpu)->luo_preserved = false;
+
+	for (i = 0; i < s->tdx.nr_tdcx_pages && i < TDX_LUO_MAX_TDCX_PAGES; i++) {
+		if (s->tdx.tdcx_pfns[i])
+			kho_unpreserve_folio(pfn_folio(s->tdx.tdcx_pfns[i]));
+	}
+
+	if (s->tdx.tdvpr_pfn)
+		kho_unpreserve_folio(pfn_folio(s->tdx.tdvpr_pfn));
+
+	memset(&s->tdx, 0, sizeof(s->tdx));
+}
+
+int kvm_tdx_luo_vcpu_retrieve(struct kvm_vcpu *vcpu,
+			      struct kvm_luo_vcpu_x86_state *s)
+{
+	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
+	struct vcpu_tdx *tdx = to_tdx(vcpu);
+	struct vcpu_vt *vt = to_vt(vcpu);
+	struct folio *folio;
+	int i;
+
+	if (!is_td_vcpu(vcpu) || !enable_tdx || !tdx_luo_is_adopted())
+		return -EOPNOTSUPP;
+
+	if (!kvm_tdx->luo_retrieved || kvm_tdx->state != TD_STATE_RUNNABLE ||
+	    !kvm_tdx->td.tdr_page || tdx->state != VCPU_TD_STATE_UNINITIALIZED)
+		return -EINVAL;
+
+	if (s->tdx.state != VCPU_TD_STATE_INITIALIZED ||
+	    s->tdx.tdr_pfn != page_to_pfn(kvm_tdx->td.tdr_page) ||
+	    !s->tdx.tdvpr_pfn || !pfn_valid(s->tdx.tdvpr_pfn) ||
+	    s->tdx.nr_tdcx_pages != kvm_tdx->td.tdcx_nr_pages ||
+	    s->tdx.nr_tdcx_pages > TDX_LUO_MAX_TDCX_PAGES)
+		return -EINVAL;
+
+	for (i = 0; i < kvm_tdx->td.tdcx_nr_pages; i++) {
+		if (!s->tdx.tdcx_pfns[i] || !pfn_valid(s->tdx.tdcx_pfns[i]))
+			return -EINVAL;
+	}
+
+	tdx->vp.tdcx_pages = kzalloc_objs(*tdx->vp.tdcx_pages,
+					  kvm_tdx->td.tdcx_nr_pages,
+					  GFP_KERNEL_ACCOUNT);
+	if (!tdx->vp.tdcx_pages)
+		return -ENOMEM;
+
+	folio = kho_restore_folio(PFN_PHYS(s->tdx.tdvpr_pfn));
+	if (!folio) {
+		kfree(tdx->vp.tdcx_pages);
+		tdx->vp.tdcx_pages = NULL;
+		return -EINVAL;
+	}
+	s->tdx.tdvpr_pfn = 0;
+	tdx->vp.tdvpr_page = folio_page(folio, 0);
+	tdx->vp.tdvpr_pa = page_to_phys(tdx->vp.tdvpr_page);
+
+	for (i = 0; i < kvm_tdx->td.tdcx_nr_pages; i++) {
+		folio = kho_restore_folio(PFN_PHYS(s->tdx.tdcx_pfns[i]));
+		if (!folio) {
+			mutex_lock(&tdx_lock);
+			while (--i >= 0) {
+				tdx_luo_reclaim_or_defer_ctrl_page(tdx->vp.tdcx_pages[i]);
+				tdx->vp.tdcx_pages[i] = NULL;
+			}
+			tdx_luo_reclaim_or_defer_ctrl_page(tdx->vp.tdvpr_page);
+			tdx->vp.tdvpr_page = NULL;
+			tdx->vp.tdvpr_pa = 0;
+			tdx_luo_drain_deferred_pages();
+			mutex_unlock(&tdx_lock);
+			kfree(tdx->vp.tdcx_pages);
+			tdx->vp.tdcx_pages = NULL;
+			return -EINVAL;
+		}
+		s->tdx.tdcx_pfns[i] = 0;
+		tdx->vp.tdcx_pages[i] = folio_page(folio, 0);
+	}
+
+	tdx->vp_enter_ret = s->tdx.vp_enter_ret;
+	tdx->vp_enter_args.rcx = s->tdx.rcx;
+	tdx->vp_enter_args.rdx = s->tdx.rdx;
+	tdx->vp_enter_args.r8 = s->tdx.r8;
+	tdx->vp_enter_args.r9 = s->tdx.r9;
+	tdx->vp_enter_args.r10 = s->tdx.r10;
+	tdx->vp_enter_args.r11 = s->tdx.r11;
+	tdx->vp_enter_args.r12 = s->tdx.r12;
+	tdx->vp_enter_args.r13 = s->tdx.r13;
+	tdx->vp_enter_args.r14 = s->tdx.r14;
+	tdx->vp_enter_args.r15 = s->tdx.r15;
+	tdx->vp_enter_args.rbx = s->tdx.rbx;
+	tdx->vp_enter_args.rdi = s->tdx.rdi;
+	tdx->vp_enter_args.rsi = s->tdx.rsi;
+	tdx->map_gpa_next = s->tdx.map_gpa_next;
+	tdx->map_gpa_end = s->tdx.map_gpa_end;
+
+	BUILD_BUG_ON(sizeof(s->tdx.pi_pir) != sizeof(tdx->vt.pi_desc.pir));
+	for (i = 0; i < ARRAY_SIZE(s->tdx.pi_pir); i++) {
+		if (s->tdx.pi_pir[i])
+			atomic_long_or(s->tdx.pi_pir[i],
+				       (atomic_long_t *)&tdx->vt.pi_desc.pir[i]);
+	}
+	pi_set_sn(&tdx->vt.pi_desc);
+	if (s->tdx.pi_control & BIT_ULL(POSTED_INTR_ON))
+		pi_set_on(&tdx->vt.pi_desc);
+	preempt_disable();
+	vt_vcpu_pi_load(vcpu, smp_processor_id());
+	preempt_enable();
+
+	vt->exit_reason.full = s->tdx.exit_reason;
+	vt->exit_qualification = tdx->vp_enter_args.rcx;
+	tdx->ext_exit_qualification = tdx->vp_enter_args.rdx;
+	tdx->exit_gpa = tdx->vp_enter_args.r8;
+	vt->exit_intr_info = tdx->vp_enter_args.r9;
+
+	tdx->state = VCPU_TD_STATE_INITIALIZED;
+
+	td_vmcs_write16(tdx, POSTED_INTR_NV, POSTED_INTR_VECTOR);
+	td_vmcs_write64(tdx, POSTED_INTR_DESC_ADDR, __pa(&tdx->vt.pi_desc));
+
+	return 0;
+}
+
+void kvm_tdx_luo_vcpu_finish(struct kvm_luo_vcpu_x86_state *s,
+			     bool retrieved)
+{
+	struct page *tdcx_pages[TDX_LUO_MAX_TDCX_PAGES] = {};
+	struct page *tdvpr_page = NULL;
+	struct folio *folio;
+	u32 nr_tdcx, i;
+
+	if (retrieved || (!s->tdx.tdvpr_pfn && !s->tdx.nr_tdcx_pages))
+		return;
+
+	if (s->tdx.tdvpr_pfn) {
+		folio = kho_restore_folio(PFN_PHYS(s->tdx.tdvpr_pfn));
+		if (folio)
+			tdvpr_page = folio_page(folio, 0);
+	}
+
+	nr_tdcx = min_t(u32, s->tdx.nr_tdcx_pages, TDX_LUO_MAX_TDCX_PAGES);
+	for (i = 0; i < nr_tdcx; i++) {
+		if (!s->tdx.tdcx_pfns[i])
+			continue;
+		folio = kho_restore_folio(PFN_PHYS(s->tdx.tdcx_pfns[i]));
+		if (folio)
+			tdcx_pages[i] = folio_page(folio, 0);
+	}
+
+	if (!tdx_luo_is_adopted())
+		return;
+
+	mutex_lock(&tdx_lock);
+	for (i = 0; i < nr_tdcx; i++) {
+		if (tdcx_pages[i])
+			tdx_luo_reclaim_or_defer_ctrl_page(tdcx_pages[i]);
+	}
+	if (tdvpr_page)
+		tdx_luo_reclaim_or_defer_ctrl_page(tdvpr_page);
+	tdx_luo_drain_deferred_pages();
+	mutex_unlock(&tdx_lock);
+}
 #endif /* CONFIG_LIVEUPDATE */
 
 int tdx_gmem_make_shared(kvm_pfn_t pfn, kvm_pfn_t nr_pages, bool reclaim)

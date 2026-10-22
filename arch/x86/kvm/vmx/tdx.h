@@ -75,6 +75,7 @@ struct vcpu_tdx {
 	u64 vp_enter_ret;
 
 	enum vcpu_tdx_state state;
+	bool luo_preserved;
 
 	u64 map_gpa_next;
 	u64 map_gpa_end;
@@ -185,6 +186,7 @@ int tdx_complete_emulated_msr(struct kvm_vcpu *vcpu, int err);
 
 #ifdef CONFIG_LIVEUPDATE
 struct kvm_luo_vm_x86_state;
+struct kvm_luo_vcpu_x86_state;
 
 int tdx_luo_init(void);
 void tdx_luo_exit(void);
@@ -195,6 +197,16 @@ int kvm_tdx_luo_vm_retrieve(struct kvm *kvm,
 			    struct kvm_luo_vm_x86_state *s);
 void kvm_tdx_luo_vm_finish(struct kvm_luo_vm_x86_state *s,
 			   bool retrieved);
+int kvm_tdx_luo_vcpu_preserve(struct kvm_vcpu *vcpu,
+			      struct kvm_luo_vcpu_x86_state *s);
+int kvm_tdx_luo_vcpu_freeze(struct kvm_vcpu *vcpu,
+			    struct kvm_luo_vcpu_x86_state *s);
+void kvm_tdx_luo_vcpu_unpreserve(struct kvm_vcpu *vcpu,
+				 struct kvm_luo_vcpu_x86_state *s);
+int kvm_tdx_luo_vcpu_retrieve(struct kvm_vcpu *vcpu,
+			      struct kvm_luo_vcpu_x86_state *s);
+void kvm_tdx_luo_vcpu_finish(struct kvm_luo_vcpu_x86_state *s,
+			     bool retrieved);
 #else
 static inline int tdx_luo_init(void) { return 0; }
 static inline void tdx_luo_exit(void) {}

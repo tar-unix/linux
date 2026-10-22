@@ -267,6 +267,7 @@ static_assert(sizeof(struct kvm_vcpu_luo_state) == 144);
 #define TDX_LUO_MAX_HKIDS		2048
 #define TDX_LUO_HKID_BITMAP_U64S	(TDX_LUO_MAX_HKIDS / 64)
 #define TDX_LUO_MAX_TDCS_PAGES		16
+#define TDX_LUO_MAX_TDCX_PAGES		8
 
 #define TDX_LUO_FLB_MAGIC		0x5444584cU
 #define TDX_LUO_FLB_F_ACTIVE_TDS	BIT(0)
@@ -378,6 +379,62 @@ struct kvm_tdx_vm_luo_state {
 };
 
 static_assert(sizeof(struct kvm_tdx_vm_luo_state) == 208);
+
+/**
+ * struct kvm_tdx_vcpu_luo_state - Per-TD vCPU state embedded in kvm_luo_vcpu_x86_state.
+ * @tdr_pfn:       PFN of the owning TD's 4KB TDR control page.
+ * @tdvpr_pfn:     PFN of the 4KB TDVPR control page.
+ * @tdcx_pfns:     PFNs of the TDCX control pages.
+ * @nr_tdcx_pages: Number of valid entries in @tdcx_pfns.
+ * @state:         TD vCPU state (enum vcpu_tdx_state).
+ * @exit_reason:   Preserved vt->exit_reason.full across liveupdate.
+ * @vp_enter_ret:  Last TDH.VP.ENTER return code.
+ * @rcx:           Saved hypercall RCX argument.
+ * @rdx:           Saved hypercall RDX argument.
+ * @r8:            Saved hypercall R8 argument.
+ * @r9:            Saved hypercall R9 argument.
+ * @r10:           Saved TDG.VP.VMCALL R10 GPR.
+ * @r11:           Saved TDG.VP.VMCALL R11 GPR.
+ * @r12:           Saved TDG.VP.VMCALL R12 GPR.
+ * @r13:           Saved TDG.VP.VMCALL R13 GPR.
+ * @r14:           Saved TDG.VP.VMCALL R14 GPR.
+ * @r15:           Saved TDG.VP.VMCALL R15 GPR.
+ * @rbx:           Saved TDG.VP.VMCALL RBX GPR.
+ * @rdi:           Saved TDG.VP.VMCALL RDI GPR.
+ * @rsi:           Saved TDG.VP.VMCALL RSI GPR.
+ * @map_gpa_next:  Next GPA for in-flight MapGPA hypercall.
+ * @map_gpa_end:   End GPA for in-flight MapGPA hypercall.
+ * @pi_pir:        Preserved VT-d Posted Interrupt Descriptor PIR bitmap.
+ * @pi_control:    Preserved VT-d Posted Interrupt Descriptor control word.
+ */
+struct kvm_tdx_vcpu_luo_state {
+	u64 tdr_pfn;
+	u64 tdvpr_pfn;
+	u64 tdcx_pfns[TDX_LUO_MAX_TDCX_PAGES];
+	u16 nr_tdcx_pages;
+	u16 state;
+	u32 exit_reason;
+	u64 vp_enter_ret;
+	u64 rcx;
+	u64 rdx;
+	u64 r8;
+	u64 r9;
+	u64 r10;
+	u64 r11;
+	u64 r12;
+	u64 r13;
+	u64 r14;
+	u64 r15;
+	u64 rbx;
+	u64 rdi;
+	u64 rsi;
+	u64 map_gpa_next;
+	u64 map_gpa_end;
+	u64 pi_pir[4];
+	u64 pi_control;
+};
+
+static_assert(sizeof(struct kvm_tdx_vcpu_luo_state) == 256);
 
 #define KVM_LUO_X86_MAX_CPUID_ENTRIES	256
 #define KVM_LUO_X86_MAX_MSR_ENTRIES	512
@@ -494,6 +551,7 @@ static_assert(sizeof(struct kvm_luo_vm_x86_state) == 51104);
  * @nr_msrs:               Number of preserved MSR entries.
  * @cpuid_entries:         Preserved guest CPUID table.
  * @msrs:                  Preserved guest MSRs.
+ * @tdx:                   Per-TD vCPU state for %KVM_VCPU_LUO_FEAT_TDX.
  */
 struct kvm_luo_vcpu_x86_state {
 	u32 version;
@@ -523,9 +581,10 @@ struct kvm_luo_vcpu_x86_state {
 	u32 nr_msrs;
 	struct kvm_cpuid_entry2 cpuid_entries[KVM_LUO_X86_MAX_CPUID_ENTRIES];
 	struct kvm_msr_entry msrs[KVM_LUO_X86_MAX_MSR_ENTRIES];
+	struct kvm_tdx_vcpu_luo_state tdx;
 };
 
-static_assert(sizeof(struct kvm_luo_vcpu_x86_state) == 24704);
+static_assert(sizeof(struct kvm_luo_vcpu_x86_state) == 24960);
 
 #endif /* CONFIG_X86 */
 

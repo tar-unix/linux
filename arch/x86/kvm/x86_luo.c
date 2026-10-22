@@ -512,7 +512,7 @@ static int kvm_x86_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 	int ret;
 
 	preserve_flags = st->flags & KVM_LUO_X86_VCPU_FLAG_VENDOR_PRESERVED;
-	memset(st, 0, sizeof(*st));
+	memset(st, 0, offsetof(struct kvm_luo_vcpu_x86_state, tdx));
 	st->version = KVM_LUO_X86_VCPU_STATE_VERSION;
 	st->flags = preserve_flags;
 	if (vcpu->arch.guest_state_protected)
@@ -570,7 +570,8 @@ static int kvm_x86_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 	if (ret)
 		return ret;
 
-	if (!vcpu->arch.guest_state_protected) {
+	if (!vcpu->arch.guest_state_protected ||
+	    vcpu->kvm->arch.vm_type == KVM_X86_TDX_VM) {
 		ret = kvm_luo_save_msrs(vcpu, st->msrs,
 					KVM_LUO_X86_MAX_MSR_ENTRIES,
 					&st->nr_msrs);
@@ -812,6 +813,20 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 			apic_set_reg(lapic->regs, APIC_TMICT, 0);
 		}
 
+		if (vcpu->kvm->arch.vm_type == KVM_X86_TDX_VM) {
+			u64 apic_base = APIC_DEFAULT_PHYS_BASE |
+					LAPIC_MODE_X2APIC |
+					(kvm_vcpu_is_reset_bsp(vcpu) ?
+					 MSR_IA32_APICBASE_BSP : 0);
+
+			vcpu->arch.apic->vapic_addr = 0;
+			if (kvm_apic_set_base(vcpu, apic_base, true)) {
+				kfree(lapic);
+				ret = -EINVAL;
+				goto out_free;
+			}
+		}
+
 		ret = kvm_apic_set_state(vcpu, lapic);
 		if (!ret && oneshot_expired)
 			apic_set_reg(vcpu->arch.apic->regs, APIC_TMICT, tmict);
@@ -821,7 +836,7 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 	}
 
 	/* 7. Restore MSRs and TSC-deadline timer. */
-	if (!is_protected) {
+	if (!is_protected || vcpu->kvm->arch.vm_type == KVM_X86_TDX_VM) {
 		ret = kvm_luo_restore_msrs(vcpu, st->msrs, st->nr_msrs);
 		if (ret)
 			goto out_free;

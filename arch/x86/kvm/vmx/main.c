@@ -917,6 +917,46 @@ static void vt_vm_luo_finish(struct kvm_luo_vm_x86_state *s,
 {
 	kvm_tdx_luo_vm_finish(s, retrieved);
 }
+
+static int vt_vcpu_luo_preserve(struct kvm_vcpu *vcpu,
+				struct kvm_luo_vcpu_x86_state *s)
+{
+	if (!is_td_vcpu(vcpu))
+		return -EOPNOTSUPP;
+
+	return kvm_tdx_luo_vcpu_preserve(vcpu, s);
+}
+
+static int vt_vcpu_luo_freeze(struct kvm_vcpu *vcpu,
+			      struct kvm_luo_vcpu_x86_state *s)
+{
+	if (!is_td_vcpu(vcpu))
+		return -EOPNOTSUPP;
+
+	return kvm_tdx_luo_vcpu_freeze(vcpu, s);
+}
+
+static void vt_vcpu_luo_unpreserve(struct kvm_vcpu *vcpu,
+				   struct kvm_luo_vcpu_x86_state *s)
+{
+	if (is_td_vcpu(vcpu))
+		kvm_tdx_luo_vcpu_unpreserve(vcpu, s);
+}
+
+static int vt_vcpu_luo_retrieve(struct kvm_vcpu *vcpu,
+				struct kvm_luo_vcpu_x86_state *s)
+{
+	if (!is_td_vcpu(vcpu))
+		return -EOPNOTSUPP;
+
+	return kvm_tdx_luo_vcpu_retrieve(vcpu, s);
+}
+
+static void vt_vcpu_luo_finish(struct kvm_luo_vcpu_x86_state *s,
+			       bool retrieved)
+{
+	kvm_tdx_luo_vcpu_finish(s, retrieved);
+}
 #endif
 
 #define vt_op(name) vt_##name
@@ -1203,6 +1243,11 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 	.vm_luo_unpreserve = vt_op_tdx_only(vm_luo_unpreserve),
 	.vm_luo_retrieve = vt_op_tdx_only(vm_luo_retrieve),
 	.vm_luo_finish = vt_op_tdx_only(vm_luo_finish),
+	.vcpu_luo_preserve = vt_op_tdx_only(vcpu_luo_preserve),
+	.vcpu_luo_freeze = vt_op_tdx_only(vcpu_luo_freeze),
+	.vcpu_luo_unpreserve = vt_op_tdx_only(vcpu_luo_unpreserve),
+	.vcpu_luo_retrieve = vt_op_tdx_only(vcpu_luo_retrieve),
+	.vcpu_luo_finish = vt_op_tdx_only(vcpu_luo_finish),
 #endif
 };
 
