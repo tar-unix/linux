@@ -191,6 +191,68 @@ TEST_F(gmem_luo, private_memory)
 	fd = vm_create_guest_memfd(self->vm, GMEM_SIZE, GUEST_MEMFD_FLAG_MMAP);
 	EXPECT_EQ(preserve_fd(self->session_fd, fd, 1, NULL, 0), -EOPNOTSUPP);
 	close(fd);
+
+#ifdef __x86_64__
+	if (kvm_check_cap(KVM_CAP_VM_TYPES) & BIT(KVM_X86_SW_PROTECTED_VM)) {
+		size_t page_size = self->page_size;
+		struct kvm_vcpu *vcpu;
+		bool init_shared;
+		struct kvm_vm *vm;
+		u64 err_off;
+
+		vm = vm_create_barebones_type(KVM_X86_SW_PROTECTED_VM);
+		init_shared = (vm_check_cap(vm, KVM_CAP_GUEST_MEMFD_FLAGS) &
+			       GMEM_FLAGS) == GMEM_FLAGS;
+		vcpu = __vm_vcpu_add(vm, 0);
+		EXPECT_EQ(preserve_fd(self->session_fd, vm->fd, 1, NULL, 0),
+			  init_shared ? 0 : -EOPNOTSUPP);
+		EXPECT_EQ(preserve_fd(self->session_fd, vcpu->fd, 2, NULL, 0),
+			  init_shared ? 0 : -EOPNOTSUPP);
+
+		fd = vm_create_guest_memfd(vm, GMEM_SIZE, 0);
+		ASSERT_EQ(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, page_size), 0);
+		EXPECT_EQ(preserve_fd(self->session_fd, fd, 3, NULL, 0),
+			  init_shared ? 0 : -EOPNOTSUPP);
+
+		if (init_shared) {
+			int conv_fd = vm_create_guest_memfd(vm, GMEM_SIZE,
+							    GMEM_FLAGS);
+
+			EXPECT_EQ(fallocate(fd, FALLOC_FL_KEEP_SIZE, page_size,
+					    page_size), -1);
+			EXPECT_EQ(errno, EPERM);
+			EXPECT_EQ(fallocate(fd,
+					    FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+					    0, page_size), -1);
+			EXPECT_EQ(errno, EPERM);
+
+			if (!__gmem_set_private(conv_fd, 0, page_size,
+						&err_off)) {
+				ASSERT_EQ(preserve_fd(self->session_fd, conv_fd,
+						      4, NULL, 0), 0);
+				EXPECT_EQ(__gmem_set_shared(conv_fd, 0,
+							    page_size,
+							    &err_off), -1);
+				EXPECT_EQ(errno, EPERM);
+				EXPECT_EQ(__gmem_set_private(conv_fd, page_size,
+							     page_size,
+							     &err_off), -1);
+				EXPECT_EQ(errno, EPERM);
+
+				close(self->session_fd);
+				self->session_fd = -1;
+
+				EXPECT_EQ(__gmem_set_shared(conv_fd, 0,
+							    page_size,
+							    &err_off), 0);
+			}
+			close(conv_fd);
+		}
+
+		close(fd);
+		kvm_vm_free(vm);
+	}
+#endif
 }
 
 TEST_HARNESS_MAIN
