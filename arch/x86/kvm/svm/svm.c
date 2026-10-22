@@ -5598,6 +5598,11 @@ struct kvm_x86_ops svm_x86_ops __initdata = {
 	.vm_luo_unpreserve = sev_vm_luo_unpreserve,
 	.vm_luo_retrieve = sev_vm_luo_retrieve,
 	.vm_luo_finish = sev_vm_luo_finish,
+	.vcpu_luo_preserve = sev_vcpu_luo_preserve,
+	.vcpu_luo_freeze = sev_vcpu_luo_freeze,
+	.vcpu_luo_unpreserve = sev_vcpu_luo_unpreserve,
+	.vcpu_luo_retrieve = sev_vcpu_luo_retrieve,
+	.vcpu_luo_finish = sev_vcpu_luo_finish,
 #endif
 #endif
 	.check_emulate_instruction = svm_check_emulate_instruction,

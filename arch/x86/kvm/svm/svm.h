@@ -279,6 +279,8 @@ struct vcpu_sev_es_state {
 	gpa_t snp_guest_vmsa_gpa;
 	bool snp_ap_waiting_for_reset;
 	bool snp_has_guest_vmsa;
+	bool luo_preserved;
+	bool luo_vmsa_preserved;
 };
 
 struct vcpu_svm {
@@ -1041,6 +1043,16 @@ int sev_vm_luo_retrieve(struct kvm *kvm,
 			struct kvm_luo_vm_x86_state *state);
 void sev_vm_luo_finish(struct kvm_luo_vm_x86_state *state,
 		       bool retrieved);
+int sev_vcpu_luo_preserve(struct kvm_vcpu *vcpu,
+			  struct kvm_luo_vcpu_x86_state *state);
+int sev_vcpu_luo_freeze(struct kvm_vcpu *vcpu,
+			struct kvm_luo_vcpu_x86_state *state);
+void sev_vcpu_luo_unpreserve(struct kvm_vcpu *vcpu,
+			     struct kvm_luo_vcpu_x86_state *state);
+int sev_vcpu_luo_retrieve(struct kvm_vcpu *vcpu,
+			  struct kvm_luo_vcpu_x86_state *state);
+void sev_vcpu_luo_finish(struct kvm_luo_vcpu_x86_state *state,
+			 bool retrieved);
 #endif
 #else
 static inline struct page *snp_safe_alloc_page_node(int node, gfp_t gfp)

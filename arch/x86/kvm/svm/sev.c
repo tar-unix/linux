@@ -35,6 +35,7 @@
 
 #include "mmu.h"
 #include "x86.h"
+#include "lapic.h"
 #include "svm.h"
 #include "svm_ops.h"
 #include "cpuid.h"
@@ -3607,6 +3608,9 @@ void sev_free_vcpu(struct kvm_vcpu *vcpu)
 
 	svm = to_svm(vcpu);
 
+	if (!svm->sev_es.vmsa || svm->sev_es.luo_vmsa_preserved)
+		goto skip_vmsa_free;
+
 	/*
 	 * If it's an SNP guest, then the VMSA was marked in the RMP table as
 	 * a guest-owned page. Transition the page to hypervisor state before
@@ -4913,6 +4917,15 @@ static void sev_es_init_vmcb(struct vcpu_svm *svm, bool init_event)
 	svm_clr_intercept(svm, INTERCEPT_XSETBV);
 
 	/*
+	 * SEV-ES guests mandate LBR virtualization whenever the guest state is
+	 * protected.  It is normally enabled by LAUNCH_UPDATE_VMSA, but a vCPU
+	 * created on a VM retrieved across live update is protected from
+	 * creation (see sev_vcpu_create()) and never goes through that path.
+	 */
+	if (svm->vcpu.arch.guest_state_protected)
+		svm_enable_lbrv(&svm->vcpu);
+
+	/*
 	 * Set the GHCB MSR value as per the GHCB specification when emulating
 	 * vCPU RESET for an SEV-ES guest.
 	 */
@@ -4958,13 +4971,20 @@ int sev_vcpu_create(struct kvm_vcpu *vcpu)
 
 	/*
 	 * SEV-ES guests require a separate (from the VMCB) VMSA page used to
-	 * contain the encrypted register state of the guest.
+	 * contain the encrypted register state of the guest.  When retrieving
+	 * a preserved VM across live update, the preserved VMSA page will be
+	 * restored in sev_vcpu_luo_retrieve().
 	 */
-	vmsa_page = snp_safe_alloc_page();
-	if (!vmsa_page)
-		return -ENOMEM;
+	if (!to_kvm_sev_info(vcpu->kvm)->luo_retrieved) {
+		vmsa_page = snp_safe_alloc_page();
+		if (!vmsa_page)
+			return -ENOMEM;
 
-	svm->sev_es.vmsa = page_address(vmsa_page);
+		svm->sev_es.vmsa = page_address(vmsa_page);
+	} else {
+		fpstate_set_confidential(&vcpu->arch.guest_fpu);
+		vcpu->arch.guest_state_protected = true;
+	}
 	svm->sev_es.snp_pending_vmsa_gpa = INVALID_PAGE;
 	svm->sev_es.snp_guest_vmsa_gpa = INVALID_PAGE;
 
@@ -5523,6 +5543,12 @@ void sev_free_decrypted_vmsa(struct kvm_vcpu *vcpu, struct vmcb_save_area *vmsa)
 #define KVM_SNP_VM_LUO_VMSA_FEAT_SHIFT	17
 #define KVM_SNP_VM_LUO_VMSA_FEAT_MASK	GENMASK(30, 17)
 
+#define KVM_SNP_VCPU_LUO_F_VALID		BIT(0)
+#define KVM_SNP_VCPU_LUO_F_PROTECTED		BIT(1)
+#define KVM_SNP_VCPU_LUO_F_HAS_GUEST_VMSA	BIT(2)
+#define KVM_SNP_VCPU_LUO_F_AP_WAIT_RESET	BIT(3)
+#define KVM_SNP_VCPU_LUO_F_RECV_FIRST_SIPI	BIT(4)
+
 static bool sev_snp_flb_registered;
 
 int sev_luo_init(void)
@@ -5624,12 +5650,19 @@ int sev_vm_luo_freeze(struct kvm *kvm, struct kvm_luo_vm_x86_state *state)
 {
 	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
 	struct kvm_snp_vm_luo_state *s = &state->snp;
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
 
 	if (!sev_snp_guest(kvm))
 		return 0;
 
 	if (!sev->luo_preserved)
 		return -EINVAL;
+
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		if (!to_svm(vcpu)->sev_es.luo_preserved)
+			return -EINVAL;
+	}
 
 	WRITE_ONCE(kvm->arch.luo_frozen, true);
 	s->ap_jump_table = sev->ap_jump_table;
@@ -5849,6 +5882,288 @@ void sev_vm_luo_finish(struct kvm_luo_vm_x86_state *state,
 	snp_free_firmware_page(page_address(ctx_page));
 }
 
+int sev_vcpu_luo_preserve(struct kvm_vcpu *vcpu,
+			  struct kvm_luo_vcpu_x86_state *state)
+{
+	struct kvm_snp_vcpu_luo_state *s = &state->snp;
+	struct vcpu_svm *svm = to_svm(vcpu);
+	struct page *vmsa_page;
+	int ret;
+
+	if (vcpu->kvm->arch.vm_type == KVM_X86_DEFAULT_VM ||
+	    vcpu->kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM)
+		return 0;
+
+	if (!is_sev_snp_guest(vcpu) || !vcpu->arch.guest_state_protected)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Nested state is not preserved, and sev_vcpu_luo_retrieve() does not
+	 * allocate it, so a vCPU with EFER.SVME set cannot be carried over.
+	 */
+	if (vcpu->arch.efer & EFER_SVME)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&svm->sev_es.snp_vmsa_mutex);
+
+	if (vcpu->arch.complete_userspace_io ||
+	    svm->sev_es.psc.batch_size ||
+	    kvm_test_request(KVM_REQ_UPDATE_PROTECTED_GUEST_STATE, vcpu) ||
+	    (VALID_PAGE(svm->sev_es.snp_pending_vmsa_gpa) !=
+	     svm->sev_es.snp_ap_waiting_for_reset) ||
+	    svm->sev_es.ap_reset_hold_type == AP_RESET_HOLD_NAE_EVENT)
+		return -EBUSY;
+
+	if (!svm->sev_es.snp_has_guest_vmsa && !svm->sev_es.vmsa)
+		return -EINVAL;
+
+	if (svm->sev_es.vmsa) {
+		vmsa_page = virt_to_page(svm->sev_es.vmsa);
+		ret = kho_preserve_pages(vmsa_page, 1);
+		if (ret)
+			return ret;
+
+		s->vmsa_pfn = page_to_pfn(vmsa_page);
+		svm->sev_es.luo_vmsa_preserved = true;
+	} else {
+		s->vmsa_pfn = 0;
+	}
+
+	s->vmsa_pa = svm->vmcb->control.vmsa_pa;
+	s->ghcb_gpa = svm->vmcb->control.ghcb_gpa;
+	s->ghcb_registered_gpa = svm->sev_es.ghcb_registered_gpa;
+	s->snp_guest_vmsa_gpa = svm->sev_es.snp_guest_vmsa_gpa;
+	s->snp_pending_vmsa_gpa = svm->sev_es.snp_pending_vmsa_gpa;
+	s->sw_scratch = svm->sev_es.sw_scratch;
+	s->apic_base = vcpu->arch.apic_base;
+	s->cr0 = vcpu->arch.cr0;
+	s->cr4 = vcpu->arch.cr4;
+	s->efer = vcpu->arch.efer;
+	s->int_state = svm->vmcb->control.int_state;
+	s->ap_reset_hold_type = svm->sev_es.ap_reset_hold_type;
+	s->asid = to_kvm_sev_info(vcpu->kvm)->asid;
+	memcpy(s->valid_bitmap, svm->sev_es.valid_bitmap,
+	       sizeof(s->valid_bitmap));
+
+	s->flags = KVM_SNP_VCPU_LUO_F_VALID | KVM_SNP_VCPU_LUO_F_PROTECTED;
+	if (svm->sev_es.snp_has_guest_vmsa)
+		s->flags |= KVM_SNP_VCPU_LUO_F_HAS_GUEST_VMSA;
+	if (svm->sev_es.snp_ap_waiting_for_reset)
+		s->flags |= KVM_SNP_VCPU_LUO_F_AP_WAIT_RESET;
+	if (svm->sev_es.received_first_sipi)
+		s->flags |= KVM_SNP_VCPU_LUO_F_RECV_FIRST_SIPI;
+
+	svm->sev_es.luo_preserved = true;
+	return 0;
+}
+
+int sev_vcpu_luo_freeze(struct kvm_vcpu *vcpu,
+			struct kvm_luo_vcpu_x86_state *state)
+{
+	struct kvm_snp_vcpu_luo_state *s = &state->snp;
+	struct vcpu_svm *svm = to_svm(vcpu);
+	u32 ap_reset_hold_type;
+
+	if (!is_sev_snp_guest(vcpu))
+		return 0;
+
+	if (!to_kvm_sev_info(vcpu->kvm)->luo_preserved ||
+	    !svm->sev_es.luo_preserved)
+		return -EINVAL;
+
+	if (!vcpu->arch.guest_state_protected ||
+	    (vcpu->arch.efer & EFER_SVME))
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&svm->sev_es.snp_vmsa_mutex);
+
+	if (vcpu->arch.complete_userspace_io ||
+	    svm->sev_es.psc.batch_size ||
+	    kvm_test_request(KVM_REQ_UPDATE_PROTECTED_GUEST_STATE, vcpu) ||
+	    (VALID_PAGE(svm->sev_es.snp_pending_vmsa_gpa) !=
+	     svm->sev_es.snp_ap_waiting_for_reset) ||
+	    svm->sev_es.ap_reset_hold_type == AP_RESET_HOLD_NAE_EVENT)
+		return -EBUSY;
+
+	ap_reset_hold_type = svm->sev_es.ap_reset_hold_type;
+	scoped_guard(srcu, &vcpu->kvm->srcu) {
+		sev_es_unmap_ghcb(svm);
+	}
+	svm->sev_es.ap_reset_hold_type = ap_reset_hold_type;
+
+	s->vmsa_pa = svm->vmcb->control.vmsa_pa;
+	s->ghcb_gpa = svm->vmcb->control.ghcb_gpa;
+	s->ghcb_registered_gpa = svm->sev_es.ghcb_registered_gpa;
+	s->snp_guest_vmsa_gpa = svm->sev_es.snp_guest_vmsa_gpa;
+	s->snp_pending_vmsa_gpa = svm->sev_es.snp_pending_vmsa_gpa;
+	s->sw_scratch = svm->sev_es.sw_scratch;
+	s->apic_base = vcpu->arch.apic_base;
+	s->cr0 = vcpu->arch.cr0;
+	s->cr4 = vcpu->arch.cr4;
+	s->efer = vcpu->arch.efer;
+	s->int_state = svm->vmcb->control.int_state;
+	s->ap_reset_hold_type = ap_reset_hold_type;
+	s->asid = to_kvm_sev_info(vcpu->kvm)->asid;
+	memcpy(s->valid_bitmap, svm->sev_es.valid_bitmap,
+	       sizeof(s->valid_bitmap));
+
+	s->flags = KVM_SNP_VCPU_LUO_F_VALID | KVM_SNP_VCPU_LUO_F_PROTECTED;
+	if (svm->sev_es.snp_has_guest_vmsa)
+		s->flags |= KVM_SNP_VCPU_LUO_F_HAS_GUEST_VMSA;
+	if (svm->sev_es.snp_ap_waiting_for_reset)
+		s->flags |= KVM_SNP_VCPU_LUO_F_AP_WAIT_RESET;
+	if (svm->sev_es.received_first_sipi)
+		s->flags |= KVM_SNP_VCPU_LUO_F_RECV_FIRST_SIPI;
+
+	return 0;
+}
+
+void sev_vcpu_luo_unpreserve(struct kvm_vcpu *vcpu,
+			     struct kvm_luo_vcpu_x86_state *state)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
+
+	if (!is_sev_snp_guest(vcpu))
+		return;
+
+	guard(mutex)(&svm->sev_es.snp_vmsa_mutex);
+
+	if (svm->sev_es.luo_vmsa_preserved) {
+		if (svm->sev_es.vmsa)
+			kho_unpreserve_pages(virt_to_page(svm->sev_es.vmsa), 1);
+		svm->sev_es.luo_vmsa_preserved = false;
+	}
+	svm->sev_es.luo_preserved = false;
+}
+
+int sev_vcpu_luo_retrieve(struct kvm_vcpu *vcpu,
+			  struct kvm_luo_vcpu_x86_state *state)
+{
+	struct kvm_snp_vcpu_luo_state *s = &state->snp;
+	struct vcpu_svm *svm = to_svm(vcpu);
+	struct page *vmsa_page;
+	bool has_guest_vmsa;
+	u64 vmsa_pfn;
+
+	if (vcpu->kvm->arch.vm_type == KVM_X86_DEFAULT_VM ||
+	    vcpu->kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM) {
+		if (s->flags & KVM_SNP_VCPU_LUO_F_VALID)
+			return -EINVAL;
+		return 0;
+	}
+
+	if (!is_sev_snp_guest(vcpu))
+		return -EOPNOTSUPP;
+
+	if (!to_kvm_sev_info(vcpu->kvm)->luo_retrieved)
+		return -EINVAL;
+
+	if (!(s->flags & KVM_SNP_VCPU_LUO_F_VALID) ||
+	    !(s->flags & KVM_SNP_VCPU_LUO_F_PROTECTED) ||
+	    s->asid != to_kvm_sev_info(vcpu->kvm)->asid ||
+	    (s->efer & EFER_SVME))
+		return -EINVAL;
+
+	has_guest_vmsa = !!(s->flags & KVM_SNP_VCPU_LUO_F_HAS_GUEST_VMSA);
+	if (!has_guest_vmsa && !s->vmsa_pfn)
+		return -EINVAL;
+
+	if (lapic_in_kernel(vcpu)) {
+		vcpu->arch.apic->vapic_addr = 0;
+		if (kvm_apic_set_base(vcpu, s->apic_base, true))
+			return -EINVAL;
+	} else {
+		vcpu->arch.apic_base = s->apic_base;
+	}
+
+	guard(mutex)(&svm->sev_es.snp_vmsa_mutex);
+
+	if (s->vmsa_pfn) {
+		vmsa_pfn = s->vmsa_pfn;
+		s->vmsa_pfn = 0;
+		vmsa_page = kho_restore_pages(PFN_PHYS(vmsa_pfn), 1);
+		if (!vmsa_page)
+			return -ENOMEM;
+
+		svm->sev_es.vmsa = page_address(vmsa_page);
+	}
+
+	vcpu->arch.cr0 = s->cr0;
+	vcpu->arch.cr4 = s->cr4;
+	vcpu->arch.efer = s->efer;
+
+	svm->sev_es.snp_has_guest_vmsa = has_guest_vmsa;
+	svm->sev_es.snp_guest_vmsa_gpa = s->snp_guest_vmsa_gpa;
+	svm->sev_es.snp_pending_vmsa_gpa = s->snp_pending_vmsa_gpa;
+	svm->sev_es.ghcb_registered_gpa = s->ghcb_registered_gpa;
+	svm->sev_es.sw_scratch = s->sw_scratch;
+	svm->sev_es.ap_reset_hold_type = s->ap_reset_hold_type;
+	svm->sev_es.snp_ap_waiting_for_reset =
+		!!(s->flags & KVM_SNP_VCPU_LUO_F_AP_WAIT_RESET);
+	svm->sev_es.received_first_sipi =
+		!!(s->flags & KVM_SNP_VCPU_LUO_F_RECV_FIRST_SIPI);
+	memcpy(svm->sev_es.valid_bitmap, s->valid_bitmap,
+	       sizeof(s->valid_bitmap));
+	vcpu->arch.guest_state_protected = true;
+	svm_enable_lbrv(vcpu);
+
+	sev_init_vmcb(svm, false);
+	svm->vmcb->control.int_state = s->int_state;
+	set_ghcb_msr(svm, s->ghcb_gpa);
+
+	if (has_guest_vmsa) {
+		svm->vmcb->control.vmsa_pa = INVALID_PAGE;
+		kvm_make_request(KVM_REQ_VMSA_PAGE_RELOAD, vcpu);
+	} else {
+		svm->vmcb->control.vmsa_pa =
+			s->vmsa_pa ? s->vmsa_pa : __pa(svm->sev_es.vmsa);
+	}
+
+	vmcb_mark_all_dirty(svm->vmcb);
+	kvm_make_request(KVM_REQ_MMU_FREE_OBSOLETE_ROOTS, vcpu);
+
+	return 0;
+}
+
+void sev_vcpu_luo_finish(struct kvm_luo_vcpu_x86_state *state,
+			 bool retrieved)
+{
+	struct kvm_snp_vcpu_luo_state *s = &state->snp;
+	struct sev_data_snp_page_reclaim reclaim = {};
+	struct page *vmsa_page;
+	int fw_err = 0;
+	u64 vmsa_pfn;
+
+	if (retrieved)
+		return;
+
+	if (!(s->flags & KVM_SNP_VCPU_LUO_F_VALID) || !s->vmsa_pfn)
+		return;
+
+	vmsa_pfn = s->vmsa_pfn;
+	s->vmsa_pfn = 0;
+	vmsa_page = kho_restore_pages(PFN_PHYS(vmsa_pfn), 1);
+	if (!vmsa_page)
+		return;
+
+	if (s->flags & KVM_SNP_VCPU_LUO_F_PROTECTED) {
+		if (!sev_snp_enabled || !snp_luo_is_adopted()) {
+			snp_leak_pages(vmsa_pfn, 1);
+			return;
+		}
+		if (rmp_make_shared(vmsa_pfn, PG_LEVEL_4K)) {
+			reclaim.paddr = __sme_set(PFN_PHYS(vmsa_pfn));
+			if (sev_do_cmd(SEV_CMD_SNP_PAGE_RECLAIM, &reclaim, &fw_err) ||
+			    rmp_make_shared(vmsa_pfn, PG_LEVEL_4K)) {
+				snp_leak_pages(vmsa_pfn, 1);
+				return;
+			}
+		}
+		clflush_cache_range(page_address(vmsa_page), PAGE_SIZE);
+	}
+
+	__free_page(vmsa_page);
+}
 #else
 int sev_luo_init(void)
 {

@@ -546,6 +546,10 @@ static int kvm_x86_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 		ret = kvm_vcpu_ioctl_x86_get_xcrs(vcpu, &st->xcrs);
 		if (ret)
 			return ret;
+	} else {
+		st->sregs2.apic_base = vcpu->arch.apic_base;
+		if (vcpu->kvm->arch.vm_type == KVM_X86_SNP_VM)
+			kvm_vcpu_ioctl_x86_get_vcpu_events(vcpu, &st->events);
 	}
 
 	if (lapic_in_kernel(vcpu)) {
@@ -813,11 +817,14 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 			apic_set_reg(lapic->regs, APIC_TMICT, 0);
 		}
 
-		if (vcpu->kvm->arch.vm_type == KVM_X86_TDX_VM) {
-			u64 apic_base = APIC_DEFAULT_PHYS_BASE |
-					LAPIC_MODE_X2APIC |
-					(kvm_vcpu_is_reset_bsp(vcpu) ?
-					 MSR_IA32_APICBASE_BSP : 0);
+		if (vcpu->kvm->arch.vm_type == KVM_X86_TDX_VM ||
+		    vcpu->kvm->arch.vm_type == KVM_X86_SNP_VM) {
+			u64 apic_base = vcpu->kvm->arch.vm_type == KVM_X86_SNP_VM ?
+					st->sregs2.apic_base :
+					(APIC_DEFAULT_PHYS_BASE |
+					 LAPIC_MODE_X2APIC |
+					 (kvm_vcpu_is_reset_bsp(vcpu) ?
+					  MSR_IA32_APICBASE_BSP : 0));
 
 			vcpu->arch.apic->vapic_addr = 0;
 			if (kvm_apic_set_base(vcpu, apic_base, true)) {
@@ -919,6 +926,13 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 		ret = kvm_x86_ops.vcpu_luo_retrieve(vcpu, st);
 		if (ret)
 			goto out_free;
+		if (vcpu->kvm->arch.vm_type == KVM_X86_SNP_VM) {
+			vcpu->arch.cpuid_dynamic_bits_dirty = true;
+			events = st->events;
+			ret = kvm_vcpu_ioctl_x86_set_vcpu_events(vcpu, &events);
+			if (ret)
+				goto out_free;
+		}
 	}
 
 	kvm_mmu_reset_context(vcpu);

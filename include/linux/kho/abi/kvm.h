@@ -537,6 +537,46 @@ struct kvm_snp_vm_luo_state {
 
 static_assert(sizeof(struct kvm_snp_vm_luo_state) == 32);
 
+/**
+ * struct kvm_snp_vcpu_luo_state - Per-SNP vCPU state embedded in kvm_luo_vcpu_x86_state.
+ * @vmsa_pfn:             PFN of KVM-allocated VMSA page.
+ * @vmsa_pa:              Active VMCB control.vmsa_pa physical address.
+ * @ghcb_gpa:             Current VMCB control.ghcb_gpa.
+ * @ghcb_registered_gpa:  Registered GHCB GPA.
+ * @snp_guest_vmsa_gpa:   AP guest_memfd VMSA GPA.
+ * @snp_pending_vmsa_gpa: Pending AP VMSA GPA from AP Creation NAE.
+ * @sw_scratch:           Saved GHCB software scratch field.
+ * @apic_base:            Host-tracked vcpu->arch.apic_base value.
+ * @cr0:                  Host-tracked vcpu->arch.cr0 value.
+ * @cr4:                  Host-tracked vcpu->arch.cr4 value.
+ * @efer:                 Host-tracked vcpu->arch.efer value.
+ * @flags:                Preserved SNP vCPU flags.
+ * @ap_reset_hold_type:   AP reset hold protocol state.
+ * @int_state:            VMCB control.int_state interrupt shadow bits.
+ * @asid:                 Owning SEV-SNP guest ASID.
+ * @valid_bitmap:         Preserved GHCB valid_bitmap.
+ */
+struct kvm_snp_vcpu_luo_state {
+	u64 vmsa_pfn;
+	u64 vmsa_pa;
+	u64 ghcb_gpa;
+	u64 ghcb_registered_gpa;
+	u64 snp_guest_vmsa_gpa;
+	u64 snp_pending_vmsa_gpa;
+	u64 sw_scratch;
+	u64 apic_base;
+	u64 cr0;
+	u64 cr4;
+	u64 efer;
+	u32 flags;
+	u32 ap_reset_hold_type;
+	u32 int_state;
+	u32 asid;
+	u8 valid_bitmap[16];
+};
+
+static_assert(sizeof(struct kvm_snp_vcpu_luo_state) == 120);
+
 #define KVM_LUO_X86_MAX_CPUID_ENTRIES	256
 #define KVM_LUO_X86_MAX_MSR_ENTRIES	512
 #define KVM_LUO_X86_MAX_IRQ_ROUTES	1024
@@ -655,6 +695,7 @@ static_assert(sizeof(struct kvm_luo_vm_x86_state) == 51136);
  * @cpuid_entries:         Preserved guest CPUID table.
  * @msrs:                  Preserved guest MSRs.
  * @tdx:                   Per-TD vCPU state for %KVM_VCPU_LUO_FEAT_TDX.
+ * @snp:                   Per-SNP vCPU state for %KVM_VCPU_LUO_FEAT_SEV_SNP.
  */
 struct kvm_luo_vcpu_x86_state {
 	u32 version;
@@ -685,9 +726,10 @@ struct kvm_luo_vcpu_x86_state {
 	struct kvm_cpuid_entry2 cpuid_entries[KVM_LUO_X86_MAX_CPUID_ENTRIES];
 	struct kvm_msr_entry msrs[KVM_LUO_X86_MAX_MSR_ENTRIES];
 	struct kvm_tdx_vcpu_luo_state tdx;
+	struct kvm_snp_vcpu_luo_state snp;
 };
 
-static_assert(sizeof(struct kvm_luo_vcpu_x86_state) == 24960);
+static_assert(sizeof(struct kvm_luo_vcpu_x86_state) == 25080);
 
 #endif /* CONFIG_X86 */
 
