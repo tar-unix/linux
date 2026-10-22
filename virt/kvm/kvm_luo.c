@@ -30,11 +30,12 @@
  *
  * In addition to the VM type, architecture-specific VM state (such as
  * in-kernel interrupt controller state, timers, and GSI routing) is carried
- * over. vCPUs are preserved separately via the "kvm-vcpu" file handler and
- * retrieved against the restored VM file descriptor using struct
- * kvm_vcpu_luo_retrieve. Guest memory is preserved separately by preserving
- * the files that back it, and the VMM re-attaches memory slots after
- * retrieval.
+ * over. Each VM and vCPU records its kind feature (non-CoCo or
+ * software-protected private memory) in its feature header. vCPUs are
+ * preserved separately via the "kvm-vcpu" file handler and retrieved against
+ * the restored VM file descriptor using struct kvm_vcpu_luo_retrieve. Guest
+ * memory is preserved separately by preserving the files that back it, and the
+ * VMM re-attaches memory slots after retrieval.
  *
  * The file handlers are available once KVM is loaded, on x86 together with
  * kvm-intel or kvm-amd. In the new kernel, these modules must be loaded before
@@ -60,10 +61,12 @@
 static const u8 kvm_vm_luo_features[KVM_VM_LUO_FEAT_MAX] = {
 	[KVM_VM_LUO_FEAT_CORE]		= LUO_FEAT_REQUIRED,
 	[KVM_VM_LUO_FEAT_NON_COCO]	= LUO_FEAT_OPTIONAL,
+	[KVM_VM_LUO_FEAT_SW_PROTECTED]	= LUO_FEAT_OPTIONAL,
 };
 
 static const unsigned int kvm_vm_luo_kinds[] = {
 	KVM_VM_LUO_FEAT_NON_COCO,
+	KVM_VM_LUO_FEAT_SW_PROTECTED,
 };
 
 static atomic_t kvm_vm_luo_nr_retrieved = ATOMIC_INIT(0);
@@ -315,12 +318,14 @@ static struct liveupdate_file_handler kvm_vm_luo_handler = {
 };
 
 static const u8 kvm_vcpu_luo_features[KVM_VCPU_LUO_FEAT_MAX] = {
-	[KVM_VCPU_LUO_FEAT_CORE]	= LUO_FEAT_REQUIRED,
-	[KVM_VCPU_LUO_FEAT_NON_COCO]	= LUO_FEAT_OPTIONAL,
+	[KVM_VCPU_LUO_FEAT_CORE]		= LUO_FEAT_REQUIRED,
+	[KVM_VCPU_LUO_FEAT_NON_COCO]		= LUO_FEAT_OPTIONAL,
+	[KVM_VCPU_LUO_FEAT_SW_PROTECTED]	= LUO_FEAT_OPTIONAL,
 };
 
 static const unsigned int kvm_vcpu_luo_kinds[] = {
 	KVM_VCPU_LUO_FEAT_NON_COCO,
+	KVM_VCPU_LUO_FEAT_SW_PROTECTED,
 };
 
 int __weak kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
@@ -401,8 +406,11 @@ static int kvm_vcpu_luo_preserve(struct liveupdate_file_op_args *args)
 
 	scoped_guard(mutex, &kvm->lock) {
 		vm_kind = kvm_arch_luo_vm_kind(kvm, &type);
-		if (vm_kind != KVM_VM_LUO_FEAT_NON_COCO)
-			return vm_kind < 0 ? vm_kind : -EOPNOTSUPP;
+		if (vm_kind < 0)
+			return vm_kind;
+		if (WARN_ON_ONCE(vm_kind <= KVM_VCPU_LUO_FEAT_CORE ||
+				 vm_kind >= KVM_VCPU_LUO_FEAT_MAX))
+			return -EINVAL;
 		if (!mutex_trylock(&vcpu->mutex))
 			return -EBUSY;
 	}
@@ -422,7 +430,7 @@ static int kvm_vcpu_luo_preserve(struct liveupdate_file_op_args *args)
 		return r;
 	}
 
-	features[KVM_VCPU_LUO_FEAT_NON_COCO] = LUO_FEAT_REQUIRED;
+	features[vm_kind] = LUO_FEAT_REQUIRED;
 	luo_feature_hdr_init(&state->features, sizeof(*state), features);
 	state->vcpu_id = vcpu->vcpu_id;
 	state->reserved = 0;
@@ -444,7 +452,7 @@ static int kvm_vcpu_luo_freeze(struct liveupdate_file_op_args *args)
 
 	scoped_guard(mutex, &kvm->lock) {
 		vm_kind = kvm_arch_luo_vm_kind(kvm, &type);
-		if (vm_kind != KVM_VM_LUO_FEAT_NON_COCO)
+		if (vm_kind < 0 || !luo_feature_is_req(&state->features, vm_kind))
 			return -EOPNOTSUPP;
 		if (!mutex_trylock(&vcpu->mutex))
 			return -EBUSY;
@@ -536,7 +544,7 @@ static int kvm_vcpu_luo_retrieve(struct liveupdate_file_op_args *args)
 
 	scoped_guard(mutex, &kvm->lock)
 		vm_kind = kvm_arch_luo_vm_kind(kvm, &type);
-	if (vm_kind != KVM_VM_LUO_FEAT_NON_COCO)
+	if (vm_kind != kind)
 		return -EINVAL;
 
 	file = kvm_create_vcpu_file(kvm, state->vcpu_id);

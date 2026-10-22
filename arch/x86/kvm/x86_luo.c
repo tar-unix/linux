@@ -27,7 +27,10 @@
 
 static int kvm_x86_luo_check_vm_supported(struct kvm *kvm)
 {
-	if (kvm_arch_has_private_mem(kvm) || kvm->arch.has_protected_state)
+	if (kvm->arch.has_protected_state && !kvm_x86_ops.vm_luo_preserve)
+		return -EOPNOTSUPP;
+	if (kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM &&
+	    !kvm_arch_supports_gmem_init_shared(kvm))
 		return -EOPNOTSUPP;
 	if ((kvm->arch.disabled_exits & ~KVM_X86_DISABLE_EXITS_PAUSE) ||
 	    kvm->arch.user_space_msr_mask ||
@@ -219,24 +222,62 @@ int kvm_arch_luo_vm_preserve(struct kvm *kvm, u64 *arch_state_pa)
 		return ret;
 	}
 
+	if (kvm->arch.has_protected_state) {
+		u64 retrieved = kvm->arch.luo_gmem_vm_id &
+				KVM_X86_LUO_GMEM_RETRIEVED;
+
+		ret = kvm_x86_ops.vm_luo_preserve(kvm, st);
+		if (ret) {
+			kho_unpreserve_free(st);
+			return ret;
+		}
+		kvm->arch.luo_gmem_vm_id |= KVM_X86_LUO_GMEM_PRESERVED |
+					    retrieved;
+	}
+
 	*arch_state_pa = __pa(st);
 	return 0;
 }
 
 int kvm_arch_luo_vm_freeze(struct kvm *kvm, u64 arch_state_pa)
 {
+	struct kvm_luo_vm_x86_state *st;
+	int ret;
+
 	if (!arch_state_pa)
 		return 0;
 
-	return kvm_x86_luo_save_vm_state(kvm, __va(arch_state_pa));
+	st = __va(arch_state_pa);
+	ret = kvm_x86_luo_save_vm_state(kvm, st);
+	if (ret)
+		return ret;
+
+	if (kvm->arch.has_protected_state && kvm_x86_ops.vm_luo_freeze)
+		return kvm_x86_ops.vm_luo_freeze(kvm, st);
+
+	return 0;
+}
+
+void kvm_arch_luo_vm_unfreeze(struct kvm *kvm, u64 arch_state_pa)
+{
+	WRITE_ONCE(kvm->arch.luo_frozen, false);
 }
 
 void kvm_arch_luo_vm_unpreserve(struct kvm *kvm, u64 arch_state_pa)
 {
+	struct kvm_luo_vm_x86_state *st;
+
+	WRITE_ONCE(kvm->arch.luo_frozen, false);
+	kvm->arch.luo_gmem_vm_id &= ~KVM_X86_LUO_GMEM_PRESERVED;
+
 	if (!arch_state_pa)
 		return;
 
-	kho_unpreserve_free(__va(arch_state_pa));
+	st = __va(arch_state_pa);
+	if (kvm->arch.has_protected_state && kvm_x86_ops.vm_luo_unpreserve)
+		kvm_x86_ops.vm_luo_unpreserve(kvm, st);
+
+	kho_unpreserve_free(st);
 }
 
 int kvm_arch_luo_vm_retrieve(struct kvm *kvm, u64 arch_state_pa)
@@ -407,15 +448,59 @@ int kvm_arch_luo_vm_retrieve(struct kvm *kvm, u64 arch_state_pa)
 
 	kvm_luo_restore_clock(kvm, st->clock_ns, st->clock_realtime_ns);
 
+	if (kvm->arch.has_protected_state) {
+		if (!kvm_x86_ops.vm_luo_retrieve)
+			return -EOPNOTSUPP;
+		ret = kvm_x86_ops.vm_luo_retrieve(kvm, st);
+		if (ret)
+			return ret;
+		kvm->arch.luo_gmem_vm_id |= KVM_X86_LUO_GMEM_RETRIEVED;
+	}
+
 	return 0;
 }
 
 void kvm_arch_luo_vm_finish(struct kvm *kvm, u64 arch_state_pa)
 {
+	struct kvm_luo_vm_x86_state *st;
+
 	if (!arch_state_pa)
 		return;
 
-	kho_restore_free(__va(arch_state_pa));
+	st = __va(arch_state_pa);
+	if (kvm_x86_ops.vm_luo_finish &&
+	    (!kvm || kvm->arch.has_protected_state))
+		kvm_x86_ops.vm_luo_finish(st, !!kvm);
+
+	kho_restore_free(st);
+}
+
+int kvm_arch_gmem_luo_get_vm_id(struct kvm *kvm, u64 *vm_id)
+{
+	if (kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM &&
+	    !kvm_x86_call(vm_has_encrypted_memory)(kvm) &&
+	    kvm_arch_supports_gmem_init_shared(kvm)) {
+		*vm_id = KVM_VM_LUO_FEAT_SW_PROTECTED;
+		return 0;
+	}
+	if (kvm->arch.luo_gmem_vm_id & KVM_X86_LUO_GMEM_PRESERVED) {
+		*vm_id = kvm->arch.luo_gmem_vm_id & ~KVM_X86_LUO_GMEM_TAG_MASK;
+		return 0;
+	}
+	return -EOPNOTSUPP;
+}
+
+bool kvm_arch_gmem_luo_validate_vm_id(struct kvm *kvm, u64 vm_id)
+{
+	if (kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM &&
+	    !kvm_x86_call(vm_has_encrypted_memory)(kvm) &&
+	    kvm_arch_supports_gmem_init_shared(kvm))
+		return vm_id == KVM_VM_LUO_FEAT_SW_PROTECTED;
+
+	if (!(kvm->arch.luo_gmem_vm_id & KVM_X86_LUO_GMEM_RETRIEVED))
+		return false;
+
+	return (kvm->arch.luo_gmem_vm_id & ~KVM_X86_LUO_GMEM_TAG_MASK) == vm_id;
 }
 
 static int kvm_x86_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
@@ -423,10 +508,15 @@ static int kvm_x86_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 {
 	struct kvm_mp_state mp_state = {};
 	bool clear_interrupt_shadow = false;
+	u32 preserve_flags;
 	int ret;
 
+	preserve_flags = st->flags & KVM_LUO_X86_VCPU_FLAG_VENDOR_PRESERVED;
 	memset(st, 0, sizeof(*st));
 	st->version = KVM_LUO_X86_VCPU_STATE_VERSION;
+	st->flags = preserve_flags;
+	if (vcpu->arch.guest_state_protected)
+		st->flags |= KVM_LUO_X86_VCPU_FLAG_PROTECTED;
 
 	ret = kvm_vcpu_ioctl_x86_get_mpstate(vcpu, &mp_state);
 	if (ret)
@@ -436,25 +526,27 @@ static int kvm_x86_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 	st->l1_tsc_offset = vcpu->arch.l1_tsc_offset;
 	st->mcg_cap = vcpu->arch.mcg_cap;
 
-	kvm_get_regs(vcpu, &st->regs);
-	kvm_vcpu_ioctl_x86_get_sregs2(vcpu, &st->sregs2);
-	kvm_vcpu_ioctl_x86_get_vcpu_events(vcpu, &st->events);
-	kvm_vcpu_ioctl_x86_get_debugregs(vcpu, &st->debugregs);
+	if (!vcpu->arch.guest_state_protected) {
+		kvm_get_regs(vcpu, &st->regs);
+		kvm_vcpu_ioctl_x86_get_sregs2(vcpu, &st->sregs2);
+		kvm_vcpu_ioctl_x86_get_vcpu_events(vcpu, &st->events);
+		kvm_vcpu_ioctl_x86_get_debugregs(vcpu, &st->debugregs);
 
-	ret = kvm_luo_apply_userspace_io(vcpu, &st->regs,
-					 &clear_interrupt_shadow);
-	if (ret)
-		return ret;
-	if (clear_interrupt_shadow)
-		st->events.interrupt.shadow = 0;
+		ret = kvm_luo_apply_userspace_io(vcpu, &st->regs,
+						 &clear_interrupt_shadow);
+		if (ret)
+			return ret;
+		if (clear_interrupt_shadow)
+			st->events.interrupt.shadow = 0;
 
-	ret = kvm_vcpu_ioctl_x86_get_xsave(vcpu, &st->xsave);
-	if (ret)
-		return ret;
+		ret = kvm_vcpu_ioctl_x86_get_xsave(vcpu, &st->xsave);
+		if (ret)
+			return ret;
 
-	ret = kvm_vcpu_ioctl_x86_get_xcrs(vcpu, &st->xcrs);
-	if (ret)
-		return ret;
+		ret = kvm_vcpu_ioctl_x86_get_xcrs(vcpu, &st->xcrs);
+		if (ret)
+			return ret;
+	}
 
 	if (lapic_in_kernel(vcpu)) {
 		struct kvm_lapic *apic = vcpu->arch.apic;
@@ -478,11 +570,13 @@ static int kvm_x86_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 	if (ret)
 		return ret;
 
-	ret = kvm_luo_save_msrs(vcpu, st->msrs,
-				KVM_LUO_X86_MAX_MSR_ENTRIES,
-				&st->nr_msrs);
-	if (ret)
-		return ret;
+	if (!vcpu->arch.guest_state_protected) {
+		ret = kvm_luo_save_msrs(vcpu, st->msrs,
+					KVM_LUO_X86_MAX_MSR_ENTRIES,
+					&st->nr_msrs);
+		if (ret)
+			return ret;
+	}
 
 	st->pv_time_msr = vcpu->arch.time;
 	if (vcpu->arch.pv_time.active)
@@ -512,11 +606,20 @@ static int kvm_x86_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
 {
 	struct kvm_luo_vcpu_x86_state *st;
+	int ret;
 
-	if (vcpu->arch.guest_state_protected ||
-	    is_guest_mode(vcpu) || vcpu->arch.nested_run_pending ||
-	    kvm_is_cr4_bit_set(vcpu, X86_CR4_VMXE) ||
-	    (vcpu->arch.efer & EFER_SVME) ||
+	if (!!vcpu->arch.guest_state_protected !=
+	    !!vcpu->kvm->arch.has_protected_state)
+		return -EOPNOTSUPP;
+	if (vcpu->arch.guest_state_protected && !kvm_x86_ops.vcpu_luo_preserve)
+		return -EOPNOTSUPP;
+	if (is_guest_mode(vcpu) || vcpu->arch.nested_run_pending)
+		return -EOPNOTSUPP;
+	if (!vcpu->arch.guest_state_protected &&
+	    (kvm_is_cr4_bit_set(vcpu, X86_CR4_VMXE) ||
+	     (vcpu->arch.efer & EFER_SVME)))
+		return -EOPNOTSUPP;
+	if (!vcpu->arch.guest_state_protected &&
 	    vcpu->arch.guest_fpu.uabi_size > sizeof(struct kvm_xsave))
 		return -EOPNOTSUPP;
 	if (vcpu->arch.cpuid_nent > KVM_LUO_X86_MAX_CPUID_ENTRIES)
@@ -525,7 +628,7 @@ int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
 	if (is_smm(vcpu))
 		return -EOPNOTSUPP;
 #endif
-	if (is_pae_paging(vcpu) &&
+	if (!vcpu->arch.guest_state_protected && is_pae_paging(vcpu) &&
 	    !kvm_register_is_available(vcpu, VCPU_REG_PDPTR)) {
 		if (current->mm != vcpu->kvm->mm)
 			return -EOPNOTSUPP;
@@ -540,6 +643,15 @@ int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
 
 	memset(st, 0, sizeof(*st));
 	st->version = KVM_LUO_X86_VCPU_STATE_VERSION;
+	if (vcpu->arch.guest_state_protected) {
+		st->flags |= KVM_LUO_X86_VCPU_FLAG_PROTECTED;
+		ret = kvm_x86_ops.vcpu_luo_preserve(vcpu, st);
+		if (ret) {
+			kho_unpreserve_free(st);
+			return ret;
+		}
+		st->flags |= KVM_LUO_X86_VCPU_FLAG_VENDOR_PRESERVED;
+	}
 
 	*arch_state_pa = __pa(st);
 	return 0;
@@ -547,51 +659,75 @@ int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
 
 int kvm_arch_luo_vcpu_freeze(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
+	struct kvm_luo_vcpu_x86_state *st;
+	int ret;
+
 	if (!arch_state_pa)
 		return 0;
-	if (vcpu->arch.guest_state_protected ||
+	st = __va(arch_state_pa);
+	if (!!vcpu->arch.guest_state_protected !=
+	    !!vcpu->kvm->arch.has_protected_state ||
+	    !!vcpu->arch.guest_state_protected !=
+	    !!(st->flags & KVM_LUO_X86_VCPU_FLAG_PROTECTED))
+		return -EOPNOTSUPP;
+	if (is_guest_mode(vcpu) || vcpu->arch.nested_run_pending)
+		return -EBUSY;
+	if (!vcpu->arch.guest_state_protected &&
+	    (kvm_is_cr4_bit_set(vcpu, X86_CR4_VMXE) ||
+	     (vcpu->arch.efer & EFER_SVME)))
+		return -EBUSY;
+	if (!vcpu->arch.guest_state_protected &&
 	    vcpu->arch.guest_fpu.uabi_size > sizeof(struct kvm_xsave))
 		return -EOPNOTSUPP;
-	if (is_guest_mode(vcpu) || vcpu->arch.nested_run_pending ||
-	    kvm_is_cr4_bit_set(vcpu, X86_CR4_VMXE) ||
-	    (vcpu->arch.efer & EFER_SVME))
-		return -EBUSY;
 #ifdef CONFIG_KVM_SMM
 	if (is_smm(vcpu))
 		return -EBUSY;
 #endif
-	if (is_pae_paging(vcpu) &&
+	if (!vcpu->arch.guest_state_protected && is_pae_paging(vcpu) &&
 	    !kvm_register_is_available(vcpu, VCPU_REG_PDPTR) &&
 	    current->mm != vcpu->kvm->mm)
 		return -EBUSY;
 
-	return kvm_x86_luo_save_vcpu_state(vcpu, __va(arch_state_pa));
+	ret = kvm_x86_luo_save_vcpu_state(vcpu, st);
+	if (ret)
+		return ret;
+
+	if (vcpu->arch.guest_state_protected && kvm_x86_ops.vcpu_luo_freeze)
+		return kvm_x86_ops.vcpu_luo_freeze(vcpu, st);
+
+	return 0;
 }
 
 void kvm_arch_luo_vcpu_unpreserve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
+	struct kvm_luo_vcpu_x86_state *st;
+
 	if (!arch_state_pa)
 		return;
 
-	kho_unpreserve_free(__va(arch_state_pa));
+	st = __va(arch_state_pa);
+	if ((st->flags & KVM_LUO_X86_VCPU_FLAG_VENDOR_PRESERVED) &&
+	    kvm_x86_ops.vcpu_luo_unpreserve)
+		kvm_x86_ops.vcpu_luo_unpreserve(vcpu, st);
+
+	kho_unpreserve_free(st);
 }
 
 int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
-	const struct kvm_luo_vcpu_x86_state *st;
+	struct kvm_luo_vcpu_x86_state *st;
 	struct kvm_mp_state mp_state = {};
 	struct kvm_vcpu_events events;
 	struct kvm_debugregs dbgregs;
 	struct kvm_sregs2 sregs2;
-	struct kvm_xsave *xsave;
+	struct kvm_xsave *xsave = NULL;
 	struct kvm_xcrs xcrs;
 	struct kvm_regs regs;
+	bool is_protected;
 	int ret;
 
 	if (!arch_state_pa)
 		return -EINVAL;
-	if (vcpu->arch.guest_state_protected)
-		return -EOPNOTSUPP;
 
 	st = __va(arch_state_pa);
 	if (st->version != KVM_LUO_X86_VCPU_STATE_VERSION ||
@@ -599,9 +735,15 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 	    st->nr_msrs > KVM_LUO_X86_MAX_MSR_ENTRIES)
 		return -EINVAL;
 
-	xsave = kmalloc_obj(*xsave, GFP_KERNEL_ACCOUNT);
-	if (!xsave)
-		return -ENOMEM;
+	is_protected = !!(st->flags & KVM_LUO_X86_VCPU_FLAG_PROTECTED);
+	if (is_protected != !!vcpu->kvm->arch.has_protected_state)
+		return -EINVAL;
+
+	if (!is_protected) {
+		xsave = kmalloc_obj(*xsave, GFP_KERNEL_ACCOUNT);
+		if (!xsave)
+			return -ENOMEM;
+	}
 
 	/* 1. Restore CPUID and MCE cap first so guest capabilities are set. */
 	ret = kvm_luo_set_cpuid(vcpu, st->cpuid_entries, st->cpuid_nent);
@@ -623,27 +765,29 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 		}
 	}
 
-	/* 3. Restore SREGS2 before XCRs so CR4.OSXSAVE is active. */
-	sregs2 = st->sregs2;
-	ret = kvm_vcpu_ioctl_x86_set_sregs2(vcpu, &sregs2);
-	if (ret)
-		goto out_free;
+	if (!is_protected) {
+		/* 3. Restore SREGS2 before XCRs so CR4.OSXSAVE is active. */
+		sregs2 = st->sregs2;
+		ret = kvm_vcpu_ioctl_x86_set_sregs2(vcpu, &sregs2);
+		if (ret)
+			goto out_free;
 
-	/* 4. Restore XCRs and XSAVE/FPU state. */
-	xcrs = st->xcrs;
-	if (xcrs.nr_xcrs) {
-		ret = kvm_vcpu_ioctl_x86_set_xcrs(vcpu, &xcrs);
+		/* 4. Restore XCRs and XSAVE/FPU state. */
+		xcrs = st->xcrs;
+		if (xcrs.nr_xcrs) {
+			ret = kvm_vcpu_ioctl_x86_set_xcrs(vcpu, &xcrs);
+			if (ret)
+				goto out_free;
+		}
+		if (vcpu->arch.guest_fpu.uabi_size > sizeof(struct kvm_xsave)) {
+			ret = -E2BIG;
+			goto out_free;
+		}
+		*xsave = st->xsave;
+		ret = kvm_vcpu_ioctl_x86_set_xsave(vcpu, xsave);
 		if (ret)
 			goto out_free;
 	}
-	if (vcpu->arch.guest_fpu.uabi_size > sizeof(struct kvm_xsave)) {
-		ret = -E2BIG;
-		goto out_free;
-	}
-	*xsave = st->xsave;
-	ret = kvm_vcpu_ioctl_x86_set_xsave(vcpu, xsave);
-	if (ret)
-		goto out_free;
 
 	/* 5. Restore L1 TSC offset without resynchronizing. */
 	kvm_luo_restore_tsc(vcpu, st->l1_tsc_offset);
@@ -677,9 +821,11 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 	}
 
 	/* 7. Restore MSRs and TSC-deadline timer. */
-	ret = kvm_luo_restore_msrs(vcpu, st->msrs, st->nr_msrs);
-	if (ret)
-		goto out_free;
+	if (!is_protected) {
+		ret = kvm_luo_restore_msrs(vcpu, st->msrs, st->nr_msrs);
+		if (ret)
+			goto out_free;
+	}
 
 	if ((st->flags & KVM_LUO_X86_VCPU_FLAG_HAS_LAPIC) &&
 	    lapic_in_kernel(vcpu))
@@ -730,23 +876,35 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 	}
 
 	/* 9. Restore debug registers, GPRs, MP state, and vCPU events. */
-	dbgregs = st->debugregs;
-	ret = kvm_vcpu_ioctl_x86_set_debugregs(vcpu, &dbgregs);
-	if (ret)
-		goto out_free;
+	if (!is_protected) {
+		dbgregs = st->debugregs;
+		ret = kvm_vcpu_ioctl_x86_set_debugregs(vcpu, &dbgregs);
+		if (ret)
+			goto out_free;
 
-	regs = st->regs;
-	kvm_set_regs(vcpu, &regs);
+		regs = st->regs;
+		kvm_set_regs(vcpu, &regs);
+	}
 
 	mp_state.mp_state = st->mp_state;
 	ret = kvm_vcpu_ioctl_x86_set_mpstate(vcpu, &mp_state);
 	if (ret)
 		goto out_free;
 
-	events = st->events;
-	ret = kvm_vcpu_ioctl_x86_set_vcpu_events(vcpu, &events);
-	if (ret)
-		goto out_free;
+	if (!is_protected) {
+		events = st->events;
+		ret = kvm_vcpu_ioctl_x86_set_vcpu_events(vcpu, &events);
+		if (ret)
+			goto out_free;
+	} else {
+		if (!kvm_x86_ops.vcpu_luo_retrieve) {
+			ret = -EOPNOTSUPP;
+			goto out_free;
+		}
+		ret = kvm_x86_ops.vcpu_luo_retrieve(vcpu, st);
+		if (ret)
+			goto out_free;
+	}
 
 	kvm_mmu_reset_context(vcpu);
 	kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
@@ -760,8 +918,15 @@ out_free:
 
 void kvm_arch_luo_vcpu_finish(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
+	struct kvm_luo_vcpu_x86_state *st;
+
 	if (!arch_state_pa)
 		return;
 
-	kho_restore_free(__va(arch_state_pa));
+	st = __va(arch_state_pa);
+	if (kvm_x86_ops.vcpu_luo_finish &&
+	    (st->flags & KVM_LUO_X86_VCPU_FLAG_VENDOR_PRESERVED))
+		kvm_x86_ops.vcpu_luo_finish(st, !!vcpu);
+
+	kho_restore_free(st);
 }

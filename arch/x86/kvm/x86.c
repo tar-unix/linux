@@ -10028,18 +10028,25 @@ void kvm_arch_free_vm(struct kvm *kvm)
 #ifdef CONFIG_LIVEUPDATE
 int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type)
 {
-	/*
-	 * Only VMs without private memory and protected state can be
-	 * preserved for now. Of the VM types, that is only the default VM,
-	 * but KVM_SEV_INIT and KVM_SEV_ES_INIT turn a default VM into an SEV
-	 * or SEV-ES guest without changing its type.
-	 */
-	if (kvm->arch.vm_type != KVM_X86_DEFAULT_VM ||
-	    kvm_x86_call(vm_has_encrypted_memory)(kvm))
+	switch (kvm->arch.vm_type) {
+	case KVM_X86_DEFAULT_VM:
+		/*
+		 * KVM_SEV_INIT and KVM_SEV_ES_INIT turn a default VM into an
+		 * SEV or SEV-ES guest without changing its type.
+		 */
+		if (kvm_x86_call(vm_has_encrypted_memory)(kvm))
+			return -EOPNOTSUPP;
+		*type = KVM_X86_DEFAULT_VM;
+		return KVM_VM_LUO_FEAT_NON_COCO;
+	case KVM_X86_SW_PROTECTED_VM:
+		if (kvm_x86_call(vm_has_encrypted_memory)(kvm) ||
+		    !kvm_arch_supports_gmem_init_shared(kvm))
+			return -EOPNOTSUPP;
+		*type = KVM_X86_SW_PROTECTED_VM;
+		return KVM_VM_LUO_FEAT_SW_PROTECTED;
+	default:
 		return -EOPNOTSUPP;
-
-	*type = KVM_X86_DEFAULT_VM;
-	return KVM_VM_LUO_FEAT_NON_COCO;
+	}
 }
 #endif
 

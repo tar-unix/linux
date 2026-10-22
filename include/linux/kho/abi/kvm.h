@@ -31,11 +31,14 @@
 
 /**
  * enum kvm_vm_luo_feature - Feature indices for struct kvm_vm_luo_state.
- * @KVM_VM_LUO_FEAT_CORE:     Covers @type and @arch_state_pa. Required for
- *                            every VM.
- * @KVM_VM_LUO_FEAT_NON_COCO: Kind of VM that has neither private memory nor
- *                            protected guest state. No kind specific fields.
- * @KVM_VM_LUO_FEAT_MAX:      Number of defined features.
+ * @KVM_VM_LUO_FEAT_CORE:         Covers @type and @arch_state_pa. Required for
+ *                                every VM.
+ * @KVM_VM_LUO_FEAT_NON_COCO:     Kind of VM that has neither private memory nor
+ *                                protected guest state. No kind specific
+ *                                fields.
+ * @KVM_VM_LUO_FEAT_SW_PROTECTED: Kind of VM with software-protected private
+ *                                memory (%KVM_X86_SW_PROTECTED_VM).
+ * @KVM_VM_LUO_FEAT_MAX:          Number of defined features.
  *
  * The values are ABI. New features are added before %KVM_VM_LUO_FEAT_MAX,
  * and retired features keep their index.
@@ -43,6 +46,7 @@
 enum kvm_vm_luo_feature {
 	KVM_VM_LUO_FEAT_CORE = 0,
 	KVM_VM_LUO_FEAT_NON_COCO = 1,
+	KVM_VM_LUO_FEAT_SW_PROTECTED = 2,
 	KVM_VM_LUO_FEAT_MAX,
 };
 
@@ -199,11 +203,15 @@ static_assert(sizeof(struct kvm_gmem_luo_state) == 200);
 
 /**
  * enum kvm_vcpu_luo_feature - Feature indices for struct kvm_vcpu_luo_state.
- * @KVM_VCPU_LUO_FEAT_CORE:     Covers @vcpu_id, @reserved, and @arch_state_pa.
- *                              Required for every vCPU.
- * @KVM_VCPU_LUO_FEAT_NON_COCO: Kind of vCPU belonging to a VM that has neither
- *                              private memory nor protected guest state.
- * @KVM_VCPU_LUO_FEAT_MAX:      Number of defined features.
+ * @KVM_VCPU_LUO_FEAT_CORE:         Covers @vcpu_id, @reserved, and
+ *                                  @arch_state_pa. Required for every vCPU.
+ * @KVM_VCPU_LUO_FEAT_NON_COCO:     Kind of vCPU belonging to a VM that has
+ *                                  neither private memory nor protected guest
+ *                                  state.
+ * @KVM_VCPU_LUO_FEAT_SW_PROTECTED: Kind of vCPU belonging to a VM with
+ *                                  software-protected private memory
+ *                                  (%KVM_X86_SW_PROTECTED_VM).
+ * @KVM_VCPU_LUO_FEAT_MAX:          Number of defined features.
  *
  * The values are ABI. New features are added before %KVM_VCPU_LUO_FEAT_MAX,
  * and retired features keep their index.
@@ -211,10 +219,13 @@ static_assert(sizeof(struct kvm_gmem_luo_state) == 200);
 enum kvm_vcpu_luo_feature {
 	KVM_VCPU_LUO_FEAT_CORE = 0,
 	KVM_VCPU_LUO_FEAT_NON_COCO = 1,
+	KVM_VCPU_LUO_FEAT_SW_PROTECTED = 2,
 	KVM_VCPU_LUO_FEAT_MAX,
 };
 
 static_assert((int)KVM_VCPU_LUO_FEAT_MAX <= LUO_FEAT_MAX);
+static_assert((int)KVM_VCPU_LUO_FEAT_NON_COCO == (int)KVM_VM_LUO_FEAT_NON_COCO);
+static_assert((int)KVM_VCPU_LUO_FEAT_SW_PROTECTED == (int)KVM_VM_LUO_FEAT_SW_PROTECTED);
 
 /**
  * struct kvm_vcpu_luo_state - Preserved state of a KVM vCPU.
@@ -321,6 +332,8 @@ static_assert(sizeof(struct kvm_luo_vm_x86_state) == 50896);
 #define KVM_LUO_X86_VCPU_FLAG_APF			BIT(4)
 #define KVM_LUO_X86_VCPU_FLAG_APIC_ONESHOT_EXPIRED	BIT(5)
 #define KVM_LUO_X86_VCPU_FLAG_OLD_KVMCLOCK		BIT(6)
+#define KVM_LUO_X86_VCPU_FLAG_PROTECTED			BIT(7)
+#define KVM_LUO_X86_VCPU_FLAG_VENDOR_PRESERVED		BIT(8)
 
 /**
  * struct kvm_luo_vcpu_x86_state - Preserved x86 vCPU architectural state.

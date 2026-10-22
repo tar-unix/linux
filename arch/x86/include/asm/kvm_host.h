@@ -1424,9 +1424,16 @@ struct kvm_arch {
 	int cpu_dirty_log_size;
 	u32 luo_tss_addr;
 	u64 luo_identity_map_addr;
+	u64 luo_gmem_vm_id;
 	bool luo_tss_addr_set;
 	bool luo_identity_map_addr_set;
+	bool luo_frozen;
 };
+
+#define KVM_X86_LUO_GMEM_PRESERVED	BIT_ULL(62)
+#define KVM_X86_LUO_GMEM_RETRIEVED	BIT_ULL(63)
+#define KVM_X86_LUO_GMEM_TAG_MASK	(KVM_X86_LUO_GMEM_PRESERVED | \
+					 KVM_X86_LUO_GMEM_RETRIEVED)
 
 struct kvm_vm_stat {
 	struct kvm_vm_stat_generic generic;
@@ -1514,6 +1521,9 @@ enum kvm_x86_run_flags {
 	KVM_RUN_LOAD_GUEST_DR6		= BIT(1),
 	KVM_RUN_LOAD_DEBUGCTL		= BIT(2),
 };
+
+struct kvm_luo_vm_x86_state;
+struct kvm_luo_vcpu_x86_state;
 
 struct kvm_x86_ops {
 	const char *name;
@@ -1760,6 +1770,24 @@ struct kvm_x86_ops {
 	void (*gmem_invalidate_range)(struct kvm *kvm, struct kvm_gfn_range *range);
 #endif
 	int (*gmem_max_mapping_level)(struct kvm *kvm, kvm_pfn_t pfn, bool is_private);
+#ifdef CONFIG_LIVEUPDATE
+	int (*vm_luo_preserve)(struct kvm *kvm, struct kvm_luo_vm_x86_state *s);
+	int (*vm_luo_freeze)(struct kvm *kvm, struct kvm_luo_vm_x86_state *s);
+	void (*vm_luo_unpreserve)(struct kvm *kvm, struct kvm_luo_vm_x86_state *s);
+	int (*vm_luo_retrieve)(struct kvm *kvm, struct kvm_luo_vm_x86_state *s);
+	void (*vm_luo_finish)(struct kvm_luo_vm_x86_state *s, bool retrieved);
+
+	int (*vcpu_luo_preserve)(struct kvm_vcpu *vcpu,
+				 struct kvm_luo_vcpu_x86_state *s);
+	int (*vcpu_luo_freeze)(struct kvm_vcpu *vcpu,
+			       struct kvm_luo_vcpu_x86_state *s);
+	void (*vcpu_luo_unpreserve)(struct kvm_vcpu *vcpu,
+				    struct kvm_luo_vcpu_x86_state *s);
+	int (*vcpu_luo_retrieve)(struct kvm_vcpu *vcpu,
+				 struct kvm_luo_vcpu_x86_state *s);
+	void (*vcpu_luo_finish)(struct kvm_luo_vcpu_x86_state *s,
+				bool retrieved);
+#endif
 };
 
 struct kvm_x86_nested_ops {
