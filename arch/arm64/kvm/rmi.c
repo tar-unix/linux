@@ -1563,11 +1563,15 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	unsigned long mpidr = kvm_vcpu_get_mpidr_aff(vcpu);
 	struct realm *realm = &vcpu->kvm->arch.realm;
 	struct realm_rec *rec = &vcpu->arch.rec;
+	struct rmi_sro_state *sro;
 	struct rec_params *params;
+	phys_addr_t rec_phys;
+	struct rec_run *run;
+	void *rec_page;
 	long rmi_ret;
 	int r, i;
 
-	if (rec->run)
+	if (READ_ONCE(rec->run))
 		return -EBUSY;
 
 	/*
@@ -1581,10 +1585,10 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	BUILD_BUG_ON(sizeof(*rec->run) > PAGE_SIZE);
 
 	params = (struct rec_params *)get_zeroed_page(GFP_KERNEL);
-	rec->rec_page = (void *)__get_free_page(GFP_KERNEL);
-	rec->run = (struct rec_run *)get_zeroed_page(GFP_KERNEL);
-	rec->sro = kmalloc_obj(*rec->sro);
-	if (!params || !rec->rec_page || !rec->run || !rec->sro) {
+	rec_page = (void *)__get_free_page(GFP_KERNEL);
+	run = (struct rec_run *)get_zeroed_page(GFP_KERNEL);
+	sro = kzalloc_obj(*sro);
+	if (!params || !rec_page || !run || !sro) {
 		r = -ENOMEM;
 		goto out_free_pages;
 	}
@@ -1597,52 +1601,52 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	if (vcpu->vcpu_id == 0)
 		params->flags |= REC_PARAMS_FLAG_RUNNABLE;
 
-	rec->rec_phys = virt_to_phys(rec->rec_page);
-	rec->run_phys = virt_to_phys(rec->run);
+	rec_phys = virt_to_phys(rec_page);
 
-	if (rmi_delegate_page(rec->rec_phys)) {
+	if (rmi_delegate_page(rec_phys)) {
 		r = -ENXIO;
 		goto out_free_pages;
 	}
 
 	params->mpidr = mpidr;
 
-	rmi_ret = rmi_rec_create(virt_to_phys(realm->rd), rec->rec_phys,
-				 virt_to_phys(params), rec->sro);
+	rmi_ret = rmi_rec_create(virt_to_phys(realm->rd), rec_phys,
+				 virt_to_phys(params), sro);
 	if (rmi_ret) {
 		r = rmi_ret < 0 ? rmi_ret : -ENXIO;
 		goto out_undelegate_rmm_rec;
 	}
 
+	rec->rec_page = rec_page;
+	rec->rec_phys = rec_phys;
+	rec->run_phys = virt_to_phys(run);
+	rec->sro = sro;
 	rec->mpidr = mpidr;
+	WRITE_ONCE(rec->run, run);
 
 	free_page((unsigned long)params);
 	return 0;
 
 out_undelegate_rmm_rec:
-	if (WARN_ON(rmi_undelegate_page(rec->rec_phys)))
-		rec->rec_page = NULL;
+	if (WARN_ON(rmi_undelegate_page(rec_phys)))
+		rec_page = NULL;
 out_free_pages:
-	free_page((unsigned long)rec->run);
-	free_page((unsigned long)rec->rec_page);
+	free_page((unsigned long)run);
+	free_page((unsigned long)rec_page);
 	free_page((unsigned long)params);
-	kfree(rec->sro);
-	rec->run = NULL;
-	rec->rec_page = NULL;
-	rec->rec_phys = 0;
-	rec->run_phys = 0;
-	rec->sro = NULL;
+	kfree(sro);
 	return r;
 }
 
 void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 {
 	struct realm_rec *rec = &vcpu->arch.rec;
+	struct rec_run *run = READ_ONCE(rec->run);
 
 	if (!vcpu_is_rec(vcpu))
 		return;
 
-	if (!rec->run) {
+	if (!run) {
 		/* Nothing to do if the VCPU hasn't been finalized */
 		return;
 	}
@@ -1650,10 +1654,10 @@ void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 	if (WARN_ON(rmi_rec_destroy(rec->rec_phys, rec->sro)))
 		return;
 
-	free_page((unsigned long)rec->run);
+	WRITE_ONCE(rec->run, NULL);
+	free_page((unsigned long)run);
 	kfree(rec->sro);
 	free_delegated_page(rec->rec_phys);
-	rec->run = NULL;
 	rec->sro = NULL;
 	rec->rec_page = NULL;
 	rec->rec_phys = 0;
@@ -1673,9 +1677,11 @@ int kvm_activate_realm(struct kvm *kvm)
 	}
 
 	guard(mutex)(&kvm->arch.config_lock);
-	if (kvm_realm_state(kvm) >= REALM_STATE_ACTIVE) {
+	if (kvm_realm_state(kvm) == REALM_STATE_DEAD)
+		return -ENXIO;
+	if (kvm_realm_state(kvm) == REALM_STATE_ACTIVE) {
 		kvm_for_each_vcpu(i, vcpu, kvm) {
-			if (!vcpu->arch.rec.run)
+			if (!READ_ONCE(vcpu->arch.rec.run))
 				return -EINVAL;
 		}
 		return 0;
@@ -2072,7 +2078,8 @@ int kvm_realm_luo_freeze(struct kvm *kvm,
 	u32 pgd_pages = pgd_size >> PAGE_SHIFT;
 	struct kvm_memory_slot *memslot;
 	struct kvm_memslots *slots;
-	unsigned long data_idx;
+	struct kvm_vcpu *vcpu;
+	unsigned long vcpu_idx, data_idx;
 	u64 *pfns = NULL;
 	u32 nr_rtt, nr_data = 0, total_pfns, i = 0;
 	struct page *page;
@@ -2086,6 +2093,12 @@ int kvm_realm_luo_freeze(struct kvm *kvm,
 	if (kvm_realm_state(kvm) != REALM_STATE_ACTIVE || !realm->rd ||
 	    !READ_ONCE(realm->luo_preserved))
 		return -EINVAL;
+
+	kvm_for_each_vcpu(vcpu_idx, vcpu, kvm) {
+		if (!vcpu_is_rec(vcpu) || !vcpu->arch.rec.run ||
+		    !READ_ONCE(vcpu->arch.rec.luo_preserved))
+			return -EINVAL;
+	}
 
 	srcu_idx = srcu_read_lock(&kvm->srcu);
 	slots = kvm_memslots(kvm);
@@ -2484,6 +2497,194 @@ void kvm_realm_luo_finish(struct kvm *kvm,
 	}
 }
 
+static void kvm_realm_rec_save_state(struct kvm_vcpu *vcpu,
+				     struct kvm_arm64_cca_rec_luo_state *cca,
+				     bool is_freeze)
+{
+	struct realm_rec *rec = &vcpu->arch.rec;
+	u32 flags = KVM_ARM64_CCA_REC_F_FINALIZED;
+
+	if (kvm_test_request(KVM_REQ_RMI, vcpu))
+		flags |= KVM_ARM64_CCA_REC_F_REQ_RMI;
+	if (is_freeze && vcpu->mmio_needed)
+		flags |= KVM_ARM64_CCA_REC_F_EMULATED_MMIO;
+
+	cca->mpidr = rec->mpidr;
+	cca->rec_phys = rec->rec_phys;
+	cca->run_phys = rec->run_phys;
+	cca->fault_esr_el2 = vcpu->arch.fault.esr_el2;
+	cca->fault_far_el2 = vcpu->arch.fault.far_el2;
+	cca->fault_hpfar_el2 = vcpu->arch.fault.hpfar_el2;
+	cca->flags = flags;
+	cca->reserved = 0;
+	cca->rd_phys = virt_to_phys(vcpu->kvm->arch.realm.rd);
+}
+
+int kvm_realm_rec_luo_preserve(struct kvm_vcpu *vcpu,
+			       struct kvm_arm64_cca_rec_luo_state *cca)
+{
+	struct realm_rec *rec = &vcpu->arch.rec;
+	int ret;
+
+	if (!vcpu_is_rec(vcpu) ||
+	    kvm_realm_state(vcpu->kvm) != REALM_STATE_ACTIVE ||
+	    !READ_ONCE(vcpu->kvm->arch.realm.luo_preserved) ||
+	    !vcpu->kvm->arch.realm.rd ||
+	    !rec->rec_page || !rec->run)
+		return -EINVAL;
+
+	ret = kho_preserve_pages(virt_to_page(rec->rec_page), 1);
+	if (ret)
+		return ret;
+
+	ret = kho_preserve_pages(virt_to_page(rec->run), 1);
+	if (ret) {
+		kho_unpreserve_pages(virt_to_page(rec->rec_page), 1);
+		return ret;
+	}
+
+	kvm_realm_rec_save_state(vcpu, cca, false);
+	WRITE_ONCE(rec->luo_preserved, true);
+	return 0;
+}
+
+int kvm_realm_rec_luo_freeze(struct kvm_vcpu *vcpu,
+			     struct kvm_arm64_cca_rec_luo_state *cca)
+{
+	struct realm_rec *rec = &vcpu->arch.rec;
+
+	if (!vcpu_is_rec(vcpu) ||
+	    kvm_realm_state(vcpu->kvm) != REALM_STATE_ACTIVE ||
+	    !READ_ONCE(vcpu->kvm->arch.realm.luo_preserved) ||
+	    !vcpu->kvm->arch.realm.rd ||
+	    !rec->rec_page || !rec->run)
+		return -EINVAL;
+
+	if (vcpu->mmio_needed && !kvm_vcpu_dabt_iswrite(vcpu))
+		return -EBUSY;
+
+	kvm_realm_rec_save_state(vcpu, cca, true);
+	return 0;
+}
+
+void kvm_realm_rec_luo_unpreserve(struct kvm_vcpu *vcpu,
+				  struct kvm_arm64_cca_rec_luo_state *cca)
+{
+	if (vcpu)
+		WRITE_ONCE(vcpu->arch.rec.luo_preserved, false);
+
+	if (!cca)
+		return;
+
+	if (cca->run_phys)
+		kho_unpreserve_pages(phys_to_page(cca->run_phys), 1);
+	if (cca->rec_phys)
+		kho_unpreserve_pages(phys_to_page(cca->rec_phys), 1);
+
+	memset(cca, 0, sizeof(*cca));
+}
+
+int kvm_realm_rec_luo_retrieve(struct kvm_vcpu *vcpu,
+			       struct kvm_arm64_cca_rec_luo_state *cca)
+{
+	u32 valid_flags = KVM_ARM64_CCA_REC_F_REQ_RMI |
+			  KVM_ARM64_CCA_REC_F_FINALIZED |
+			  KVM_ARM64_CCA_REC_F_EMULATED_MMIO;
+	struct realm *realm = &vcpu->kvm->arch.realm;
+	struct realm_rec *rec = &vcpu->arch.rec;
+	struct page *rec_page, *run_page;
+
+	if (!vcpu_is_rec(vcpu) || !cca ||
+	    kvm_realm_state(vcpu->kvm) != REALM_STATE_ACTIVE ||
+	    !realm->luo_retrieved || !realm->rd)
+		return -EINVAL;
+
+	if (!(cca->flags & KVM_ARM64_CCA_REC_F_FINALIZED) ||
+	    (cca->flags & ~valid_flags) || cca->reserved ||
+	    !cca->rec_phys || !cca->run_phys ||
+	    !PAGE_ALIGNED(cca->rec_phys) || !PAGE_ALIGNED(cca->run_phys) ||
+	    cca->rd_phys != virt_to_phys(realm->rd) ||
+	    cca->mpidr != kvm_vcpu_get_mpidr_aff(vcpu))
+		return -EINVAL;
+
+	rec->sro = kzalloc_obj(*rec->sro);
+	if (!rec->sro)
+		return -ENOMEM;
+
+	rec_page = kho_restore_pages(cca->rec_phys, 1);
+	if (!rec_page) {
+		kfree(rec->sro);
+		rec->sro = NULL;
+		return -ENOMEM;
+	}
+
+	run_page = kho_restore_pages(cca->run_phys, 1);
+	if (!run_page) {
+		if (!WARN_ON(rmi_rec_destroy(cca->rec_phys, rec->sro)))
+			free_delegated_page(cca->rec_phys);
+		cca->rec_phys = 0;
+		kfree(rec->sro);
+		rec->sro = NULL;
+		return -ENOMEM;
+	}
+
+	rec->mpidr = cca->mpidr;
+	rec->rec_page = page_to_virt(rec_page);
+	rec->rec_phys = cca->rec_phys;
+	rec->run_phys = cca->run_phys;
+
+	vcpu->arch.fault.esr_el2 = cca->fault_esr_el2;
+	vcpu->arch.fault.far_el2 = cca->fault_far_el2;
+	vcpu->arch.fault.hpfar_el2 = cca->fault_hpfar_el2;
+
+	if (cca->flags & KVM_ARM64_CCA_REC_F_REQ_RMI)
+		kvm_make_request(KVM_REQ_RMI, vcpu);
+	if (cca->flags & KVM_ARM64_CCA_REC_F_EMULATED_MMIO)
+		((struct rec_run *)page_to_virt(run_page))->enter.flags |=
+			REC_ENTER_FLAG_EMULATED_MMIO;
+	WRITE_ONCE(rec->run, page_to_virt(run_page));
+
+	cca->rec_phys = 0;
+	cca->run_phys = 0;
+	return 0;
+}
+
+void kvm_realm_rec_luo_finish(struct kvm_vcpu *vcpu,
+			      struct kvm_arm64_cca_rec_luo_state *cca)
+{
+	struct page *rec_page, *run_page;
+
+	if (vcpu || !cca || (!cca->rec_phys && !cca->run_phys)) {
+		realm_luo_drain_deferred();
+		return;
+	}
+
+	if (cca->run_phys) {
+		run_page = kho_restore_pages(cca->run_phys, 1);
+		if (run_page)
+			__free_page(run_page);
+		cca->run_phys = 0;
+	}
+
+	if (cca->rec_phys) {
+		rec_page = kho_restore_pages(cca->rec_phys, 1);
+		if (rec_page) {
+			struct rmi_sro_state *dyn_sro __free(kfree) = kzalloc_obj(*dyn_sro);
+			struct rmi_sro_state *sro = dyn_sro;
+
+			mutex_lock(&realm_luo_deferred_lock);
+			if (!sro)
+				sro = realm_luo_fallback_sro;
+			if (!WARN_ON_ONCE(!sro) &&
+			    !WARN_ON(rmi_rec_destroy(cca->rec_phys, sro)))
+				free_delegated_page(cca->rec_phys);
+			mutex_unlock(&realm_luo_deferred_lock);
+		}
+		cca->rec_phys = 0;
+	}
+
+	realm_luo_drain_deferred();
+}
 #endif /* CONFIG_LIVEUPDATE */
 
 static int rmm_check_features(void)

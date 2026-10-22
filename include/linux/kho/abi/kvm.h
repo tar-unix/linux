@@ -812,17 +812,47 @@ struct kvm_arm64_cca_vm_luo_state {
 
 static_assert(sizeof(struct kvm_arm64_cca_vm_luo_state) == 48);
 
+#define KVM_ARM64_CCA_REC_F_REQ_RMI		BIT(0)
+#define KVM_ARM64_CCA_REC_F_FINALIZED		BIT(1)
+#define KVM_ARM64_CCA_REC_F_EMULATED_MMIO	BIT(2)
+
+/**
+ * struct kvm_arm64_cca_rec_luo_state - ARM64 CCA REC per-vCPU KHO state.
+ * @rd_phys:         Physical address of the owning Realm Descriptor (GRANULE_STATE_RD).
+ * @mpidr:           MPIDR affinity value (rec->mpidr).
+ * @rec_phys:        Physical address of the 4KB REC granule (GRANULE_STATE_REC).
+ * @run_phys:        Physical address of the 4KB NS struct rec_run page.
+ * @fault_esr_el2:   Host vcpu->arch.fault.esr_el2 across pending MMIO/RIPAS exit.
+ * @fault_far_el2:   Host vcpu->arch.fault.far_el2.
+ * @fault_hpfar_el2: Host vcpu->arch.fault.hpfar_el2.
+ * @flags:           %KVM_ARM64_CCA_REC_F_* flags.
+ * @reserved:        Reserved for alignment, must be zero.
+ */
+struct kvm_arm64_cca_rec_luo_state {
+	u64 rd_phys;
+	u64 mpidr;
+	u64 rec_phys;
+	u64 run_phys;
+	u64 fault_esr_el2;
+	u64 fault_far_el2;
+	u64 fault_hpfar_el2;
+	u32 flags;
+	u32 reserved;
+};
+
+static_assert(sizeof(struct kvm_arm64_cca_rec_luo_state) == 64);
+
 /**
  * struct kvm_luo_vgic_irq_state - Preserved state of one vGICv3 SGI/PPI/SPI.
- * @intid:         Virtual interrupt identifier.
- * @pending_latch: Software-latched pending state.
- * @active:        Active state.
- * @enabled:       Enable bit.
- * @config:        Trigger configuration (0 = level, 1 = edge).
- * @priority:      Interrupt priority.
- * @group:         Interrupt group (0 or 1).
- * @source:        SGI source CPU mask.
- * @active_source: Active SGI source CPU.
+ * @intid:          Virtual interrupt identifier.
+ * @pending_latch:  Software-latched pending state.
+ * @active:         Active state.
+ * @enabled:        Enable bit.
+ * @config:         Trigger configuration (0 = level, 1 = edge).
+ * @priority:       Interrupt priority.
+ * @group:          Interrupt group (0 or 1).
+ * @source:         SGI source CPU mask.
+ * @active_source:  Active SGI source CPU.
  * @line_level:     Asserted input line level.
  * @targets:        GICv2 target CPU mask.
  * @active_vcpu_id: vCPU ID where the interrupt is active (-1 if none).
@@ -977,6 +1007,7 @@ static_assert(sizeof(struct kvm_luo_vm_arm64_state) == 24680);
  * @reserved1:            Reserved for alignment, must be zero.
  * @ccsidr:               Per-vCPU CCSIDR override values indexed by CSSELR.
  * @private_irqs:         Preserved SGI and PPI interrupt states (0..31).
+ * @cca:                  Per-REC vCPU state for %KVM_VCPU_LUO_FEAT_ARM_CCA.
  */
 struct kvm_luo_vcpu_arm64_state {
 	u32 version;
@@ -1022,9 +1053,10 @@ struct kvm_luo_vcpu_arm64_state {
 	u32 reserved1;
 	u32 ccsidr[KVM_LUO_ARM64_CSSELR_MAX];
 	struct kvm_luo_vgic_irq_state private_irqs[32];
+	struct kvm_arm64_cca_rec_luo_state cca;
 };
 
-static_assert(sizeof(struct kvm_luo_vcpu_arm64_state) == 19936);
+static_assert(sizeof(struct kvm_luo_vcpu_arm64_state) == 20000);
 
 #endif /* CONFIG_ARM64 */
 

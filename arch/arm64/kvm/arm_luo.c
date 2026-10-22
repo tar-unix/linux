@@ -427,7 +427,7 @@ static int kvm_arm_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 			return -EBUSY;
 	}
 
-	memset(s, 0, sizeof(*s));
+	memset(s, 0, offsetof(struct kvm_luo_vcpu_arm64_state, cca));
 	s->version = KVM_LUO_ARM64_VCPU_STATE_VERSION;
 
 	BUILD_BUG_ON(NR_SYS_REGS > KVM_LUO_ARM64_MAX_SYS_REGS);
@@ -442,9 +442,10 @@ static int kvm_arm_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 	smp_rmb();
 
 	if (is_freeze &&
-	    (vcpu_get_flag(vcpu, PENDING_EXCEPTION) ||
+	    ((!vcpu_is_rec(vcpu) && vcpu_get_flag(vcpu, PENDING_EXCEPTION)) ||
 	     kvm_test_request(KVM_REQ_VCPU_RESET, vcpu) ||
-	     ((vcpu->mmio_needed || vcpu_get_flag(vcpu, INCREMENT_PC)) &&
+	     (!vcpu_is_rec(vcpu) &&
+	      (vcpu->mmio_needed || vcpu_get_flag(vcpu, INCREMENT_PC)) &&
 	      vcpu_mode_is_32bit(vcpu))))
 		return -EBUSY;
 
@@ -460,7 +461,7 @@ static int kvm_arm_luo_save_vcpu_state(struct kvm_vcpu *vcpu,
 	s->guest_debug = vcpu->guest_debug;
 
 	s->gp_regs = vcpu->arch.ctxt.regs;
-	if (is_freeze) {
+	if (is_freeze && !vcpu_is_rec(vcpu)) {
 		if (vcpu->mmio_needed && !kvm_vcpu_dabt_iswrite(vcpu)) {
 			unsigned int len = kvm_vcpu_dabt_get_as(vcpu);
 			unsigned long data =
@@ -554,9 +555,8 @@ int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
 	struct kvm_luo_vcpu_arm64_state *s;
 	int ret;
 
-	if (vcpu_is_protected(vcpu) || vcpu_is_rec(vcpu) ||
-	    kvm_vcpu_has_pmu(vcpu) || vcpu_has_nv(vcpu) ||
-	    !mtree_empty(&vcpu->kvm->arch.smccc_filter))
+	if (vcpu_is_protected(vcpu) || kvm_vcpu_has_pmu(vcpu) ||
+	    vcpu_has_nv(vcpu) || !mtree_empty(&vcpu->kvm->arch.smccc_filter))
 		return -EOPNOTSUPP;
 	if (!kvm_vcpu_initialized(vcpu))
 		return -EINVAL;
@@ -572,12 +572,21 @@ int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
 		return ret;
 	}
 
+	if (vcpu_is_rec(vcpu)) {
+		ret = kvm_realm_rec_luo_preserve(vcpu, &s->cca);
+		if (ret) {
+			kho_unpreserve_free(s);
+			return ret;
+		}
+	}
+
 	*arch_state_pa = __pa(s);
 	return 0;
 }
 
 int kvm_arch_luo_vcpu_freeze(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
+	struct kvm_luo_vcpu_arm64_state *s;
 	int ret;
 
 	if (!arch_state_pa)
@@ -585,22 +594,36 @@ int kvm_arch_luo_vcpu_freeze(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 	if (!kvm_vcpu_initialized(vcpu))
 		return -EINVAL;
 
+	s = __va(arch_state_pa);
 	scoped_guard(mutex, &vcpu->kvm->arch.config_lock)
-		ret = kvm_arm_luo_save_vcpu_state(vcpu, __va(arch_state_pa), true);
-	return ret;
+		ret = kvm_arm_luo_save_vcpu_state(vcpu, s, true);
+	if (ret)
+		return ret;
+
+	if (vcpu_is_rec(vcpu))
+		return kvm_realm_rec_luo_freeze(vcpu, &s->cca);
+
+	return 0;
 }
 
 void kvm_arch_luo_vcpu_unpreserve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
+	struct kvm_luo_vcpu_arm64_state *s;
+
 	if (!arch_state_pa)
 		return;
 
-	kho_unpreserve_free(__va(arch_state_pa));
+	s = __va(arch_state_pa);
+	if (s->cca.rec_phys || s->cca.run_phys || (vcpu && vcpu_is_rec(vcpu)))
+		kvm_realm_rec_luo_unpreserve(vcpu, &s->cca);
+
+	kho_unpreserve_free(s);
 }
 
 int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
 	struct kvm_luo_vcpu_arm64_state *s;
+	u64 init_mpidr;
 	int ret = 0;
 	u32 i;
 
@@ -658,9 +681,16 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 		vcpu->arch.sve_max_vl = s->sve_max_vl;
 	}
 
+	init_mpidr = kvm_vcpu_get_mpidr_aff(vcpu);
+
 	ret = kvm_arm_luo_restore_sys_regs(vcpu, s->sys_regs, s->nr_sys_regs);
 	if (ret)
 		goto out;
+
+	if (vcpu_is_rec(vcpu) && kvm_vcpu_get_mpidr_aff(vcpu) != init_mpidr) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	if (s->has_ccsidr) {
 		if (!vcpu->arch.ccsidr) {
@@ -760,6 +790,12 @@ int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 	if (s->mp_state == KVM_MP_STATE_STOPPED || s->pause)
 		kvm_make_request(KVM_REQ_SLEEP, vcpu);
 
+	if (vcpu_is_rec(vcpu)) {
+		ret = kvm_realm_rec_luo_retrieve(vcpu, &s->cca);
+		if (ret)
+			goto out;
+	}
+
 	kvm_destroy_mpidr_data(vcpu->kvm);
 	ret = 0;
 out:
@@ -769,8 +805,14 @@ out:
 
 void kvm_arch_luo_vcpu_finish(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
+	struct kvm_luo_vcpu_arm64_state *s;
+
 	if (!arch_state_pa)
 		return;
 
-	kho_restore_free(__va(arch_state_pa));
+	s = __va(arch_state_pa);
+	if (s->cca.rec_phys || s->cca.run_phys)
+		kvm_realm_rec_luo_finish(vcpu, &s->cca);
+
+	kho_restore_free(s);
 }

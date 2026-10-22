@@ -851,15 +851,18 @@ int __kvm_arm_vcpu_set_events(struct kvm_vcpu *vcpu,
 		 * inject an SEA when the REC is scheduled to be run.
 		 */
 		if (ext_dabt_pending) {
+			struct rec_run *run = READ_ONCE(vcpu->arch.rec.run);
+
 			/*
 			 * Can only inject SEA into a Realm if the previous exit
 			 * was due to a data abort of an Unprotected IPA.
 			 */
-			if (!(vcpu->arch.rec.run->enter.flags & REC_ENTER_FLAG_EMULATED_MMIO))
+			if (!run ||
+			    !(run->enter.flags & REC_ENTER_FLAG_EMULATED_MMIO))
 				return -EINVAL;
 
-			vcpu->arch.rec.run->enter.flags &= ~REC_ENTER_FLAG_EMULATED_MMIO;
-			vcpu->arch.rec.run->enter.flags |= REC_ENTER_FLAG_INJECT_SEA;
+			run->enter.flags &= ~REC_ENTER_FLAG_EMULATED_MMIO;
+			run->enter.flags |= REC_ENTER_FLAG_INJECT_SEA;
 		}
 
 		return 0;

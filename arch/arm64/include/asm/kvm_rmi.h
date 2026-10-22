@@ -103,6 +103,7 @@ struct realm {
  * @run: Kernel VA of the RmiRecRun structure shared with the RMM
  * @run_phys: Physical address of @run
  * @sro: A preallocated SRO state context
+ * @luo_preserved: REC is preserved in an active live update session
  */
 struct realm_rec {
 	unsigned long mpidr;
@@ -111,6 +112,7 @@ struct realm_rec {
 	struct rec_run *run;
 	phys_addr_t run_phys;
 	struct rmi_sro_state *sro;
+	bool luo_preserved;
 };
 
 void kvm_init_rmi(void);
@@ -130,6 +132,7 @@ int kvm_realm_teardown_stage2(struct kvm *kvm);
 void kvm_destroy_rec(struct kvm_vcpu *vcpu);
 
 struct kvm_arm64_cca_vm_luo_state;
+struct kvm_arm64_cca_rec_luo_state;
 
 int kvm_realm_luo_preserve(struct kvm *kvm,
 			   struct kvm_arm64_cca_vm_luo_state *cca);
@@ -143,6 +146,17 @@ int kvm_realm_luo_retrieve(struct kvm *kvm,
 			   struct kvm_arm64_cca_vm_luo_state *cca);
 void kvm_realm_luo_finish(struct kvm *kvm,
 			  struct kvm_arm64_cca_vm_luo_state *cca);
+
+int kvm_realm_rec_luo_preserve(struct kvm_vcpu *vcpu,
+			       struct kvm_arm64_cca_rec_luo_state *cca);
+int kvm_realm_rec_luo_freeze(struct kvm_vcpu *vcpu,
+			     struct kvm_arm64_cca_rec_luo_state *cca);
+void kvm_realm_rec_luo_unpreserve(struct kvm_vcpu *vcpu,
+				  struct kvm_arm64_cca_rec_luo_state *cca);
+int kvm_realm_rec_luo_retrieve(struct kvm_vcpu *vcpu,
+			       struct kvm_arm64_cca_rec_luo_state *cca);
+void kvm_realm_rec_luo_finish(struct kvm_vcpu *vcpu,
+			      struct kvm_arm64_cca_rec_luo_state *cca);
 
 int kvm_rec_enter(struct kvm_vcpu *vcpu);
 int kvm_rec_exit(struct kvm_vcpu *vcpu, int rec_run_status);

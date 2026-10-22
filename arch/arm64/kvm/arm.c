@@ -1043,8 +1043,11 @@ int kvm_arch_vcpu_run_pid_change(struct kvm_vcpu *vcpu)
 	if (!kvm_arm_vcpu_is_finalized(vcpu))
 		return -EPERM;
 
-	if (likely(vcpu_has_run_once(vcpu)))
+	if (likely(vcpu_has_run_once(vcpu))) {
+		if (vcpu_is_rec(vcpu) && !READ_ONCE(vcpu->arch.rec.run))
+			return -EINVAL;
 		return 0;
+	}
 
 	kvm_init_mpidr_data(kvm);
 
