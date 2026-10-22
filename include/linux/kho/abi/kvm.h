@@ -266,6 +266,7 @@ static_assert(sizeof(struct kvm_vcpu_luo_state) == 144);
 /* Global CoCo FLB handler names. */
 #define TDX_HOST_LUO_FLB_NAME	"tdx-host"
 #define SEV_SNP_LUO_FLB_NAME	"sev-snp"
+#define ARM_RMM_LUO_FLB_NAME	"arm-rmm"
 
 #ifdef CONFIG_X86
 
@@ -734,6 +735,33 @@ static_assert(sizeof(struct kvm_luo_vcpu_x86_state) == 25080);
 #endif /* CONFIG_X86 */
 
 #ifdef CONFIG_ARM64
+
+/**
+ * struct rmi_sro_donated_entry - Preserved RMM SRO donated memory range.
+ * @phys_addr: Physical base address of the donated granule range.
+ * @nr_pages:  Number of 4KB granules in the range.
+ */
+struct rmi_sro_donated_entry {
+	u64 phys_addr;
+	u64 nr_pages;
+};
+
+static_assert(sizeof(struct rmi_sro_donated_entry) == 16);
+
+/**
+ * struct arm_rmm_luo_flb_state - ARM64 RMM KHO/FLB donation ledger state.
+ * @count:      Number of entries in the @entries_pa array.
+ * @nr_pages:   Number of KHO-preserved pages holding the @entries_pa array.
+ * @entries_pa: Physical address of KHO-preserved page(s) holding
+ *              struct rmi_sro_donated_entry[].
+ */
+struct arm_rmm_luo_flb_state {
+	u64 count;
+	u64 nr_pages;
+	u64 entries_pa;
+};
+
+static_assert(sizeof(struct arm_rmm_luo_flb_state) == 24);
 
 #define KVM_LUO_ARM64_VM_STATE_VERSION		1
 #define KVM_LUO_ARM64_MAX_RD_REGIONS		16

@@ -39,6 +39,15 @@ static inline int rmi_undelegate_page(phys_addr_t phys)
 
 bool is_rmi_available(void);
 
+#if IS_ENABLED(CONFIG_ARM_RMM) && IS_ENABLED(CONFIG_KVM) && IS_ENABLED(CONFIG_LIVEUPDATE)
+int arm_rmm_luo_sync_donations(void);
+#else
+static inline int arm_rmm_luo_sync_donations(void)
+{
+	return 0;
+}
+#endif
+
 long rmi_sro_memxfer_execute(struct rmi_sro_state *sro, gfp_t gfp);
 void rmi_sro_free(struct rmi_sro_state *sro);
 long rmi_sro_execute(struct arm_smccc_1_2_regs *regs);
@@ -64,6 +73,23 @@ static inline int rmi_rmm_config_set(unsigned long cfg_ptr)
 	struct arm_smccc_res res;
 
 	arm_smccc_1_1_invoke(SMC_RMI_RMM_CONFIG_SET, cfg_ptr, &res);
+
+	return res.a0;
+}
+
+/**
+ * rmi_rmm_config_get() - Read the RMM configuration
+ * @cfg_ptr: PA of a struct rmm_config
+ *
+ * Reads configuration options from the RMM.
+ *
+ * Return: RMI return code
+ */
+static inline int rmi_rmm_config_get(unsigned long cfg_ptr)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(SMC_RMI_RMM_CONFIG_GET, cfg_ptr, &res);
 
 	return res.a0;
 }

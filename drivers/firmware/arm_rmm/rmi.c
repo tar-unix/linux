@@ -3,16 +3,273 @@
  * Copyright (C) 2023-2026 ARM Ltd.
  */
 
+#include <linux/cleanup.h>
 #include <linux/cpufeature.h>
+#include <linux/kexec_handover.h>
+#include <linux/kho/abi/kvm.h>
+#include <linux/kvm_host.h>
+#include <linux/list.h>
+#include <linux/liveupdate.h>
 #include <linux/memblock.h>
+#include <linux/mutex.h>
 #include <linux/arm-rmi-cmds.h>
 #include <linux/processor.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 
 #include <asm/memory.h>
 #include <asm/pgtable-hwdef.h>
 
 static bool arm64_rmi_is_available;
+
+#ifdef CONFIG_LIVEUPDATE
+struct rmi_donated_node {
+	struct list_head list;
+	phys_addr_t phys_addr;
+	unsigned long nr_pages;
+	bool kho_preserved;
+	bool kho_preserving;
+};
+
+static LIST_HEAD(rmi_donated_list);
+static DEFINE_MUTEX(rmi_donated_lock);
+static size_t rmi_donated_count;
+static u64 rmi_donated_generation;
+static struct arm_rmm_luo_flb_state *arm_rmm_kho_state;
+static struct arm_rmm_luo_flb_state *arm_rmm_flb_state;
+static u64 arm_rmm_synced_generation;
+static bool arm_rmm_incoming_restored;
+
+static void arm_rmm_free_entries_table(struct arm_rmm_luo_flb_state *state)
+{
+	void *entries;
+
+	if (!state || !state->nr_pages || !state->entries_pa)
+		return;
+
+	entries = phys_to_virt(state->entries_pa);
+	kho_unpreserve_pages(virt_to_page(entries), state->nr_pages);
+	free_pages_exact(entries, state->nr_pages * PAGE_SIZE);
+	state->count = 0;
+	state->nr_pages = 0;
+	state->entries_pa = 0;
+}
+
+static void arm_rmm_unpreserve_all_nodes_locked(void)
+{
+	struct rmi_donated_node *node;
+
+	lockdep_assert_held(&rmi_donated_lock);
+
+	list_for_each_entry(node, &rmi_donated_list, list) {
+		if (!node->kho_preserved)
+			continue;
+		kho_unpreserve_pages(phys_to_page(node->phys_addr),
+				     node->nr_pages);
+		node->kho_preserved = false;
+	}
+}
+
+static int arm_rmm_populate_flb_entries_locked(struct arm_rmm_luo_flb_state *state)
+{
+	struct rmi_sro_donated_entry *entries = NULL;
+	struct arm_rmm_luo_flb_state old = *state;
+	struct rmi_donated_node *node;
+	unsigned long nr_pages = 0;
+	size_t count = rmi_donated_count;
+	size_t i = 0;
+	int ret;
+
+	lockdep_assert_held(&rmi_donated_lock);
+
+	if (count) {
+		nr_pages = PAGE_ALIGN(count * sizeof(*entries)) >> PAGE_SHIFT;
+		entries = alloc_pages_exact(nr_pages * PAGE_SIZE,
+					    GFP_KERNEL | __GFP_ZERO);
+		if (!entries)
+			return -ENOMEM;
+
+		ret = kho_preserve_pages(virt_to_page(entries), nr_pages);
+		if (ret) {
+			free_pages_exact(entries, nr_pages * PAGE_SIZE);
+			return ret;
+		}
+
+		list_for_each_entry(node, &rmi_donated_list, list) {
+			if (!node->kho_preserved) {
+				ret = kho_preserve_pages(phys_to_page(node->phys_addr),
+							 node->nr_pages);
+				if (ret) {
+					list_for_each_entry(node, &rmi_donated_list, list) {
+						if (!node->kho_preserving)
+							continue;
+						kho_unpreserve_pages(phys_to_page(node->phys_addr),
+								     node->nr_pages);
+						node->kho_preserving = false;
+					}
+					kho_unpreserve_pages(virt_to_page(entries),
+							     nr_pages);
+					free_pages_exact(entries,
+							 nr_pages * PAGE_SIZE);
+					return ret;
+				}
+				node->kho_preserving = true;
+			}
+			entries[i].phys_addr = node->phys_addr;
+			entries[i].nr_pages = node->nr_pages;
+			i++;
+		}
+
+		list_for_each_entry(node, &rmi_donated_list, list) {
+			if (node->kho_preserving) {
+				node->kho_preserved = true;
+				node->kho_preserving = false;
+			}
+		}
+	}
+
+	arm_rmm_free_entries_table(&old);
+
+	state->count = count;
+	state->nr_pages = nr_pages;
+	state->entries_pa = entries ? virt_to_phys(entries) : 0;
+	arm_rmm_synced_generation = rmi_donated_generation;
+	return 0;
+}
+
+static int arm_rmm_sync_kho_locked(void)
+{
+	int ret;
+
+	lockdep_assert_held(&rmi_donated_lock);
+
+	if (!arm_rmm_kho_state && !arm_rmm_flb_state)
+		return 0;
+
+	if (arm_rmm_kho_state) {
+		if (arm_rmm_kho_state->count != rmi_donated_count ||
+		    arm_rmm_synced_generation != rmi_donated_generation) {
+			ret = arm_rmm_populate_flb_entries_locked(arm_rmm_kho_state);
+			if (ret)
+				return ret;
+		}
+		if (arm_rmm_flb_state) {
+			arm_rmm_flb_state->count = arm_rmm_kho_state->count;
+			arm_rmm_flb_state->nr_pages = 0;
+			arm_rmm_flb_state->entries_pa = 0;
+		}
+		return 0;
+	}
+
+	if (arm_rmm_flb_state->count == rmi_donated_count &&
+	    arm_rmm_synced_generation == rmi_donated_generation)
+		return 0;
+
+	return arm_rmm_populate_flb_entries_locked(arm_rmm_flb_state);
+}
+
+static void rmi_ledger_record_donated(phys_addr_t phys, unsigned long nr_pages,
+				      gfp_t gfp)
+{
+	struct rmi_donated_node *node;
+
+	if (!nr_pages)
+		return;
+
+	node = kmalloc_obj(*node, (gfp & ~__GFP_ZERO) | __GFP_NOFAIL);
+	if (WARN_ON_ONCE(!node))
+		return;
+
+	node->phys_addr = phys;
+	node->nr_pages = nr_pages;
+	node->kho_preserved = false;
+	node->kho_preserving = false;
+
+	guard(mutex)(&rmi_donated_lock);
+	list_add_tail(&node->list, &rmi_donated_list);
+	rmi_donated_count++;
+	rmi_donated_generation++;
+}
+
+static void rmi_ledger_remove_reclaimed(phys_addr_t phys, unsigned long nr_pages)
+{
+	phys_addr_t reclaim_end = phys + (nr_pages << PAGE_SHIFT);
+	struct rmi_donated_node *split = NULL;
+	struct rmi_donated_node *node, *tmp;
+	bool need_kho_sync = false;
+
+	if (!nr_pages)
+		return;
+
+	guard(mutex)(&rmi_donated_lock);
+	list_for_each_entry_safe(node, tmp, &rmi_donated_list, list) {
+		phys_addr_t node_end =
+			node->phys_addr + (node->nr_pages << PAGE_SHIFT);
+
+		if (reclaim_end <= node->phys_addr || phys >= node_end)
+			continue;
+
+		if (node->kho_preserved) {
+			kho_unpreserve_pages(phys_to_page(node->phys_addr),
+					     node->nr_pages);
+			node->kho_preserved = false;
+			need_kho_sync = true;
+		}
+
+		if (phys <= node->phys_addr && reclaim_end >= node_end) {
+			list_del(&node->list);
+			rmi_donated_count--;
+			rmi_donated_generation++;
+			kfree(node);
+		} else if (phys <= node->phys_addr) {
+			unsigned long cut =
+				(reclaim_end - node->phys_addr) >> PAGE_SHIFT;
+
+			node->phys_addr = reclaim_end;
+			node->nr_pages -= cut;
+			rmi_donated_generation++;
+		} else if (reclaim_end >= node_end) {
+			unsigned long cut =
+				(node_end - phys) >> PAGE_SHIFT;
+
+			node->nr_pages -= cut;
+			rmi_donated_generation++;
+		} else {
+			split = kmalloc_obj(*split, GFP_KERNEL | __GFP_NOFAIL);
+			if (WARN_ON_ONCE(!split))
+				break;
+			split->phys_addr = reclaim_end;
+			split->nr_pages = (node_end - reclaim_end) >> PAGE_SHIFT;
+			split->kho_preserved = false;
+			split->kho_preserving = false;
+			node->nr_pages = (phys - node->phys_addr) >> PAGE_SHIFT;
+			list_add(&split->list, &node->list);
+			split = NULL;
+			rmi_donated_count++;
+			rmi_donated_generation++;
+		}
+	}
+	if (need_kho_sync && WARN_ON_ONCE(arm_rmm_sync_kho_locked())) {
+		if (arm_rmm_kho_state)
+			arm_rmm_free_entries_table(arm_rmm_kho_state);
+		if (arm_rmm_flb_state)
+			arm_rmm_free_entries_table(arm_rmm_flb_state);
+		arm_rmm_unpreserve_all_nodes_locked();
+	}
+}
+#else
+static inline void rmi_ledger_record_donated(phys_addr_t phys,
+					     unsigned long nr_pages,
+					     gfp_t gfp)
+{
+}
+
+static inline void rmi_ledger_remove_reclaimed(phys_addr_t phys,
+					       unsigned long nr_pages)
+{
+}
+#endif
 
 /* Currently only the first 2 registers are used by Linux */
 #define RMI_FEAT_REG_COUNT	2
@@ -238,8 +495,12 @@ out:
 	if (donated_granules == 0) {
 		/* No pages used by the RMM */
 		sro->addr_count++;
-	} else if (donated_size < size) {
+	} else {
 		phys = sro->addr_list[sro->addr_count] & RMI_ADDR_RANGE_ADDR_MASK;
+		rmi_ledger_record_donated(phys,
+					  min(donated_granules,
+					      size >> PAGE_SHIFT),
+					  gfp);
 
 		/* Not all granules used by the RMM, free the remaining pages */
 		for (long i = donated_size; i < size; i += PAGE_SIZE) {
@@ -336,6 +597,12 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 	 * the number of (complete) consumed units.
 	 */
 	consumed_units = donated_granules / granules_per_unit;
+	for (unsigned long i = 0; i < consumed_units; i++) {
+		unsigned long entry = sro->addr_list[addr_list_start + i];
+
+		rmi_ledger_record_donated(RMI_ADDR_RANGE_ADDR(entry),
+					  granules_per_unit, gfp);
+	}
 	if (donated_granules % granules_per_unit) {
 		/*
 		 * A unit has been partially consumed, the start is owned by
@@ -344,8 +611,11 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 		unsigned long entry =
 			sro->addr_list[addr_list_start + consumed_units];
 		phys_addr_t phys = RMI_ADDR_RANGE_ADDR(entry);
-		unsigned long donated_size =
-			(donated_granules % granules_per_unit) << PAGE_SHIFT;
+		unsigned long rem_granules =
+			donated_granules % granules_per_unit;
+		unsigned long donated_size = rem_granules << PAGE_SHIFT;
+
+		rmi_ledger_record_donated(phys, rem_granules, gfp);
 
 		/* Free the tail back */
 		for (unsigned long i = donated_size; i < unit_size_bytes;
@@ -410,6 +680,16 @@ static int rmi_sro_reclaim(struct rmi_sro_state *sro,
 
 	if (WARN_ON_ONCE(out_regs->a1 > capacity))
 		out_regs->a1 = capacity;
+
+	for (unsigned long i = 0; i < out_regs->a1; i++) {
+		unsigned long entry = sro->addr_list[sro->addr_count + i];
+		unsigned long addr = RMI_ADDR_RANGE_ADDR(entry);
+		unsigned long unit_size = RMI_ADDR_RANGE_SIZE(entry);
+		unsigned long count = RMI_ADDR_RANGE_COUNT(entry);
+		unsigned long size = donate_req_to_size(unit_size) * count;
+
+		rmi_ledger_remove_reclaimed(addr, size >> PAGE_SHIFT);
+	}
 
 	sro->addr_count += out_regs->a1;
 
@@ -629,6 +909,29 @@ static int rmi_configure(void)
 	config->tracking_region_size = 0;
 
 	rmi_ret = rmi_rmm_config_set(virt_to_phys(config));
+#ifdef CONFIG_LIVEUPDATE
+	if (is_kho_boot() && arm_rmm_incoming_restored &&
+	    rmi_ret >= 0 && RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_GLOBAL) {
+		/*
+		 * RMM is already in RMM_STATE_ACTIVE across a KHO/LUO kexec.
+		 * Read back the active configuration and verify that it
+		 * matches this kernel's granule size and tracking region size;
+		 * if so, skip rmi_rmm_activate().
+		 */
+		memset(config, 0, sizeof(*config));
+		rmi_ret = rmi_rmm_config_get(virt_to_phys(config));
+		if (rmi_ret || config->rmi_granule_size != granule_size ||
+		    config->tracking_region_size != 0) {
+			pr_err("RMM active config mismatch (ret=%ld gran=%llu track=%llu)\n",
+			       rmi_ret, config->rmi_granule_size,
+			       config->tracking_region_size);
+			ret = -EINVAL;
+			goto out_free_sro;
+		}
+		pr_info("Re-attached to active RMM across live update\n");
+		goto out_free_sro;
+	}
+#endif
 	if (rmi_ret) {
 		pr_err("RMM config set failed\n");
 		ret = -EINVAL;
@@ -741,6 +1044,287 @@ bool is_rmi_available(void)
 	return arm64_rmi_is_available;
 }
 
+#ifdef CONFIG_LIVEUPDATE
+static int arm_rmm_restore_flb_entries(struct arm_rmm_luo_flb_state *state)
+{
+	struct rmi_sro_donated_entry *entries;
+	struct page *entries_page;
+	u64 entries_pa;
+	size_t i;
+
+	if (!state->nr_pages || !state->entries_pa)
+		return 0;
+
+	entries_pa = state->entries_pa;
+	state->entries_pa = 0;
+	entries_page = kho_restore_pages(entries_pa, state->nr_pages);
+	if (!entries_page)
+		return -ENOMEM;
+
+	entries = page_to_virt(entries_page);
+	for (i = 0; i < state->count; i++) {
+		if (!kho_restore_pages(entries[i].phys_addr,
+				       entries[i].nr_pages)) {
+			while (i--)
+				rmi_ledger_remove_reclaimed(entries[i].phys_addr,
+							    entries[i].nr_pages);
+			free_pages_exact(entries, state->nr_pages * PAGE_SIZE);
+			return -ENOMEM;
+		}
+		rmi_ledger_record_donated(entries[i].phys_addr,
+					  entries[i].nr_pages,
+					  GFP_KERNEL);
+	}
+	free_pages_exact(entries, state->nr_pages * PAGE_SIZE);
+	return 0;
+}
+
+static int __init arm_rmm_kho_restore_incoming(void)
+{
+	struct arm_rmm_luo_flb_state *state;
+	phys_addr_t state_phys;
+	size_t state_size;
+	int ret;
+
+	if (!is_kho_boot() || arm_rmm_incoming_restored)
+		return 0;
+
+	ret = kho_retrieve_subtree(ARM_RMM_LUO_FLB_NAME, &state_phys,
+				   &state_size);
+	if (ret == -ENOENT)
+		return 0;
+	if (ret)
+		return ret;
+	if (state_size < sizeof(*state))
+		return -EINVAL;
+
+	state = phys_to_virt(state_phys);
+	ret = arm_rmm_restore_flb_entries(state);
+	kho_restore_free(state);
+	if (!ret)
+		arm_rmm_incoming_restored = true;
+	return ret;
+}
+
+static void __init rmi_ledger_free_all(void)
+{
+	struct rmi_donated_node *node, *tmp;
+
+	guard(mutex)(&rmi_donated_lock);
+	list_for_each_entry_safe(node, tmp, &rmi_donated_list, list) {
+		list_del(&node->list);
+		kfree(node);
+	}
+	rmi_donated_count = 0;
+	arm_rmm_incoming_restored = false;
+}
+
+static int arm_rmm_reboot_notify(struct notifier_block *nb,
+				 unsigned long action, void *data)
+{
+	guard(mutex)(&rmi_donated_lock);
+	WARN_ON_ONCE(arm_rmm_sync_kho_locked());
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block arm_rmm_reboot_nb = {
+	.notifier_call = arm_rmm_reboot_notify,
+};
+
+static int __init arm_rmm_kho_init(void)
+{
+	struct arm_rmm_luo_flb_state *state;
+	int ret;
+
+	if (!arm64_rmi_is_available || !kho_is_enabled())
+		return 0;
+
+	scoped_guard(mutex, &rmi_donated_lock) {
+		state = kho_alloc_preserve(sizeof(*state));
+		if (IS_ERR(state))
+			return PTR_ERR(state);
+
+		ret = arm_rmm_populate_flb_entries_locked(state);
+		if (ret) {
+			arm_rmm_unpreserve_all_nodes_locked();
+			kho_unpreserve_free(state);
+			return ret;
+		}
+
+		ret = kho_add_subtree(ARM_RMM_LUO_FLB_NAME, state,
+				      sizeof(*state));
+		if (ret) {
+			arm_rmm_free_entries_table(state);
+			arm_rmm_unpreserve_all_nodes_locked();
+			kho_unpreserve_free(state);
+			return ret;
+		}
+
+		arm_rmm_kho_state = state;
+	}
+
+	/*
+	 * arm_rmm_reboot_notify() takes rmi_donated_lock under
+	 * reboot_notifier_list.rwsem, so register outside rmi_donated_lock.
+	 */
+	register_reboot_notifier(&arm_rmm_reboot_nb);
+	return 0;
+}
+fs_initcall_sync(arm_rmm_kho_init);
+#else
+static inline int arm_rmm_kho_restore_incoming(void)
+{
+	return 0;
+}
+
+static inline void rmi_ledger_free_all(void)
+{
+}
+#endif
+
+#if IS_ENABLED(CONFIG_KVM) && IS_ENABLED(CONFIG_LIVEUPDATE)
+int arm_rmm_luo_sync_donations(void)
+{
+	guard(mutex)(&rmi_donated_lock);
+	return arm_rmm_sync_kho_locked();
+}
+EXPORT_SYMBOL_GPL(arm_rmm_luo_sync_donations);
+
+static int arm_rmm_flb_preserve(struct liveupdate_flb_op_args *argp)
+{
+	struct arm_rmm_luo_flb_state *state;
+	int ret;
+
+	guard(mutex)(&rmi_donated_lock);
+	ret = arm_rmm_sync_kho_locked();
+	if (ret)
+		return ret;
+
+	state = kho_alloc_preserve(sizeof(*state));
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+
+	if (arm_rmm_kho_state) {
+		state->count = arm_rmm_kho_state->count;
+		state->nr_pages = 0;
+		state->entries_pa = 0;
+	} else {
+		ret = arm_rmm_populate_flb_entries_locked(state);
+		if (ret) {
+			arm_rmm_unpreserve_all_nodes_locked();
+			kho_unpreserve_free(state);
+			return ret;
+		}
+	}
+
+	arm_rmm_flb_state = state;
+	argp->data = virt_to_phys(state);
+	argp->obj = state;
+	return 0;
+}
+
+static void arm_rmm_flb_unpreserve(struct liveupdate_flb_op_args *argp)
+{
+	struct arm_rmm_luo_flb_state *state = argp->obj ? : phys_to_virt(argp->data);
+
+	guard(mutex)(&rmi_donated_lock);
+	if (!state)
+		return;
+
+	if (arm_rmm_flb_state == state)
+		arm_rmm_flb_state = NULL;
+	arm_rmm_free_entries_table(state);
+	if (!arm_rmm_kho_state)
+		arm_rmm_unpreserve_all_nodes_locked();
+	kho_unpreserve_free(state);
+}
+
+static struct liveupdate_flb arm_rmm_luo_flb;
+
+static int arm_rmm_flb_retrieve(struct liveupdate_flb_op_args *argp)
+{
+	struct arm_rmm_luo_flb_state *state;
+	struct page *entries_page;
+	int ret = 0;
+
+	if (!argp->data)
+		return -EINVAL;
+
+	state = phys_to_virt(argp->data);
+	if (!arm_rmm_incoming_restored) {
+		ret = arm_rmm_restore_flb_entries(state);
+		if (!ret)
+			arm_rmm_incoming_restored = true;
+	} else if (state->nr_pages && state->entries_pa) {
+		entries_page = kho_restore_pages(state->entries_pa,
+						 state->nr_pages);
+		state->entries_pa = 0;
+		if (entries_page)
+			free_pages_exact(page_to_virt(entries_page),
+					 state->nr_pages * PAGE_SIZE);
+	}
+
+	kho_restore_free(state);
+	if (ret)
+		return ret;
+
+	argp->obj = &arm_rmm_luo_flb;
+	return 0;
+}
+
+static void arm_rmm_flb_finish(struct liveupdate_flb_op_args *argp)
+{
+}
+
+static const struct liveupdate_flb_ops arm_rmm_luo_flb_ops = {
+	.preserve	= arm_rmm_flb_preserve,
+	.unpreserve	= arm_rmm_flb_unpreserve,
+	.retrieve	= arm_rmm_flb_retrieve,
+	.finish		= arm_rmm_flb_finish,
+	.owner		= THIS_MODULE,
+};
+
+static struct liveupdate_flb arm_rmm_luo_flb = {
+	.ops		= &arm_rmm_luo_flb_ops,
+	.name		= ARM_RMM_LUO_FLB_NAME,
+};
+
+static int __init arm_rmm_luo_init(void)
+{
+	void *obj;
+	int ret;
+
+	ret = kvm_luo_register_flb(&arm_rmm_luo_flb);
+	if (ret)
+		return ret;
+
+	ret = liveupdate_flb_get_incoming(&arm_rmm_luo_flb, &obj);
+	if (!ret) {
+		liveupdate_flb_put_incoming(&arm_rmm_luo_flb);
+	} else if (ret != -ENODATA && ret != -ENOENT && ret != -EOPNOTSUPP) {
+		pr_err("Failed to retrieve RMM FLB state: %d\n", ret);
+		kvm_luo_unregister_flb(&arm_rmm_luo_flb);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void __init arm_rmm_luo_cleanup(void)
+{
+	kvm_luo_unregister_flb(&arm_rmm_luo_flb);
+}
+#else
+static inline int arm_rmm_luo_init(void)
+{
+	return 0;
+}
+
+static inline void arm_rmm_luo_cleanup(void)
+{
+}
+#endif
+
 static int __init arm64_init_rmi(void)
 {
 	int ret;
@@ -754,13 +1338,31 @@ static int __init arm64_init_rmi(void)
 	if (ret)
 		return ret;
 
-	ret = rmi_configure();
-	if (ret)
+	ret = arm_rmm_kho_restore_incoming();
+	if (ret) {
+		pr_err("Failed to restore RMM KHO donation ledger: %d\n", ret);
 		return ret;
+	}
+
+	ret = arm_rmm_luo_init();
+	if (ret) {
+		rmi_ledger_free_all();
+		return ret;
+	}
+
+	ret = rmi_configure();
+	if (ret) {
+		arm_rmm_luo_cleanup();
+		rmi_ledger_free_all();
+		return ret;
+	}
 
 	ret = rmi_init_metadata();
-	if (ret)
+	if (ret) {
+		arm_rmm_luo_cleanup();
+		rmi_ledger_free_all();
 		return ret;
+	}
 
 	arm64_rmi_is_available = true;
 	pr_info("RMI configured\n");
