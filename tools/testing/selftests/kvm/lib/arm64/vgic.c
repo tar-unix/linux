@@ -49,21 +49,25 @@ int __vgic_v3_setup(struct kvm_vm *vm, unsigned int nr_vcpus, u32 nr_irqs)
 
 	/* Distributor setup */
 	gic_fd = __kvm_create_device(vm, KVM_DEV_TYPE_ARM_VGIC_V3);
-	if (gic_fd < 0)
+	if (gic_fd >= 0) {
+		kvm_device_attr_set(gic_fd, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0,
+				    &nr_irqs);
+
+		attr = GICD_BASE_GPA;
+		kvm_device_attr_set(gic_fd, KVM_DEV_ARM_VGIC_GRP_ADDR,
+				    KVM_VGIC_V3_ADDR_TYPE_DIST, &attr);
+
+		attr = REDIST_REGION_ATTR_ADDR(nr_vcpus, GICR_BASE_GPA, 0, 0);
+		kvm_device_attr_set(gic_fd, KVM_DEV_ARM_VGIC_GRP_ADDR,
+				    KVM_VGIC_V3_ADDR_TYPE_REDIST_REGION, &attr);
+	} else if (errno != EEXIST) {
 		return gic_fd;
+	}
 
-	kvm_device_attr_set(gic_fd, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &nr_irqs);
-
-	attr = GICD_BASE_GPA;
-	kvm_device_attr_set(gic_fd, KVM_DEV_ARM_VGIC_GRP_ADDR,
-			    KVM_VGIC_V3_ADDR_TYPE_DIST, &attr);
 	nr_gic_pages = vm_calc_num_guest_pages(vm->mode, KVM_VGIC_V3_DIST_SIZE);
 	virt_map(vm, GICD_BASE_GPA, GICD_BASE_GPA, nr_gic_pages);
 
 	/* Redistributor setup */
-	attr = REDIST_REGION_ATTR_ADDR(nr_vcpus, GICR_BASE_GPA, 0, 0);
-	kvm_device_attr_set(gic_fd, KVM_DEV_ARM_VGIC_GRP_ADDR,
-			    KVM_VGIC_V3_ADDR_TYPE_REDIST_REGION, &attr);
 	nr_gic_pages = vm_calc_num_guest_pages(vm->mode,
 						KVM_VGIC_V3_REDIST_SIZE * nr_vcpus);
 	virt_map(vm, GICR_BASE_GPA, GICR_BASE_GPA, nr_gic_pages);
@@ -73,6 +77,9 @@ int __vgic_v3_setup(struct kvm_vm *vm, unsigned int nr_vcpus, u32 nr_irqs)
 
 void __vgic_v3_init(int fd)
 {
+	if (fd < 0)
+		return;
+
 	kvm_device_attr_set(fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
 			    KVM_DEV_ARM_VGIC_CTRL_INIT, NULL);
 }

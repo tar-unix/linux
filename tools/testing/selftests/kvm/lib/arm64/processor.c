@@ -716,7 +716,7 @@ void kvm_arch_vm_finalize_vcpus(struct kvm_vm *vm)
 
 void kvm_arch_vm_release(struct kvm_vm *vm)
 {
-	if (vm->arch.has_gic)
+	if (vm->arch.has_gic && vm->arch.gic_fd >= 0)
 		close(vm->arch.gic_fd);
 }
 

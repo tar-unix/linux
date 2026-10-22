@@ -21,6 +21,11 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <stdarg.h>
+#define KVM_ARCH_HEADER "asm/kvm.h"
+#if __has_include(KVM_ARCH_HEADER)
+#define HAVE_KVM_UAPI 1
+#include <linux/kvm.h>
+#endif
 #include <linux/unistd.h>
 
 #include <libliveupdate.h>
@@ -117,6 +122,29 @@ int luo_session_retrieve_fd_arg(int session_fd, __u64 token, __u64 user_arg)
 int luo_session_retrieve_fd(int session_fd, __u64 token)
 {
 	return luo_session_retrieve_fd_arg(session_fd, token, 0);
+}
+
+int luo_preserve_vcpu(int session_fd, int vcpu_fd, __u64 token)
+{
+	return luo_session_preserve_fd(session_fd, vcpu_fd, token);
+}
+
+int luo_retrieve_vcpu(int session_fd, __u64 token, int vm_fd)
+{
+#ifdef HAVE_KVM_UAPI
+	struct kvm_vcpu_luo_retrieve arg = {
+		.size = sizeof(arg),
+		.vm_fd = vm_fd,
+	};
+
+	return luo_session_retrieve_fd_arg(session_fd, token,
+					   (unsigned long)&arg);
+#else
+	(void)session_fd;
+	(void)token;
+	(void)vm_fd;
+	return -ENOTSUP;
+#endif
 }
 
 /* Helper function to get a session name via ioctl. */

@@ -34,6 +34,9 @@ int luo_session_preserve_fd_arg(int session_fd, int fd, __u64 token,
 int luo_session_retrieve_fd(int session_fd, __u64 token);
 int luo_session_retrieve_fd_arg(int session_fd, __u64 token, __u64 user_arg);
 
+int luo_preserve_vcpu(int session_fd, int vcpu_fd, __u64 token);
+int luo_retrieve_vcpu(int session_fd, __u64 token, int vm_fd);
+
 int create_and_preserve_memfd(int session_fd, int token, const char *data);
 int restore_and_verify_memfd(int session_fd, int token, const char *expected_data);
 

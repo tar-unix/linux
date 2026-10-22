@@ -1446,11 +1446,8 @@ static bool vcpu_exists(struct kvm_vm *vm, u32 vcpu_id)
 	return false;
 }
 
-/*
- * Adds a virtual CPU to the VM specified by vm with the ID given by vcpu_id.
- * No additional vCPU setup is done.  Returns the vCPU.
- */
-struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
+static struct kvm_vcpu *vcpu_alloc_and_open(struct kvm_vm *vm, u32 vcpu_id,
+					    int vcpu_fd)
 {
 	struct kvm_vcpu *vcpu;
 
@@ -1463,8 +1460,14 @@ struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
 
 	vcpu->vm = vm;
 	vcpu->id = vcpu_id;
-	vcpu->fd = __vm_ioctl(vm, KVM_CREATE_VCPU, (void *)(unsigned long)vcpu_id);
-	TEST_ASSERT_VM_VCPU_IOCTL(vcpu->fd >= 0, KVM_CREATE_VCPU, vcpu->fd, vm);
+	if (vcpu_fd >= 0) {
+		vcpu->fd = vcpu_fd;
+	} else {
+		vcpu->fd = __vm_ioctl(vm, KVM_CREATE_VCPU,
+				      (void *)(unsigned long)vcpu_id);
+		TEST_ASSERT_VM_VCPU_IOCTL(vcpu->fd >= 0, KVM_CREATE_VCPU,
+					  vcpu->fd, vm);
+	}
 
 	TEST_ASSERT(vcpu_mmap_sz() >= sizeof(*vcpu->run), "vcpu mmap size "
 		"smaller than expected, vcpu_mmap_sz: %zi expected_min: %zi",
@@ -1481,6 +1484,23 @@ struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
 	list_add(&vcpu->list, &vm->vcpus);
 
 	return vcpu;
+}
+
+/*
+ * Adds a virtual CPU to the VM specified by vm with the ID given by vcpu_id.
+ * No additional vCPU setup is done.  Returns the vCPU.
+ */
+struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
+{
+	return vcpu_alloc_and_open(vm, vcpu_id, -1);
+}
+
+struct kvm_vcpu *vm_vcpu_add_from_fd(struct kvm_vm *vm, u32 vcpu_id,
+				     int vcpu_fd)
+{
+	TEST_ASSERT(vcpu_fd >= 0, "Invalid vCPU file descriptor %d", vcpu_fd);
+
+	return vcpu_alloc_and_open(vm, vcpu_id, vcpu_fd);
 }
 
 /*
@@ -1776,10 +1796,17 @@ void vm_create_irqchip(struct kvm_vm *vm)
 	 * support for KVM_CREATE_IRQCHIP).
 	 */
 	r = __vm_ioctl(vm, KVM_CREATE_IRQCHIP, NULL);
-	if (r && errno == ENOTTY && kvm_has_cap(KVM_CAP_SPLIT_IRQCHIP))
-		vm_enable_cap(vm, KVM_CAP_SPLIT_IRQCHIP, 24);
-	else
+	if (r && errno == ENOTTY && kvm_has_cap(KVM_CAP_SPLIT_IRQCHIP)) {
+		r = __vm_enable_cap(vm, KVM_CAP_SPLIT_IRQCHIP, 24);
+		if (r && errno == EEXIST)
+			r = 0;
+		else
+			TEST_ASSERT_VM_VCPU_IOCTL(!r, KVM_ENABLE_CAP, r, vm);
+	} else if (r && errno == EEXIST) {
+		r = 0;
+	} else {
 		TEST_ASSERT_VM_VCPU_IOCTL(!r, KVM_CREATE_IRQCHIP, r, vm);
+	}
 
 	vm->has_irqchip = true;
 }
