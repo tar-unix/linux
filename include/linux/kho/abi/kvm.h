@@ -319,6 +319,26 @@ struct tdx_luo_flb_state {
 
 static_assert(sizeof(struct tdx_luo_flb_state) == 5416);
 
+/**
+ * struct kvm_tdx_luo_sept_page - One preserved S-EPT mirror page table node.
+ * @gfn:         Base GFN covered by this SP.
+ * @spt_pfn:     PFN of KVM software mirror page (sp->spt).
+ * @ext_spt_pfn: PFN of SEAM S-EPT page (sp->external_spt; 0 for root level).
+ * @role_bits:   Preserved kvm_mmu_page_role word.
+ * @level:       Page table level (PG_LEVEL_4K .. root_level).
+ * @reserved:    Reserved for alignment, must be zero.
+ */
+struct kvm_tdx_luo_sept_page {
+	u64 gfn;
+	u64 spt_pfn;
+	u64 ext_spt_pfn;
+	u32 role_bits;
+	u8 level;
+	u8 reserved[3];
+};
+
+static_assert(sizeof(struct kvm_tdx_luo_sept_page) == 32);
+
 #define KVM_LUO_X86_MAX_CPUID_ENTRIES	256
 #define KVM_LUO_X86_MAX_MSR_ENTRIES	512
 #define KVM_LUO_X86_MAX_IRQ_ROUTES	1024

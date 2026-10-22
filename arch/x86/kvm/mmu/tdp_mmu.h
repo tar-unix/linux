@@ -119,4 +119,21 @@ static inline bool is_tdp_mmu_page(struct kvm_mmu_page *sp) { return sp->tdp_mmu
 static inline bool is_tdp_mmu_page(struct kvm_mmu_page *sp) { return false; }
 #endif
 
+#ifdef CONFIG_LIVEUPDATE
+struct kvm_tdx_luo_sept_page;
+
+long kvm_tdp_mmu_luo_count_mirror_pages(struct kvm *kvm);
+int kvm_tdp_mmu_luo_preserve_mirror(struct kvm *kvm,
+				    struct kvm_tdx_luo_sept_page *pages,
+				    u64 max_pages, u64 *nr_out);
+void kvm_tdp_mmu_luo_unpreserve_mirror(const struct kvm_tdx_luo_sept_page *pages,
+				       u64 nr_pages);
+int kvm_tdp_mmu_luo_retrieve_mirror(struct kvm *kvm,
+				    const struct kvm_tdx_luo_sept_page *pages,
+				    u64 nr_pages,
+				    int (*verify_sept)(struct kvm *kvm,
+						       gfn_t gfn, int level,
+						       u64 mirror_spte));
+#endif
+
 #endif /* __KVM_X86_MMU_TDP_MMU_H */

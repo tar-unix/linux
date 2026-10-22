@@ -1948,3 +1948,318 @@ u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, gfn_t gfn,
 	 */
 	return rcu_dereference(sptep);
 }
+
+#ifdef CONFIG_LIVEUPDATE
+#include <linux/kexec_handover.h>
+#include <linux/kho/abi/kvm.h>
+
+static struct kvm_mmu_page *tdp_mmu_luo_find_mirror_root(struct kvm *kvm)
+{
+	struct kvm_mmu_page *root;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	__for_each_tdp_mmu_root(kvm, root, -1, KVM_MIRROR_ROOTS)
+		return root;
+
+	return NULL;
+}
+
+long kvm_tdp_mmu_luo_count_mirror_pages(struct kvm *kvm)
+{
+	struct kvm_mmu_page *root;
+	struct tdp_iter iter;
+	long count = 0;
+
+	guard(write_lock)(&kvm->mmu_lock);
+	guard(rcu)();
+
+	root = tdp_mmu_luo_find_mirror_root(kvm);
+	if (!root)
+		return 0;
+
+	count = 1;
+	for_each_tdp_pte_min_level(iter, kvm, root, PG_LEVEL_2M, 0,
+				   tdp_mmu_max_gfn_exclusive()) {
+		if (!is_shadow_present_pte(iter.old_spte) ||
+		    is_last_spte(iter.old_spte, iter.level))
+			continue;
+
+		count++;
+	}
+
+	return count;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_tdp_mmu_luo_count_mirror_pages);
+
+static void tdp_mmu_luo_snapshot_one_sp(struct kvm_mmu_page *sp,
+					struct kvm_tdx_luo_sept_page *entry)
+{
+	entry->gfn = sp->gfn;
+	entry->spt_pfn = __pa(sp->spt) >> PAGE_SHIFT;
+	entry->ext_spt_pfn = sp->external_spt ?
+			     (__pa(sp->external_spt) >> PAGE_SHIFT) : 0;
+	entry->role_bits = sp->role.word;
+	entry->level = sp->role.level;
+	memset(entry->reserved, 0, sizeof(entry->reserved));
+}
+
+int kvm_tdp_mmu_luo_preserve_mirror(struct kvm *kvm,
+				    struct kvm_tdx_luo_sept_page *pages,
+				    u64 max_pages, u64 *nr_out)
+{
+	struct kvm_mmu_page *root;
+	struct tdp_iter iter;
+	u64 i, idx = 0;
+	int ret = 0;
+
+	*nr_out = 0;
+
+	write_lock(&kvm->mmu_lock);
+	rcu_read_lock();
+
+	root = tdp_mmu_luo_find_mirror_root(kvm);
+	if (!root) {
+		rcu_read_unlock();
+		write_unlock(&kvm->mmu_lock);
+		return 0;
+	}
+
+	if (max_pages < 1) {
+		rcu_read_unlock();
+		write_unlock(&kvm->mmu_lock);
+		return -ENOSPC;
+	}
+
+	tdp_mmu_luo_snapshot_one_sp(root, &pages[idx++]);
+
+	for_each_tdp_pte_min_level(iter, kvm, root, PG_LEVEL_2M, 0,
+				   tdp_mmu_max_gfn_exclusive()) {
+		struct kvm_mmu_page *child_sp;
+
+		if (!is_shadow_present_pte(iter.old_spte) ||
+		    is_last_spte(iter.old_spte, iter.level))
+			continue;
+
+		if (idx >= max_pages) {
+			rcu_read_unlock();
+			write_unlock(&kvm->mmu_lock);
+			return -ENOSPC;
+		}
+
+		child_sp = spte_to_child_sp(iter.old_spte);
+		tdp_mmu_luo_snapshot_one_sp(child_sp, &pages[idx++]);
+	}
+
+	rcu_read_unlock();
+	write_unlock(&kvm->mmu_lock);
+
+	for (i = 0; i < idx; i++) {
+		ret = kho_preserve_folio(pfn_folio(pages[i].spt_pfn));
+		if (ret)
+			goto err_unpreserve;
+
+		if (pages[i].ext_spt_pfn) {
+			ret = kho_preserve_folio(pfn_folio(pages[i].ext_spt_pfn));
+			if (ret) {
+				kho_unpreserve_folio(pfn_folio(pages[i].spt_pfn));
+				goto err_unpreserve;
+			}
+		}
+	}
+
+	*nr_out = idx;
+	return 0;
+
+err_unpreserve:
+	kvm_tdp_mmu_luo_unpreserve_mirror(pages, i);
+	return ret;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_tdp_mmu_luo_preserve_mirror);
+
+void kvm_tdp_mmu_luo_unpreserve_mirror(const struct kvm_tdx_luo_sept_page *pages,
+				       u64 nr_pages)
+{
+	u64 i;
+
+	for (i = 0; i < nr_pages; i++) {
+		if (pages[i].ext_spt_pfn)
+			kho_unpreserve_folio(pfn_folio(pages[i].ext_spt_pfn));
+		if (pages[i].spt_pfn)
+			kho_unpreserve_folio(pfn_folio(pages[i].spt_pfn));
+	}
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_tdp_mmu_luo_unpreserve_mirror);
+
+int kvm_tdp_mmu_luo_retrieve_mirror(struct kvm *kvm,
+				    const struct kvm_tdx_luo_sept_page *pages,
+				    u64 nr_pages,
+				    int (*verify_sept)(struct kvm *kvm,
+						       gfn_t gfn, int level,
+						       u64 mirror_spte))
+{
+	struct kvm_mmu_page *root = NULL;
+	struct kvm_mmu_page **sps;
+	u64 i;
+	int ret = 0;
+
+	if (!nr_pages)
+		return 0;
+
+	for (i = 0; i < nr_pages; i++) {
+		const struct kvm_tdx_luo_sept_page *entry = &pages[i];
+		union kvm_mmu_page_role role;
+
+		role.word = entry->role_bits;
+		if (!role.is_mirror || role.level != entry->level ||
+		    entry->level < PG_LEVEL_4K ||
+		    entry->level > PT64_ROOT_MAX_LEVEL ||
+		    !IS_ALIGNED(entry->gfn, KVM_PAGES_PER_HPAGE(entry->level + 1)) ||
+		    !entry->spt_pfn || !pfn_to_online_page(entry->spt_pfn))
+			return -EINVAL;
+
+		if (i == 0) {
+			if (entry->gfn != 0 || entry->ext_spt_pfn != 0)
+				return -EINVAL;
+		} else {
+			bool has_parent = false;
+			gfn_t parent_gfn;
+			u64 j;
+
+			if (!entry->ext_spt_pfn ||
+			    entry->ext_spt_pfn == entry->spt_pfn ||
+			    !pfn_to_online_page(entry->ext_spt_pfn) ||
+			    entry->level >= pages[0].level)
+				return -EINVAL;
+
+			parent_gfn = ALIGN_DOWN(entry->gfn,
+						KVM_PAGES_PER_HPAGE(entry->level + 2));
+
+			for (j = 0; j < i; j++) {
+				if (pages[j].spt_pfn == entry->spt_pfn ||
+				    pages[j].spt_pfn == entry->ext_spt_pfn ||
+				    (pages[j].ext_spt_pfn &&
+				     (pages[j].ext_spt_pfn == entry->spt_pfn ||
+				      pages[j].ext_spt_pfn == entry->ext_spt_pfn)))
+					return -EINVAL;
+				if (pages[j].level == entry->level &&
+				    pages[j].gfn == entry->gfn)
+					return -EINVAL;
+				if (pages[j].level == entry->level + 1 &&
+				    pages[j].gfn == parent_gfn)
+					has_parent = true;
+			}
+			if (!has_parent)
+				return -EINVAL;
+
+			if (verify_sept) {
+				ret = verify_sept(kvm, entry->gfn,
+						  entry->level + 1,
+						  PFN_PHYS(entry->ext_spt_pfn));
+				if (ret)
+					return ret;
+			}
+		}
+
+		if (entry->level == PG_LEVEL_4K && verify_sept) {
+			u64 *spt = pfn_to_kaddr(entry->spt_pfn);
+			int idx;
+
+			for (idx = 0; idx < SPTE_ENT_PER_PAGE; idx++) {
+				if (!is_shadow_present_pte(spt[idx]))
+					continue;
+				ret = verify_sept(kvm, entry->gfn + idx,
+						  PG_LEVEL_4K, spt[idx]);
+				if (ret)
+					return ret;
+			}
+		}
+	}
+
+	sps = kvcalloc(nr_pages, sizeof(*sps), GFP_KERNEL_ACCOUNT);
+	if (!sps)
+		return -ENOMEM;
+
+	for (i = 0; i < nr_pages; i++) {
+		sps[i] = kmem_cache_zalloc(mmu_page_header_cache,
+					   GFP_KERNEL_ACCOUNT);
+		if (!sps[i]) {
+			ret = -ENOMEM;
+			goto out_free_sps;
+		}
+	}
+
+	write_lock(&kvm->mmu_lock);
+	rcu_read_lock();
+
+	for (i = 0; i < nr_pages; i++) {
+		const struct kvm_tdx_luo_sept_page *entry = &pages[i];
+		union kvm_mmu_page_role role;
+		struct kvm_mmu_page *sp;
+		tdp_ptep_t sptep = NULL;
+
+		role.word = entry->role_bits;
+		if (i > 0) {
+			struct kvm_mmu_page *cur_sp = root;
+			int l;
+
+			for (l = root->role.level; l > entry->level + 1; l--) {
+				int idx = SPTE_INDEX(entry->gfn << PAGE_SHIFT, l);
+				u64 spte = cur_sp->spt[idx];
+
+				cur_sp = spte_to_child_sp(spte);
+			}
+			sptep = (tdp_ptep_t)&cur_sp->spt[SPTE_INDEX(entry->gfn << PAGE_SHIFT,
+								    entry->level + 1)];
+		}
+
+		sp = sps[i];
+		sps[i] = NULL;
+		sp->spt = pfn_to_kaddr(entry->spt_pfn);
+		sp->external_spt = entry->ext_spt_pfn ?
+				   pfn_to_kaddr(entry->ext_spt_pfn) : NULL;
+		if (role.level > PG_LEVEL_4K)
+			memset64(sp->spt, SHADOW_NONPRESENT_VALUE,
+				 SPTE_ENT_PER_PAGE);
+		tdp_mmu_init_sp(sp, sptep, entry->gfn, role);
+
+		if (i == 0) {
+			root = sp;
+			refcount_set(&root->tdp_mmu_root_count, 1);
+		} else {
+			u64 parent_spte = make_nonleaf_spte(sp->spt, !kvm_ad_enabled);
+
+			tdp_account_mmu_page(kvm, sp);
+			__kvm_tdp_mmu_write_spte(sptep, parent_spte);
+		}
+
+		if (sp->role.level == PG_LEVEL_4K) {
+			int idx;
+
+			for (idx = 0; idx < SPTE_ENT_PER_PAGE; idx++) {
+				if (!is_shadow_present_pte(sp->spt[idx]))
+					continue;
+				kvm_update_page_stats(kvm, PG_LEVEL_4K, 1);
+			}
+		}
+	}
+
+	if (root) {
+		spin_lock(&kvm->arch.tdp_mmu_pages_lock);
+		list_add_rcu(&root->link, &kvm->arch.tdp_mmu_roots);
+		spin_unlock(&kvm->arch.tdp_mmu_pages_lock);
+	}
+
+	rcu_read_unlock();
+	write_unlock(&kvm->mmu_lock);
+
+out_free_sps:
+	for (i = 0; i < nr_pages; i++) {
+		if (sps[i])
+			kmem_cache_free(mmu_page_header_cache, sps[i]);
+	}
+	kvfree(sps);
+	return ret;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_tdp_mmu_luo_retrieve_mirror);
+#endif /* CONFIG_LIVEUPDATE */
