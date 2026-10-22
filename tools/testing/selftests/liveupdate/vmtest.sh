@@ -4,6 +4,7 @@
 set -ue
 
 CROSS_COMPILE="${CROSS_COMPILE:-""}"
+VMTEST_ACCEL="${VMTEST_ACCEL:-kvm hvf tcg}"
 
 test_dir=$(realpath "$(dirname "$0")")
 kernel_dir=$(realpath "$test_dir/../../../..")
@@ -194,13 +195,19 @@ function run_qemu() {
 	local cmdline=$2
 	local kernel_path=$3
 	local serial="$workspace_dir/qemu.serial"
+	local accel_args=""
+	local accel
+
+	for accel in $VMTEST_ACCEL; do
+		accel_args="$accel_args -accel $accel"
+	done
 
 	cmdline="$cmdline liveupdate=on panic=-1"
 
 	echo "# Serial Log: $serial"
 	timeout "${test_timeout}s" \
 	$qemu_cmd -m 1G -smp 2 -no-reboot -nographic -nodefaults \
-		  -accel kvm -accel hvf -accel tcg \
+		  $accel_args \
 		  -serial file:"$serial" \
 		  -append "$cmdline" \
 		  -kernel "$kernel_path" \

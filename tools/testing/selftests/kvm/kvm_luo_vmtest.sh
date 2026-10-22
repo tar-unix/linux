@@ -59,6 +59,7 @@ function main() {
 	if [[ "$target" != "$(uname -m)" && -z "${CROSS_COMPILE:-}" ]]; then
 		export CROSS_COMPILE="$target-linux-gnu-"
 	fi
+	export VMTEST_ACCEL="${VMTEST_ACCEL:-tcg}"
 
 	local ws=$(mktemp -d /tmp/kvm-luo-test.XXXXXXXX)
 	[ -z "$keep" ] && trap 'rm -rf "$ws"' EXIT
