@@ -52,6 +52,10 @@ int kvm_get_feature_msrs(struct kvm_msrs __user *user_msrs);
 
 int kvm_get_msrs(struct kvm_vcpu *vcpu, struct kvm_msrs __user *user_msrs);
 int kvm_set_msrs(struct kvm_vcpu *vcpu, struct kvm_msrs __user *user_msrs);
+int kvm_luo_save_msrs(struct kvm_vcpu *vcpu, struct kvm_msr_entry *entries,
+		      u32 max_entries, u32 *nr_out);
+int kvm_luo_restore_msrs(struct kvm_vcpu *vcpu,
+			 const struct kvm_msr_entry *entries, u32 nr_entries);
 
 int kvm_get_set_one_reg(struct kvm_vcpu *vcpu, unsigned int ioctl,
 			void __user *argp);

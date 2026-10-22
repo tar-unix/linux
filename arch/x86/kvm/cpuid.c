@@ -660,6 +660,44 @@ int kvm_vcpu_ioctl_get_cpuid2(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
+int kvm_luo_save_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid_entry2 *entries,
+		       u32 max_entries, u32 *nent_out)
+{
+	if (vcpu->arch.cpuid_nent > max_entries)
+		return -E2BIG;
+
+	if (vcpu->arch.cpuid_dynamic_bits_dirty)
+		kvm_update_cpuid_runtime(vcpu);
+
+	if (vcpu->arch.cpuid_nent)
+		memcpy(entries, vcpu->arch.cpuid_entries,
+		       vcpu->arch.cpuid_nent * sizeof(*entries));
+	*nent_out = vcpu->arch.cpuid_nent;
+	return 0;
+}
+
+int kvm_luo_set_cpuid(struct kvm_vcpu *vcpu,
+		      const struct kvm_cpuid_entry2 *entries, u32 nent)
+{
+	struct kvm_cpuid_entry2 *e2 = NULL;
+	int r;
+
+	if (nent > KVM_MAX_CPUID_ENTRIES)
+		return -E2BIG;
+
+	if (nent) {
+		e2 = kvmemdup(entries, array_size(nent, sizeof(*e2)),
+			      GFP_KERNEL_ACCOUNT);
+		if (!e2)
+			return -ENOMEM;
+	}
+
+	r = kvm_set_cpuid(vcpu, e2, nent);
+	if (r)
+		kvfree(e2);
+	return r;
+}
+
 static __always_inline u32 raw_cpuid_get(struct cpuid_reg cpuid)
 {
 	struct kvm_cpuid_entry2 entry;

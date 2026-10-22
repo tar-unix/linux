@@ -501,6 +501,9 @@ unsigned long kvm_get_rflags(struct kvm_vcpu *vcpu);
 void __kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags);
 void kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags);
 
+void kvm_get_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs);
+void kvm_set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs);
+
 void kvm_vcpu_ioctl_x86_get_sregs2(struct kvm_vcpu *vcpu,
 				   struct kvm_sregs2 *sregs2);
 int kvm_vcpu_ioctl_x86_set_sregs2(struct kvm_vcpu *vcpu,

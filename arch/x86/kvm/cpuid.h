@@ -61,6 +61,10 @@ int kvm_vcpu_ioctl_set_cpuid2(struct kvm_vcpu *vcpu,
 int kvm_vcpu_ioctl_get_cpuid2(struct kvm_vcpu *vcpu,
 			      struct kvm_cpuid2 *cpuid,
 			      struct kvm_cpuid_entry2 __user *entries);
+int kvm_luo_save_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid_entry2 *entries,
+		       u32 max_entries, u32 *nent_out);
+int kvm_luo_set_cpuid(struct kvm_vcpu *vcpu,
+		      const struct kvm_cpuid_entry2 *entries, u32 nent);
 bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
 	       u32 *ecx, u32 *edx, bool exact_only);
 

@@ -87,6 +87,11 @@ static void __get_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
 	regs->rflags = kvm_get_rflags(vcpu);
 }
 
+void kvm_get_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
+{
+	__get_regs(vcpu, regs);
+}
+
 int kvm_arch_vcpu_ioctl_get_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
 {
 	if (vcpu->kvm->arch.has_protected_state &&
@@ -130,6 +135,11 @@ static void __set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
 	vcpu->arch.exception_vmexit.pending = false;
 
 	kvm_make_request(KVM_REQ_EVENT, vcpu);
+}
+
+void kvm_set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
+{
+	__set_regs(vcpu, regs);
 }
 
 int kvm_arch_vcpu_ioctl_set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)

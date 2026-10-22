@@ -2737,3 +2737,203 @@ int kvm_spec_ctrl_test_value(u64 value)
 	return ret;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_spec_ctrl_test_value);
+
+static bool kvm_luo_skip_msr(u32 index)
+{
+#ifdef CONFIG_KVM_HYPERV
+	if ((index >= HV_X64_MSR_GUEST_OS_ID &&
+	     index <= HV_X64_MSR_VP_ASSIST_PAGE) ||
+	    (index >= HV_X64_MSR_SCONTROL &&
+	     index <= HV_X64_MSR_STIMER3_COUNT) ||
+	    (index >= HV_X64_MSR_CRASH_P0 &&
+	     index <= HV_X64_MSR_TSC_INVARIANT_CONTROL) ||
+	    (index >= HV_X64_MSR_SYNDBG_CONTROL &&
+	     index <= HV_X64_MSR_SYNDBG_OPTIONS))
+		return true;
+#endif
+	switch (index) {
+	case MSR_IA32_TSC:
+	case MSR_IA32_TSC_DEADLINE:
+	case MSR_KVM_WALL_CLOCK:
+	case MSR_KVM_WALL_CLOCK_NEW:
+	case MSR_KVM_SYSTEM_TIME:
+	case MSR_KVM_SYSTEM_TIME_NEW:
+	case MSR_KVM_ASYNC_PF_EN:
+	case MSR_KVM_ASYNC_PF_INT:
+	case MSR_KVM_ASYNC_PF_ACK:
+	case MSR_KVM_STEAL_TIME:
+	case MSR_KVM_PV_EOI_EN:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int kvm_luo_try_save_msr(struct kvm_vcpu *vcpu, u32 index,
+				struct kvm_msr_entry *entries, u32 max_entries,
+				u32 *nr, bool *fpu_loaded)
+{
+	u64 data;
+
+	if (kvm_luo_skip_msr(index))
+		return 0;
+	if (vcpu->arch.guest_state_protected &&
+	    (!kvm_x86_call(has_emulated_msr)(vcpu->kvm, index) ||
+	     index == MSR_IA32_APICBASE || index == MSR_EFER ||
+	     index == MSR_IA32_FEAT_CTL || index == MSR_IA32_TSC_DEADLINE ||
+	     index == MSR_IA32_UCODE_REV))
+		return 0;
+	if (!vcpu->arch.guest_state_protected &&
+	    !*fpu_loaded && is_xstate_managed_msr(vcpu, index)) {
+		kvm_load_guest_fpu(vcpu);
+		*fpu_loaded = true;
+	}
+	if (__kvm_get_msr(vcpu, index, &data, true))
+		return 0;
+	if (*nr >= max_entries)
+		return -E2BIG;
+
+	entries[*nr].index = index;
+	entries[*nr].reserved = 0;
+	entries[*nr].data = data;
+	(*nr)++;
+	return 0;
+}
+
+static const u32 kvm_luo_extra_msrs[] = {
+	MSR_AMD64_DE_CFG,
+	MSR_VM_CR,
+	MSR_AMD64_OSVW_ID_LENGTH,
+	MSR_AMD64_OSVW_STATUS,
+	MSR_MTRRdefType,
+	MSR_MTRRfix64K_00000,
+	MSR_MTRRfix16K_80000,
+	MSR_MTRRfix16K_A0000,
+	MSR_MTRRfix4K_C0000,
+	MSR_MTRRfix4K_C8000,
+	MSR_MTRRfix4K_D0000,
+	MSR_MTRRfix4K_D8000,
+	MSR_MTRRfix4K_E0000,
+	MSR_MTRRfix4K_E8000,
+	MSR_MTRRfix4K_F0000,
+	MSR_MTRRfix4K_F8000,
+};
+
+int kvm_luo_save_msrs(struct kvm_vcpu *vcpu, struct kvm_msr_entry *entries,
+		      u32 max_entries, u32 *nr_out)
+{
+	unsigned int bank_num = vcpu->arch.mcg_cap & 0xff;
+	bool fpu_loaded = false;
+	int srcu_idx, ret = 0;
+	u32 i, nr = 0;
+
+	srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+
+	/*
+	 * Save emulated and feature MSRs before msrs_to_save[] so feature
+	 * gates (e.g. MSR_IA32_ARCH_CAPABILITIES, MSR_PLATFORM_INFO) are
+	 * restored before dependent MSRs (e.g. MSR_IA32_TSX_CTRL,
+	 * MSR_MISC_FEATURES_ENABLES).
+	 */
+	for (i = 0; i < num_emulated_msrs; i++) {
+		ret = kvm_luo_try_save_msr(vcpu, emulated_msrs[i], entries,
+					   max_entries, &nr, &fpu_loaded);
+		if (ret)
+			goto out;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(kvm_luo_extra_msrs); i++) {
+		ret = kvm_luo_try_save_msr(vcpu, kvm_luo_extra_msrs[i], entries,
+					   max_entries, &nr, &fpu_loaded);
+		if (ret)
+			goto out;
+	}
+
+	for (i = 0; i < KVM_NR_VAR_MTRR; i++) {
+		ret = kvm_luo_try_save_msr(vcpu, MTRRphysBase_MSR(i), entries,
+					   max_entries, &nr, &fpu_loaded);
+		if (ret)
+			goto out;
+		ret = kvm_luo_try_save_msr(vcpu, MTRRphysMask_MSR(i), entries,
+					   max_entries, &nr, &fpu_loaded);
+		if (ret)
+			goto out;
+	}
+
+	for (i = 0; i < num_msrs_to_save; i++) {
+		ret = kvm_luo_try_save_msr(vcpu, msrs_to_save[i], entries,
+					   max_entries, &nr, &fpu_loaded);
+		if (ret)
+			goto out;
+	}
+
+	if (guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK)) {
+		ret = kvm_luo_try_save_msr(vcpu, MSR_KVM_INTERNAL_GUEST_SSP,
+					   entries, max_entries, &nr,
+					   &fpu_loaded);
+		if (ret)
+			goto out;
+	}
+
+	for (i = 0; i < bank_num * 4; i++) {
+		ret = kvm_luo_try_save_msr(vcpu, MSR_IA32_MC0_CTL + i,
+					   entries, max_entries, &nr,
+					   &fpu_loaded);
+		if (ret)
+			goto out;
+	}
+
+	if (vcpu->arch.mcg_cap & MCG_CMCI_P) {
+		for (i = 0; i < bank_num; i++) {
+			ret = kvm_luo_try_save_msr(vcpu, MSR_IA32_MC0_CTL2 + i,
+						   entries, max_entries, &nr,
+						   &fpu_loaded);
+			if (ret)
+				goto out;
+		}
+	}
+
+	*nr_out = nr;
+out:
+	if (fpu_loaded)
+		kvm_put_guest_fpu(vcpu);
+	srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
+	return ret;
+}
+
+int kvm_luo_restore_msrs(struct kvm_vcpu *vcpu,
+			 const struct kvm_msr_entry *entries, u32 nr_entries)
+{
+	bool fpu_loaded = false, has_rtit_ctl = false;
+	u64 rtit_ctl = 0;
+	int srcu_idx;
+	u32 i;
+
+	srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+
+	for (i = 0; i < nr_entries; i++) {
+		u32 index = entries[i].index;
+
+		if (index == MSR_IA32_RTIT_CTL) {
+			rtit_ctl = entries[i].data;
+			has_rtit_ctl = true;
+			continue;
+		}
+
+		if (!vcpu->arch.guest_state_protected &&
+		    !fpu_loaded && is_xstate_managed_msr(vcpu, index)) {
+			kvm_load_guest_fpu(vcpu);
+			fpu_loaded = true;
+		}
+		(void)__kvm_set_msr(vcpu, index, entries[i].data, true);
+	}
+
+	if (has_rtit_ctl)
+		(void)__kvm_set_msr(vcpu, MSR_IA32_RTIT_CTL, rtit_ctl, true);
+
+	if (fpu_loaded)
+		kvm_put_guest_fpu(vcpu);
+	srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
+
+	return 0;
+}

@@ -1057,7 +1057,7 @@ static int set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
 	return 0;
 }
 
-static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
+int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
 {
 	u32 thresh_lo, thresh_hi;
 	int use_scaling = 0;
@@ -2812,8 +2812,7 @@ static int vcpu_ioctl_tpr_access_reporting(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int kvm_vcpu_ioctl_x86_setup_mce(struct kvm_vcpu *vcpu,
-					u64 mcg_cap)
+int kvm_vcpu_ioctl_x86_setup_mce(struct kvm_vcpu *vcpu, u64 mcg_cap)
 {
 	int r;
 	unsigned bank_num = mcg_cap & 0xff, bank;
@@ -2971,8 +2970,8 @@ void kvm_handle_exception_payload_quirk(struct kvm_vcpu *vcpu)
 		kvm_deliver_exception_payload(vcpu, ex);
 }
 
-static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
-					       struct kvm_vcpu_events *events)
+void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+					struct kvm_vcpu_events *events)
 {
 	struct kvm_queued_exception *ex = kvm_get_exception_to_save(vcpu);
 
@@ -3040,8 +3039,8 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
 	}
 }
 
-static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
-					      struct kvm_vcpu_events *events)
+int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+				       struct kvm_vcpu_events *events)
 {
 	if (events->flags & ~(KVM_VCPUEVENT_VALID_NMI_PENDING
 			      | KVM_VCPUEVENT_VALID_SIPI_VECTOR
@@ -3179,15 +3178,15 @@ static int kvm_vcpu_ioctl_x86_get_xsave2(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int kvm_vcpu_ioctl_x86_get_xsave(struct kvm_vcpu *vcpu,
-					struct kvm_xsave *guest_xsave)
+int kvm_vcpu_ioctl_x86_get_xsave(struct kvm_vcpu *vcpu,
+				 struct kvm_xsave *guest_xsave)
 {
 	return kvm_vcpu_ioctl_x86_get_xsave2(vcpu, (void *)guest_xsave->region,
 					     sizeof(guest_xsave->region));
 }
 
-static int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
-					struct kvm_xsave *guest_xsave)
+int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
+				 struct kvm_xsave *guest_xsave)
 {
 	union fpregs_state *xstate = (union fpregs_state *)guest_xsave->region;
 
@@ -3207,8 +3206,8 @@ static int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
 					      &vcpu->arch.pkru);
 }
 
-static int kvm_vcpu_ioctl_x86_get_xcrs(struct kvm_vcpu *vcpu,
-				       struct kvm_xcrs *guest_xcrs)
+int kvm_vcpu_ioctl_x86_get_xcrs(struct kvm_vcpu *vcpu,
+				struct kvm_xcrs *guest_xcrs)
 {
 	if (vcpu->kvm->arch.has_protected_state &&
 	    vcpu->arch.guest_state_protected)
@@ -3226,8 +3225,8 @@ static int kvm_vcpu_ioctl_x86_get_xcrs(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int kvm_vcpu_ioctl_x86_set_xcrs(struct kvm_vcpu *vcpu,
-				       struct kvm_xcrs *guest_xcrs)
+int kvm_vcpu_ioctl_x86_set_xcrs(struct kvm_vcpu *vcpu,
+				struct kvm_xcrs *guest_xcrs)
 {
 	int i, r = 0;
 
@@ -4442,6 +4441,41 @@ void kvm_luo_restore_clock(struct kvm *kvm, u64 clock_ns, u64 realtime_ns)
 		now_raw_ns = get_kvmclock_base_ns();
 	ka->kvmclock_offset = clock_ns - now_raw_ns;
 	kvm_end_pvclock_update(kvm);
+}
+
+void kvm_luo_restore_tsc(struct kvm_vcpu *vcpu, u64 l1_tsc_offset)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_vcpu *other;
+	unsigned long flags, i;
+	u32 matched_count = 0;
+	bool matched = false;
+	u64 tsc, ns;
+
+	raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+	tsc = kvm_scale_tsc(rdtsc(), vcpu->arch.l1_tsc_scaling_ratio) +
+	      l1_tsc_offset;
+	ns = get_kvmclock_base_ns();
+	__kvm_synchronize_tsc(vcpu, l1_tsc_offset, tsc, ns, false, true);
+
+	kvm_for_each_vcpu(i, other, kvm) {
+		if (other == vcpu)
+			continue;
+		if (other->arch.virtual_tsc_khz == vcpu->arch.virtual_tsc_khz &&
+		    other->arch.l1_tsc_offset == l1_tsc_offset) {
+			other->arch.this_tsc_generation =
+				kvm->arch.cur_tsc_generation;
+			other->arch.this_tsc_nsec = kvm->arch.cur_tsc_nsec;
+			other->arch.this_tsc_write = kvm->arch.cur_tsc_write;
+			matched_count++;
+			matched = true;
+		}
+	}
+	if (matched) {
+		kvm->arch.nr_vcpus_matched_tsc = matched_count;
+		kvm_track_tsc_matching(vcpu, false);
+	}
+	raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
 }
 
 long kvm_arch_vcpu_unlocked_ioctl(struct file *filp, unsigned int ioctl,
@@ -9121,12 +9155,11 @@ out:
 	return r;
 }
 
-int kvm_arch_vcpu_ioctl_get_mpstate(struct kvm_vcpu *vcpu,
-				    struct kvm_mp_state *mp_state)
+int kvm_vcpu_ioctl_x86_get_mpstate(struct kvm_vcpu *vcpu,
+				   struct kvm_mp_state *mp_state)
 {
 	int r;
 
-	vcpu_load(vcpu);
 	kvm_vcpu_srcu_read_lock(vcpu);
 
 	r = kvm_apic_accept_events(vcpu);
@@ -9143,17 +9176,23 @@ int kvm_arch_vcpu_ioctl_get_mpstate(struct kvm_vcpu *vcpu,
 
 out:
 	kvm_vcpu_srcu_read_unlock(vcpu);
+	return r;
+}
+
+int kvm_arch_vcpu_ioctl_get_mpstate(struct kvm_vcpu *vcpu,
+				    struct kvm_mp_state *mp_state)
+{
+	int r;
+
+	vcpu_load(vcpu);
+	r = kvm_vcpu_ioctl_x86_get_mpstate(vcpu, mp_state);
 	vcpu_put(vcpu);
 	return r;
 }
 
-int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
-				    struct kvm_mp_state *mp_state)
+int kvm_vcpu_ioctl_x86_set_mpstate(struct kvm_vcpu *vcpu,
+				   struct kvm_mp_state *mp_state)
 {
-	int ret = -EINVAL;
-
-	vcpu_load(vcpu);
-
 	switch (mp_state->mp_state) {
 	case KVM_MP_STATE_UNINITIALIZED:
 	case KVM_MP_STATE_HALTED:
@@ -9161,14 +9200,14 @@ int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
 	case KVM_MP_STATE_INIT_RECEIVED:
 	case KVM_MP_STATE_SIPI_RECEIVED:
 		if (!lapic_in_kernel(vcpu))
-			goto out;
+			return -EINVAL;
 		break;
 
 	case KVM_MP_STATE_RUNNABLE:
 		break;
 
 	default:
-		goto out;
+		return -EINVAL;
 	}
 
 	/*
@@ -9197,8 +9236,16 @@ int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
 
 	kvm_make_request(KVM_REQ_EVENT, vcpu);
 
-	ret = 0;
-out:
+	return 0;
+}
+
+int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
+				    struct kvm_mp_state *mp_state)
+{
+	int ret;
+
+	vcpu_load(vcpu);
+	ret = kvm_vcpu_ioctl_x86_set_mpstate(vcpu, mp_state);
 	vcpu_put(vcpu);
 	return ret;
 }
@@ -11134,6 +11181,180 @@ int kvm_sev_es_string_io(struct kvm_vcpu *vcpu, unsigned int size,
 		  : kvm_sev_es_outs(vcpu, size, port);
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_sev_es_string_io);
+
+static void kvm_luo_assign_reg(void *reg, u64 val, unsigned int bytes)
+{
+	switch (bytes) {
+	case 1:
+		*(u8 *)reg = (u8)val;
+		break;
+	case 2:
+		*(u16 *)reg = (u16)val;
+		break;
+	case 4:
+		*(unsigned long *)reg = (u32)val;
+		break;
+	case 8:
+		*(u64 *)reg = val;
+		break;
+	}
+}
+
+int kvm_luo_apply_userspace_io(struct kvm_vcpu *vcpu, struct kvm_regs *regs,
+			       bool *clear_interrupt_shadow)
+{
+	int (*cui)(struct kvm_vcpu *) = vcpu->arch.complete_userspace_io;
+	struct x86_emulate_ctxt *ctxt = vcpu->arch.emulate_ctxt;
+
+	*clear_interrupt_shadow = false;
+	if (!cui)
+		return 0;
+
+	if ((vcpu->guest_debug &
+	     (KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_SINGLESTEP)) ||
+	    (kvm_x86_call(get_rflags)(vcpu) & X86_EFLAGS_TF))
+		return -EBUSY;
+
+	if (cui == complete_fast_pio_out_port_0x7e)
+		return 0;
+
+	if (cui == complete_emulated_mmio || cui == complete_emulated_pio) {
+		unsigned long gprs[NR_VCPU_GENERAL_PURPOSE_REGS];
+		unsigned long reg_off;
+		unsigned int dst_bytes;
+		u64 val = 0;
+
+		if (cui == complete_emulated_mmio) {
+			struct kvm_mmio_fragment *frag;
+
+			if (!vcpu->mmio_needed ||
+			    vcpu->mmio_cur_fragment + 1 != vcpu->mmio_nr_fragments)
+				return -EBUSY;
+			frag = &vcpu->mmio_fragments[vcpu->mmio_cur_fragment];
+			if (frag->len > 8)
+				return -EBUSY;
+			if (vcpu->mmio_is_write)
+				return 0;
+			if (vcpu->mmio_nr_fragments != 1 ||
+			    !is_power_of_2(frag->len))
+				return -EBUSY;
+		} else {
+			if (vcpu->arch.pio.count != 1 ||
+			    !vcpu->arch.pio.in ||
+			    !is_power_of_2(vcpu->arch.pio.size) ||
+			    vcpu->arch.pio.size > 4)
+				return -EBUSY;
+		}
+
+		if (!ctxt || ctxt->tf || ctxt->rep_prefix ||
+		    ctxt->have_exception || ctxt->dst.type != OP_REG ||
+		    ctxt->src2.type != OP_NONE)
+			return -EBUSY;
+
+		dst_bytes = ctxt->dst.bytes;
+		if (cui == complete_emulated_pio) {
+			if (ctxt->opcode_len != 1 ||
+			    (ctxt->b != 0xe4 && ctxt->b != 0xe5 &&
+			     ctxt->b != 0xec && ctxt->b != 0xed) ||
+			    dst_bytes != vcpu->arch.pio.size)
+				return -EBUSY;
+			memcpy(&val, vcpu->arch.pio_data, dst_bytes);
+		} else {
+			struct kvm_mmio_fragment *frag =
+				&vcpu->mmio_fragments[vcpu->mmio_cur_fragment];
+
+			if (ctxt->src.type != OP_MEM ||
+			    ctxt->src.bytes != frag->len)
+				return -EBUSY;
+			memcpy(&val, vcpu->run->mmio.data, frag->len);
+
+			if (ctxt->opcode_len == 1 &&
+			    (ctxt->b == 0x8a || ctxt->b == 0x8b ||
+			     ctxt->b == 0xa0 || ctxt->b == 0xa1)) {
+				if (dst_bytes != frag->len)
+					return -EBUSY;
+			} else if (ctxt->opcode_len == 1 && ctxt->b == 0x63) {
+				if (frag->len != 4)
+					return -EBUSY;
+				dst_bytes = ctxt->op_bytes;
+				val = (u64)(s64)(s32)val;
+			} else if (ctxt->opcode_len == 2 &&
+				   (ctxt->b == 0xb6 || ctxt->b == 0xb7)) {
+				if (frag->len != 1 && frag->len != 2)
+					return -EBUSY;
+				dst_bytes = ctxt->op_bytes;
+				val = (frag->len == 1) ? (u8)val : (u16)val;
+			} else if (ctxt->opcode_len == 2 &&
+				   (ctxt->b == 0xbe || ctxt->b == 0xbf)) {
+				if (frag->len != 1 && frag->len != 2)
+					return -EBUSY;
+				dst_bytes = ctxt->op_bytes;
+				val = (u64)(s64)((frag->len == 1) ?
+						 (s8)val : (s16)val);
+			} else {
+				return -EBUSY;
+			}
+		}
+
+		if (!is_power_of_2(dst_bytes) || dst_bytes > 8)
+			return -EBUSY;
+
+		reg_off = (unsigned long)ctxt->dst.addr.reg -
+			  (unsigned long)ctxt->_regs;
+		if (reg_off + dst_bytes > sizeof(gprs) ||
+		    (dst_bytes > 1 && (reg_off % sizeof(unsigned long)) != 0) ||
+		    (dst_bytes == 1 && (reg_off % sizeof(unsigned long)) > 1))
+			return -EBUSY;
+
+		gprs[VCPU_REGS_RAX] = regs->rax;
+		gprs[VCPU_REGS_RCX] = regs->rcx;
+		gprs[VCPU_REGS_RDX] = regs->rdx;
+		gprs[VCPU_REGS_RBX] = regs->rbx;
+		gprs[VCPU_REGS_RSP] = regs->rsp;
+		gprs[VCPU_REGS_RBP] = regs->rbp;
+		gprs[VCPU_REGS_RSI] = regs->rsi;
+		gprs[VCPU_REGS_RDI] = regs->rdi;
+#ifdef CONFIG_X86_64
+		gprs[VCPU_REGS_R8] = regs->r8;
+		gprs[VCPU_REGS_R9] = regs->r9;
+		gprs[VCPU_REGS_R10] = regs->r10;
+		gprs[VCPU_REGS_R11] = regs->r11;
+		gprs[VCPU_REGS_R12] = regs->r12;
+		gprs[VCPU_REGS_R13] = regs->r13;
+		gprs[VCPU_REGS_R14] = regs->r14;
+		gprs[VCPU_REGS_R15] = regs->r15;
+#endif
+
+		kvm_luo_assign_reg((u8 *)gprs + reg_off, val, dst_bytes);
+
+		regs->rax = gprs[VCPU_REGS_RAX];
+		regs->rcx = gprs[VCPU_REGS_RCX];
+		regs->rdx = gprs[VCPU_REGS_RDX];
+		regs->rbx = gprs[VCPU_REGS_RBX];
+		regs->rsp = gprs[VCPU_REGS_RSP];
+		regs->rbp = gprs[VCPU_REGS_RBP];
+		regs->rsi = gprs[VCPU_REGS_RSI];
+		regs->rdi = gprs[VCPU_REGS_RDI];
+#ifdef CONFIG_X86_64
+		regs->r8 = gprs[VCPU_REGS_R8];
+		regs->r9 = gprs[VCPU_REGS_R9];
+		regs->r10 = gprs[VCPU_REGS_R10];
+		regs->r11 = gprs[VCPU_REGS_R11];
+		regs->r12 = gprs[VCPU_REGS_R12];
+		regs->r13 = gprs[VCPU_REGS_R13];
+		regs->r14 = gprs[VCPU_REGS_R14];
+		regs->r15 = gprs[VCPU_REGS_R15];
+#endif
+
+		regs->rip = (ctxt->mode != X86EMUL_MODE_PROT64) ?
+			    (u32)ctxt->_eip : ctxt->_eip;
+		regs->rflags = ctxt->eflags & ~X86_EFLAGS_RF;
+		*clear_interrupt_shadow = true;
+		return 0;
+	}
+
+	return -EBUSY;
+}
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_entry);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_exit);

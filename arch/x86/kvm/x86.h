@@ -911,9 +911,30 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu);
 
 void kvm_flush_pml_buffer(struct kvm_vcpu *vcpu, u16 pml_idx);
 
+int kvm_vcpu_ioctl_x86_setup_mce(struct kvm_vcpu *vcpu, u64 mcg_cap);
+int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz);
+void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+					struct kvm_vcpu_events *events);
+int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+				       struct kvm_vcpu_events *events);
+int kvm_vcpu_ioctl_x86_get_xsave(struct kvm_vcpu *vcpu,
+				 struct kvm_xsave *guest_xsave);
+int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
+				 struct kvm_xsave *guest_xsave);
+int kvm_vcpu_ioctl_x86_get_xcrs(struct kvm_vcpu *vcpu,
+				struct kvm_xcrs *guest_xcrs);
+int kvm_vcpu_ioctl_x86_set_xcrs(struct kvm_vcpu *vcpu,
+				struct kvm_xcrs *guest_xcrs);
+int kvm_vcpu_ioctl_x86_get_mpstate(struct kvm_vcpu *vcpu,
+				   struct kvm_mp_state *mp_state);
+int kvm_vcpu_ioctl_x86_set_mpstate(struct kvm_vcpu *vcpu,
+				   struct kvm_mp_state *mp_state);
 int kvm_vm_ioctl_set_tss_addr(struct kvm *kvm, unsigned long addr);
 int kvm_vm_ioctl_set_identity_map_addr(struct kvm *kvm, u64 ident_addr);
 void kvm_luo_save_clock(struct kvm *kvm, u64 *clock_ns, u64 *realtime_ns);
 void kvm_luo_restore_clock(struct kvm *kvm, u64 clock_ns, u64 realtime_ns);
+void kvm_luo_restore_tsc(struct kvm_vcpu *vcpu, u64 l1_tsc_offset);
+int kvm_luo_apply_userspace_io(struct kvm_vcpu *vcpu, struct kvm_regs *regs,
+			       bool *clear_interrupt_shadow);
 
 #endif

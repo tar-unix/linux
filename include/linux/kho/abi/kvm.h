@@ -206,6 +206,8 @@ static_assert(sizeof(struct kvm_vcpu_luo_state) == 144);
 
 #ifdef CONFIG_X86
 
+#define KVM_LUO_X86_MAX_CPUID_ENTRIES	256
+#define KVM_LUO_X86_MAX_MSR_ENTRIES	512
 #define KVM_LUO_X86_MAX_IRQ_ROUTES	1024
 
 #define KVM_LUO_X86_VM_STATE_VERSION	1
@@ -276,6 +278,77 @@ struct kvm_luo_vm_x86_state {
 };
 
 static_assert(sizeof(struct kvm_luo_vm_x86_state) == 50896);
+
+#define KVM_LUO_X86_VCPU_STATE_VERSION			1
+#define KVM_LUO_X86_VCPU_FLAG_HAS_LAPIC			BIT(0)
+#define KVM_LUO_X86_VCPU_FLAG_PV_TIME			BIT(1)
+#define KVM_LUO_X86_VCPU_FLAG_PV_EOI			BIT(2)
+#define KVM_LUO_X86_VCPU_FLAG_STEAL			BIT(3)
+#define KVM_LUO_X86_VCPU_FLAG_APF			BIT(4)
+#define KVM_LUO_X86_VCPU_FLAG_APIC_ONESHOT_EXPIRED	BIT(5)
+#define KVM_LUO_X86_VCPU_FLAG_OLD_KVMCLOCK		BIT(6)
+
+/**
+ * struct kvm_luo_vcpu_x86_state - Preserved x86 vCPU architectural state.
+ * @version:               Format version (%KVM_LUO_X86_VCPU_STATE_VERSION).
+ * @flags:                 %KVM_LUO_X86_VCPU_FLAG_* flags.
+ * @mp_state:              vCPU multiprocessing state.
+ * @virtual_tsc_khz:       vCPU virtual TSC frequency in kHz.
+ * @l1_tsc_offset:         L1 guest TSC offset.
+ * @mcg_cap:               Guest IA32_MCG_CAP value set via KVM_X86_SETUP_MCE.
+ * @tscdeadline:           LAPIC TSC-deadline timer target value.
+ * @pv_time_msr:           Guest MSR_KVM_SYSTEM_TIME / _NEW value.
+ * @pv_eoi_msr:            Guest MSR_KVM_PV_EOI_EN value.
+ * @steal_msr:             Guest MSR_KVM_STEAL_TIME value.
+ * @apf_msr_en:            Guest MSR_KVM_ASYNC_PF_EN value.
+ * @apf_msr_int:           Guest MSR_KVM_ASYNC_PF_INT value.
+ * @apf_vec:               Async page fault interrupt vector.
+ * @apf_id:                Async page fault token counter.
+ * @apf_pageready_pending: Whether an async PF page-ready event is pending.
+ * @reserved0:             Reserved for alignment, must be zero.
+ * @regs:                  General-purpose registers, RIP, and RFLAGS.
+ * @sregs2:                Segment/control registers and PAE PDPTRs.
+ * @events:                Pending exceptions, interrupts, NMIs, and SMIs.
+ * @lapic:                 In-kernel local APIC register page.
+ * @xsave:                 FPU/SSE/XSAVE state (4 KiB region).
+ * @xcrs:                  Extended control registers (XCR0).
+ * @debugregs:             Debug registers DR0-DR3, DR6, DR7.
+ * @cpuid_nent:            Number of preserved CPUID entries.
+ * @nr_msrs:               Number of preserved MSR entries.
+ * @cpuid_entries:         Preserved guest CPUID table.
+ * @msrs:                  Preserved guest MSRs.
+ */
+struct kvm_luo_vcpu_x86_state {
+	u32 version;
+	u32 flags;
+	u32 mp_state;
+	u32 virtual_tsc_khz;
+	u64 l1_tsc_offset;
+	u64 mcg_cap;
+	u64 tscdeadline;
+	u64 pv_time_msr;
+	u64 pv_eoi_msr;
+	u64 steal_msr;
+	u64 apf_msr_en;
+	u64 apf_msr_int;
+	u32 apf_vec;
+	u32 apf_id;
+	u8 apf_pageready_pending;
+	u8 reserved0[7];
+	struct kvm_regs regs;
+	struct kvm_sregs2 sregs2;
+	struct kvm_vcpu_events events;
+	struct kvm_lapic_state lapic;
+	struct kvm_xsave xsave;
+	struct kvm_xcrs xcrs;
+	struct kvm_debugregs debugregs;
+	u32 cpuid_nent;
+	u32 nr_msrs;
+	struct kvm_cpuid_entry2 cpuid_entries[KVM_LUO_X86_MAX_CPUID_ENTRIES];
+	struct kvm_msr_entry msrs[KVM_LUO_X86_MAX_MSR_ENTRIES];
+};
+
+static_assert(sizeof(struct kvm_luo_vcpu_x86_state) == 24704);
 
 #endif /* CONFIG_X86 */
 
