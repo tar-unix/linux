@@ -218,6 +218,8 @@ late_initcall(luo_late_startup);
 
 /* Public Functions */
 
+static bool luo_reboot_in_progress;
+
 /**
  * liveupdate_reboot() - Kernel reboot notifier for live update final
  * serialization.
@@ -235,9 +237,12 @@ int liveupdate_reboot(void)
 	if (!liveupdate_enabled())
 		return 0;
 
+	WRITE_ONCE(luo_reboot_in_progress, true);
 	err = luo_session_serialize();
-	if (err)
+	if (err) {
+		WRITE_ONCE(luo_reboot_in_progress, false);
 		return err;
+	}
 
 	luo_flb_serialize();
 
@@ -256,6 +261,7 @@ bool liveupdate_enabled(void)
 {
 	return luo_global.enabled;
 }
+EXPORT_SYMBOL_GPL(liveupdate_enabled);
 
 /**
  * DOC: LUO ioctl Interface
@@ -442,6 +448,28 @@ static struct luo_device_state luo_dev = {
 	},
 	.in_use = ATOMIC_INIT(0),
 };
+
+static atomic_t luo_coco_preserving_count = ATOMIC_INIT(0);
+
+void liveupdate_coco_preserve_enter(void)
+{
+	atomic_inc(&luo_coco_preserving_count);
+}
+EXPORT_SYMBOL_GPL(liveupdate_coco_preserve_enter);
+
+void liveupdate_coco_preserve_exit(void)
+{
+	WARN_ON_ONCE(atomic_dec_if_positive(&luo_coco_preserving_count) < 0);
+}
+EXPORT_SYMBOL_GPL(liveupdate_coco_preserve_exit);
+
+bool liveupdate_coco_is_preserving(void)
+{
+	return liveupdate_enabled() &&
+	       READ_ONCE(luo_reboot_in_progress) &&
+	       atomic_read(&luo_coco_preserving_count) > 0;
+}
+EXPORT_SYMBOL_GPL(liveupdate_coco_is_preserving);
 
 static int __init liveupdate_ioctl_init(void)
 {

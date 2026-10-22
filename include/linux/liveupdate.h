@@ -307,6 +307,10 @@ int liveupdate_get_file_incoming(struct liveupdate_session *s, u64 token,
 int liveupdate_get_token_outgoing(struct liveupdate_session *s,
 				  struct file *file, u64 *tokenp);
 
+void liveupdate_coco_preserve_enter(void);
+void liveupdate_coco_preserve_exit(void);
+bool liveupdate_coco_is_preserving(void);
+
 #else /* CONFIG_LIVEUPDATE */
 
 static inline bool liveupdate_enabled(void)
@@ -380,6 +384,13 @@ static inline int liveupdate_get_token_outgoing(struct liveupdate_session *s,
 						struct file *file, u64 *tokenp)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline void liveupdate_coco_preserve_enter(void) {}
+static inline void liveupdate_coco_preserve_exit(void) {}
+static inline bool liveupdate_coco_is_preserving(void)
+{
+	return false;
 }
 
 #endif /* CONFIG_LIVEUPDATE */

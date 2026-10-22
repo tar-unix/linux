@@ -89,6 +89,10 @@ int __weak kvm_arch_luo_vm_freeze(struct kvm *kvm, u64 arch_state_pa)
 	return 0;
 }
 
+void __weak kvm_arch_luo_vm_unfreeze(struct kvm *kvm, u64 arch_state_pa)
+{
+}
+
 void __weak kvm_arch_luo_vm_unpreserve(struct kvm *kvm, u64 arch_state_pa)
 {
 }
@@ -187,6 +191,15 @@ static int kvm_vm_luo_freeze(struct liveupdate_file_op_args *args)
 
 		return kvm_arch_luo_vm_freeze(kvm, state->arch_state_pa);
 	}
+}
+
+static void kvm_vm_luo_unfreeze(struct liveupdate_file_op_args *args)
+{
+	struct kvm_vm_luo_state *state = __va(args->serialized_data);
+	struct kvm *kvm = args->file->private_data;
+
+	scoped_guard(mutex, &kvm->lock)
+		kvm_arch_luo_vm_unfreeze(kvm, state->arch_state_pa);
 }
 
 static void kvm_vm_luo_unpreserve(struct liveupdate_file_op_args *args)
@@ -290,6 +303,7 @@ static struct liveupdate_file_ops kvm_vm_luo_file_ops = {
 	.can_preserve	= kvm_vm_luo_can_preserve,
 	.preserve	= kvm_vm_luo_preserve,
 	.freeze		= kvm_vm_luo_freeze,
+	.unfreeze	= kvm_vm_luo_unfreeze,
 	.unpreserve	= kvm_vm_luo_unpreserve,
 	.retrieve	= kvm_vm_luo_retrieve,
 	.finish		= kvm_vm_luo_finish,
@@ -317,6 +331,10 @@ int __weak kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa)
 int __weak kvm_arch_luo_vcpu_freeze(struct kvm_vcpu *vcpu, u64 arch_state_pa)
 {
 	return -EOPNOTSUPP;
+}
+
+void __weak kvm_arch_luo_vcpu_unfreeze(struct kvm_vcpu *vcpu, u64 arch_state_pa)
+{
 }
 
 void __weak kvm_arch_luo_vcpu_unpreserve(struct kvm_vcpu *vcpu,
@@ -440,6 +458,18 @@ static int kvm_vcpu_luo_freeze(struct liveupdate_file_op_args *args)
 	return r;
 }
 
+static void kvm_vcpu_luo_unfreeze(struct liveupdate_file_op_args *args)
+{
+	struct kvm_vcpu_luo_state *state = __va(args->serialized_data);
+	struct kvm_vcpu *vcpu = args->file->private_data;
+
+	mutex_lock(&vcpu->mutex);
+	kvm_luo_vcpu_load(vcpu);
+	kvm_arch_luo_vcpu_unfreeze(vcpu, state->arch_state_pa);
+	kvm_luo_vcpu_put(vcpu);
+	mutex_unlock(&vcpu->mutex);
+}
+
 static void kvm_vcpu_luo_unpreserve(struct liveupdate_file_op_args *args)
 {
 	struct kvm_vcpu_luo_state *state = __va(args->serialized_data);
@@ -558,6 +588,7 @@ static struct liveupdate_file_ops kvm_vcpu_luo_file_ops = {
 	.can_preserve	= kvm_vcpu_luo_can_preserve,
 	.preserve	= kvm_vcpu_luo_preserve,
 	.freeze		= kvm_vcpu_luo_freeze,
+	.unfreeze	= kvm_vcpu_luo_unfreeze,
 	.unpreserve	= kvm_vcpu_luo_unpreserve,
 	.retrieve	= kvm_vcpu_luo_retrieve,
 	.finish		= kvm_vcpu_luo_finish,
@@ -569,8 +600,16 @@ static struct liveupdate_file_handler kvm_vcpu_luo_handler = {
 	.name	= KVM_VCPU_LUO_FH_NAME,
 };
 
+#define KVM_LUO_MAX_PENDING_FLBS	4
+
+static DEFINE_MUTEX(kvm_luo_flb_lock);
+static struct liveupdate_flb *kvm_luo_pending_flbs[KVM_LUO_MAX_PENDING_FLBS];
+static unsigned int kvm_luo_nr_pending_flbs;
+static bool kvm_luo_initialized;
+
 int kvm_vm_luo_init(struct module *module)
 {
+	unsigned int i;
 	int r;
 
 	/*
@@ -580,23 +619,105 @@ int kvm_vm_luo_init(struct module *module)
 	kvm_vm_luo_file_ops.owner = module;
 	kvm_vcpu_luo_file_ops.owner = module;
 
+	guard(mutex)(&kvm_luo_flb_lock);
+
 	r = liveupdate_register_file_handler(&kvm_vm_luo_handler);
 	if (r == -EOPNOTSUPP)
 		return 0;
 	if (r)
 		return r;
 
+	for (i = 0; i < kvm_luo_nr_pending_flbs; i++) {
+		r = liveupdate_register_flb(&kvm_vm_luo_handler,
+					    kvm_luo_pending_flbs[i]);
+		if (r && r != -EOPNOTSUPP) {
+			while (i--)
+				liveupdate_unregister_flb(&kvm_vm_luo_handler,
+							  kvm_luo_pending_flbs[i]);
+			liveupdate_unregister_file_handler(&kvm_vm_luo_handler);
+			return r;
+		}
+	}
+
 	r = liveupdate_register_file_handler(&kvm_vcpu_luo_handler);
 	if (r) {
+		for (i = kvm_luo_nr_pending_flbs; i > 0; i--)
+			liveupdate_unregister_flb(&kvm_vm_luo_handler,
+						  kvm_luo_pending_flbs[i - 1]);
 		liveupdate_unregister_file_handler(&kvm_vm_luo_handler);
 		return r;
 	}
 
+	kvm_luo_initialized = true;
 	return 0;
 }
 
 void kvm_vm_luo_exit(void)
 {
+	unsigned int i;
+
+	guard(mutex)(&kvm_luo_flb_lock);
+
+	if (!kvm_luo_initialized)
+		return;
+
+	kvm_luo_initialized = false;
 	liveupdate_unregister_file_handler(&kvm_vcpu_luo_handler);
+	for (i = kvm_luo_nr_pending_flbs; i > 0; i--)
+		liveupdate_unregister_flb(&kvm_vm_luo_handler,
+					  kvm_luo_pending_flbs[i - 1]);
 	liveupdate_unregister_file_handler(&kvm_vm_luo_handler);
 }
+
+int kvm_luo_register_flb(struct liveupdate_flb *flb)
+{
+	unsigned int i;
+	int r = 0;
+
+	if (!liveupdate_enabled())
+		return 0;
+
+	guard(mutex)(&kvm_luo_flb_lock);
+
+	for (i = 0; i < kvm_luo_nr_pending_flbs; i++) {
+		if (kvm_luo_pending_flbs[i] == flb)
+			return 0;
+	}
+	if (WARN_ON_ONCE(kvm_luo_nr_pending_flbs >= KVM_LUO_MAX_PENDING_FLBS))
+		return -ENOSPC;
+
+	if (kvm_luo_initialized) {
+		r = liveupdate_register_flb(&kvm_vm_luo_handler, flb);
+		if (r && r != -EOPNOTSUPP)
+			return r;
+	}
+
+	kvm_luo_pending_flbs[kvm_luo_nr_pending_flbs++] = flb;
+	return 0;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_luo_register_flb);
+
+void kvm_luo_unregister_flb(struct liveupdate_flb *flb)
+{
+	unsigned int i;
+
+	if (!liveupdate_enabled())
+		return;
+
+	guard(mutex)(&kvm_luo_flb_lock);
+
+	for (i = 0; i < kvm_luo_nr_pending_flbs; i++) {
+		if (kvm_luo_pending_flbs[i] == flb) {
+			kvm_luo_nr_pending_flbs--;
+			memmove(&kvm_luo_pending_flbs[i],
+				&kvm_luo_pending_flbs[i + 1],
+				(kvm_luo_nr_pending_flbs - i) *
+				sizeof(kvm_luo_pending_flbs[0]));
+			if (kvm_luo_initialized)
+				liveupdate_unregister_flb(&kvm_vm_luo_handler,
+							  flb);
+			return;
+		}
+	}
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_luo_unregister_flb);

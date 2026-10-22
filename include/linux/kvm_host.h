@@ -1679,6 +1679,7 @@ void kvm_arch_create_vm_debugfs(struct kvm *kvm);
 int kvm_arch_luo_vm_kind(struct kvm *kvm, u64 *type);
 int kvm_arch_luo_vm_preserve(struct kvm *kvm, u64 *arch_state_pa);
 int kvm_arch_luo_vm_freeze(struct kvm *kvm, u64 arch_state_pa);
+void kvm_arch_luo_vm_unfreeze(struct kvm *kvm, u64 arch_state_pa);
 void kvm_arch_luo_vm_unpreserve(struct kvm *kvm, u64 arch_state_pa);
 int kvm_arch_luo_vm_retrieve(struct kvm *kvm, u64 arch_state_pa);
 void kvm_arch_luo_vm_finish(struct kvm *kvm, u64 arch_state_pa);
@@ -1688,9 +1689,25 @@ bool kvm_arch_gmem_luo_validate_vm_id(struct kvm *kvm, u64 vm_id);
 /* Called with vcpu->mutex held and vcpu loaded, except unpreserve/finish. */
 int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa);
 int kvm_arch_luo_vcpu_freeze(struct kvm_vcpu *vcpu, u64 arch_state_pa);
+void kvm_arch_luo_vcpu_unfreeze(struct kvm_vcpu *vcpu, u64 arch_state_pa);
 void kvm_arch_luo_vcpu_unpreserve(struct kvm_vcpu *vcpu, u64 arch_state_pa);
 int kvm_arch_luo_vcpu_retrieve(struct kvm_vcpu *vcpu, u64 arch_state_pa);
 void kvm_arch_luo_vcpu_finish(struct kvm_vcpu *vcpu, u64 arch_state_pa);
+
+struct liveupdate_flb;
+#ifdef CONFIG_LIVEUPDATE
+int kvm_luo_register_flb(struct liveupdate_flb *flb);
+void kvm_luo_unregister_flb(struct liveupdate_flb *flb);
+#else
+static inline int kvm_luo_register_flb(struct liveupdate_flb *flb)
+{
+	return 0;
+}
+
+static inline void kvm_luo_unregister_flb(struct liveupdate_flb *flb)
+{
+}
+#endif
 
 #ifndef __KVM_HAVE_ARCH_VM_ALLOC
 /*
