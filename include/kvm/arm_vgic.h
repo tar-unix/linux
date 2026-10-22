@@ -267,6 +267,7 @@ struct vgic_irq {
 	u8 active_source;		/* GICv2 SGIs only */
 	u8 priority;
 	u8 group;			/* 0 == group 0, 1 == group 1 */
+	s16 luo_active_vcpu_id;		/* Preserved active ap_list vCPU ID */
 
 	const struct irq_ops *ops;
 
@@ -369,6 +370,7 @@ struct vgic_dist {
 	bool			in_kernel;
 	bool			ready;
 	bool			initialized;
+	bool			from_liveupdate;
 
 	/* vGIC model the kernel emulates for the guest (GICv2 or GICv3) */
 	u32			vgic_model;

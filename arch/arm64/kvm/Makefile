@@ -31,6 +31,7 @@ kvm-$(CONFIG_ARM64_PTR_AUTH)  += pauth.o
 kvm-$(CONFIG_PTDUMP_STAGE2_DEBUGFS) += ptdump.o
 
 kvm-$(CONFIG_NVHE_EL2_TRACING) += hyp_trace.o
+kvm-$(CONFIG_LIVEUPDATE) += arm_luo.o
 
 always-y := hyp_constants.h hyp-constants.s
 

@@ -610,8 +610,11 @@ struct kvm *kvm_arch_alloc_vm(void)
 
 int kvm_arch_vcpu_precreate(struct kvm *kvm, unsigned int id)
 {
-	if (irqchip_in_kernel(kvm) && vgic_initialized(kvm))
-		return -EBUSY;
+	if (irqchip_in_kernel(kvm)) {
+		guard(mutex)(&kvm->arch.config_lock);
+		if (vgic_initialized(kvm) && !kvm->arch.vgic.from_liveupdate)
+			return -EBUSY;
+	}
 
 	if (id >= kvm->max_vcpus)
 		return -EINVAL;

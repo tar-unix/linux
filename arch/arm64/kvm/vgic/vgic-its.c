@@ -1871,6 +1871,12 @@ static int vgic_its_create(struct kvm_device *dev, u32 type)
 
 	mutex_lock(&dev->kvm->arch.config_lock);
 
+	if (dev->kvm->arch.vgic.from_liveupdate) {
+		mutex_unlock(&dev->kvm->arch.config_lock);
+		kfree(its);
+		return -EBUSY;
+	}
+
 	if (vgic_initialized(dev->kvm)) {
 		ret = vgic_v4_init(dev->kvm);
 		if (ret < 0) {

@@ -50,6 +50,7 @@ struct arch_timer_vm_data {
 
 	/* The PPI for each timer, global to the VM */
 	u32	ppi[NR_KVM_TIMERS];
+	bool	from_liveupdate;
 };
 
 struct arch_timer_context {

@@ -231,6 +231,7 @@ static int kvm_vgic_dist_init(struct kvm *kvm, unsigned int nr_spis)
 		raw_spin_lock_init(&irq->irq_lock);
 		irq->vcpu = NULL;
 		irq->target_vcpu = vcpu0;
+		irq->luo_active_vcpu_id = -1;
 		refcount_set(&irq->refcount, 0);
 		switch (dist->vgic_model) {
 		case KVM_DEV_TYPE_ARM_VGIC_V2:
@@ -321,6 +322,10 @@ static int vgic_allocate_private_irqs_locked(struct kvm_vcpu *vcpu, u32 type)
 
 	lockdep_assert_held(&vcpu->kvm->arch.config_lock);
 
+	if (vgic_initialized(vcpu->kvm) &&
+	    !vcpu->kvm->arch.vgic.from_liveupdate)
+		return -EBUSY;
+
 	if (vgic_cpu->private_irqs)
 		return 0;
 
@@ -343,6 +348,7 @@ static int vgic_allocate_private_irqs_locked(struct kvm_vcpu *vcpu, u32 type)
 		raw_spin_lock_init(&irq->irq_lock);
 		irq->vcpu = NULL;
 		irq->target_vcpu = vcpu;
+		irq->luo_active_vcpu_id = -1;
 		refcount_set(&irq->refcount, 0);
 
 		if (vgic_is_v5(vcpu->kvm))
@@ -363,6 +369,18 @@ static int vgic_allocate_private_irqs(struct kvm_vcpu *vcpu, u32 type)
 	mutex_unlock(&vcpu->kvm->arch.config_lock);
 
 	return ret;
+}
+
+static void kvm_vgic_vcpu_reset(struct kvm_vcpu *vcpu)
+{
+	const struct vgic_dist *dist = &vcpu->kvm->arch.vgic;
+
+	if (dist->vgic_model == KVM_DEV_TYPE_ARM_VGIC_V5)
+		vgic_v5_reset(vcpu);
+	else if (kvm_vgic_global_state.type == VGIC_V2)
+		vgic_v2_reset(vcpu);
+	else
+		vgic_v3_reset(vcpu);
 }
 
 /**
@@ -393,28 +411,23 @@ int kvm_vgic_vcpu_init(struct kvm_vcpu *vcpu)
 	if (ret)
 		return ret;
 
+	if (vgic_initialized(vcpu->kvm))
+		kvm_vgic_vcpu_reset(vcpu);
+
 	/*
 	 * If we are creating a VCPU with a GICv3 we must also register the
 	 * KVM io device for the redistributor that belongs to this VCPU.
 	 */
 	if (dist->vgic_model == KVM_DEV_TYPE_ARM_VGIC_V3) {
 		mutex_lock(&vcpu->kvm->slots_lock);
-		ret = vgic_register_redist_iodev(vcpu);
+		if (dist->ready ||
+		    (vgic_initialized(vcpu->kvm) && !dist->from_liveupdate))
+			ret = -EBUSY;
+		else if (!dist->from_liveupdate)
+			ret = vgic_register_redist_iodev(vcpu);
 		mutex_unlock(&vcpu->kvm->slots_lock);
 	}
 	return ret;
-}
-
-static void kvm_vgic_vcpu_reset(struct kvm_vcpu *vcpu)
-{
-	const struct vgic_dist *dist = &vcpu->kvm->arch.vgic;
-
-	if (dist->vgic_model == KVM_DEV_TYPE_ARM_VGIC_V5)
-		vgic_v5_reset(vcpu);
-	else if (kvm_vgic_global_state.type == VGIC_V2)
-		vgic_v2_reset(vcpu);
-	else
-		vgic_v3_reset(vcpu);
 }
 
 /*
@@ -453,9 +466,12 @@ int vgic_init(struct kvm *kvm)
 
 		/*
 		 * Ensure vPEs are allocated if direct IRQ injection (e.g. vSGIs,
-		 * vLPIs) is supported.
+		 * vLPIs) is supported. During live-update VM retrieval, vCPUs
+		 * have not been recreated yet; defer vPE allocation to
+		 * kvm_vgic_map_resources().
 		 */
-		if (vgic_supports_direct_irqs(kvm)) {
+		if (vgic_supports_direct_irqs(kvm) &&
+		    (!dist->from_liveupdate || atomic_read(&kvm->online_vcpus))) {
 			ret = vgic_v4_init(kvm);
 			if (ret)
 				return ret;
@@ -636,6 +652,68 @@ int kvm_vgic_map_resources(struct kvm *kvm)
 	if (!irqchip_in_kernel(kvm))
 		goto out;
 
+	if (kvm->created_vcpus != atomic_read(&kvm->online_vcpus)) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	if (dist->from_liveupdate &&
+	    dist->vgic_model == KVM_DEV_TYPE_ARM_VGIC_V3) {
+		struct kvm_vcpu *vcpu;
+		unsigned long c;
+
+		mutex_unlock(&kvm->arch.config_lock);
+		kvm_for_each_vcpu(c, vcpu, kvm) {
+			if (IS_VGIC_ADDR_UNDEF(vcpu->arch.vgic_cpu.rd_iodev.base_addr)) {
+				ret = vgic_register_redist_iodev(vcpu);
+				if (ret)
+					goto out_slots;
+			}
+		}
+		mutex_lock(&kvm->arch.config_lock);
+		if (dist->ready)
+			goto out;
+		if (kvm->created_vcpus != atomic_read(&kvm->online_vcpus)) {
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+
+	if (dist->from_liveupdate && !vgic_is_v5(kvm)) {
+		if (vgic_supports_direct_irqs(kvm) && !dist->its_vm.vpes) {
+			ret = vgic_v4_init(kvm);
+			if (ret)
+				goto out;
+			if (vgic_supports_direct_sgis(kvm) && dist->nassgireq)
+				vgic_v4_configure_vsgis(kvm);
+		}
+
+		if (dist->vgic_model == KVM_DEV_TYPE_ARM_VGIC_V3 &&
+		    dist->initialized && dist->spis) {
+			int i;
+
+			for (i = 0; i < dist->nr_spis; i++) {
+				struct vgic_irq *irq = &dist->spis[i];
+				struct kvm_vcpu *target, *act_vcpu = NULL;
+				unsigned long flags;
+				int act_id;
+
+				target = kvm_mpidr_to_vcpu(kvm,
+							   READ_ONCE(irq->mpidr));
+				raw_spin_lock_irqsave(&irq->irq_lock, flags);
+				act_id = irq->luo_active_vcpu_id;
+				if (irq->active && act_id >= 0)
+					act_vcpu = kvm_get_vcpu_by_id(kvm, act_id);
+				irq->target_vcpu = act_vcpu ?: target;
+				vgic_queue_irq_unlock(kvm, irq, flags);
+				raw_spin_lock_irqsave(&irq->irq_lock, flags);
+				irq->target_vcpu = target;
+				irq->luo_active_vcpu_id = -1;
+				raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+			}
+		}
+	}
+
 	if (dist->vgic_model == KVM_DEV_TYPE_ARM_VGIC_V2) {
 		ret = vgic_v2_map_resources(kvm);
 		type = VGIC_V2;
@@ -650,6 +728,8 @@ int kvm_vgic_map_resources(struct kvm *kvm)
 
 	if (ret)
 		goto out;
+
+	dist->from_liveupdate = false;
 
 	if (needs_dist) {
 		dist_base = dist->vgic_dist_base;

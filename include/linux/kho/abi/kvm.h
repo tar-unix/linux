@@ -225,4 +225,130 @@ static_assert(sizeof(struct kvm_luo_vm_x86_state) == 50896);
 
 #endif /* CONFIG_X86 */
 
+#ifdef CONFIG_ARM64
+
+#define KVM_LUO_ARM64_VM_STATE_VERSION		1
+#define KVM_LUO_ARM64_MAX_RD_REGIONS		16
+#define KVM_LUO_ARM64_MAX_SPIS			988
+
+/**
+ * struct kvm_luo_vgic_irq_state - Preserved state of one vGICv3 SGI/PPI/SPI.
+ * @intid:         Virtual interrupt identifier.
+ * @pending_latch: Software-latched pending state.
+ * @active:        Active state.
+ * @enabled:       Enable bit.
+ * @config:        Trigger configuration (0 = level, 1 = edge).
+ * @priority:      Interrupt priority.
+ * @group:         Interrupt group (0 or 1).
+ * @source:        SGI source CPU mask.
+ * @active_source: Active SGI source CPU.
+ * @line_level:     Asserted input line level.
+ * @targets:        GICv2 target CPU mask.
+ * @active_vcpu_id: vCPU ID where the interrupt is active (-1 if none).
+ * @mpidr:          GICv3 target affinity (IROUTER).
+ */
+struct kvm_luo_vgic_irq_state {
+	u32 intid;
+	u8 pending_latch;
+	u8 active;
+	u8 enabled;
+	u8 config;
+	u8 priority;
+	u8 group;
+	u8 source;
+	u8 active_source;
+	u8 line_level;
+	u8 targets;
+	s16 active_vcpu_id;
+	u64 mpidr;
+};
+
+static_assert(sizeof(struct kvm_luo_vgic_irq_state) == 24);
+
+/**
+ * struct kvm_luo_vgic_rd_region - Preserved vGICv3 redistributor region.
+ * @base:  Guest physical base address of the redistributor region.
+ * @count: Number of redistributors in this region (0 = unbounded).
+ * @index: Region index.
+ */
+struct kvm_luo_vgic_rd_region {
+	u64 base;
+	u32 count;
+	u32 index;
+};
+
+static_assert(sizeof(struct kvm_luo_vgic_rd_region) == 16);
+
+/**
+ * struct kvm_luo_vm_arm64_state - Preserved arm64 VM architectural state.
+ * @version:                 Format version (%KVM_LUO_ARM64_VM_STATE_VERSION).
+ * @psci_version:            Configured PSCI version.
+ * @arch_flags:              Preserved subset of kvm->arch.flags.
+ * @vcpu_features:           Configured VM-wide vCPU feature bitmap.
+ * @smccc_std_bmap:          Bitmap of standard secure service calls.
+ * @smccc_std_hyp_bmap:      Bitmap of standard hypervisor service calls.
+ * @smccc_vendor_hyp_bmap:   Bitmap of vendor hypervisor calls (0-63).
+ * @smccc_vendor_hyp_bmap_2: Bitmap of vendor hypervisor calls (64-127).
+ * @id_regs:                 Sanitised guest feature ID registers.
+ * @midr_el1:                Guest MIDR_EL1 value.
+ * @revidr_el1:              Guest REVIDR_EL1 value.
+ * @aidr_el1:                Guest AIDR_EL1 value.
+ * @ctr_el0:                 Guest CTR_EL0 value.
+ * @timer_voffset:           Virtual counter offset.
+ * @timer_poffset:           Physical counter offset.
+ * @timer_ppi:               Arch timer PPI interrupt numbers.
+ * @has_vgic:                Whether an in-kernel vGICv3 is present.
+ * @vgic_initialized:        Whether the vGICv3 distributor is initialized.
+ * @vgic_enabled:            Whether the vGICv3 distributor is enabled.
+ * @vgic_msis_require_devid: Whether MSIs require a device ID.
+ * @vgic_nassgireq:          GICD_CTLR.nASSGIreq state.
+ * @vgic_nassgicap:          Whether GICD_TYPER2.nASSGIcap is enabled.
+ * @vgic_implementation_rev: GICv3 architecture implementation revision.
+ * @reserved1:               Reserved for alignment, must be zero.
+ * @vgic_model:              vGIC device model (%KVM_DEV_TYPE_ARM_VGIC_V3).
+ * @vgic_nr_spis:            Number of configured SPIs.
+ * @vgic_dist_base:          Guest physical base address of GICD.
+ * @nr_rd_regions:           Number of configured redistributor regions.
+ * @reserved2:               Reserved for alignment, must be zero.
+ * @rd_regions:              Preserved redistributor regions.
+ * @spis:                    Preserved SPI interrupt states.
+ */
+struct kvm_luo_vm_arm64_state {
+	u32 version;
+	u32 psci_version;
+	u64 arch_flags;
+	u64 vcpu_features;
+	u64 smccc_std_bmap;
+	u64 smccc_std_hyp_bmap;
+	u64 smccc_vendor_hyp_bmap;
+	u64 smccc_vendor_hyp_bmap_2;
+	u64 id_regs[64];
+	u64 midr_el1;
+	u64 revidr_el1;
+	u64 aidr_el1;
+	u64 ctr_el0;
+	u64 timer_voffset;
+	u64 timer_poffset;
+	u32 timer_ppi[4];
+	u8 has_vgic;
+	u8 vgic_initialized;
+	u8 vgic_enabled;
+	u8 vgic_msis_require_devid;
+	u8 vgic_nassgireq;
+	u8 vgic_nassgicap;
+	u8 vgic_implementation_rev;
+	u8 reserved1;
+	u32 vgic_model;
+	u32 vgic_nr_spis;
+	u64 vgic_dist_base;
+	u32 nr_rd_regions;
+	u32 reserved2;
+	struct kvm_luo_vgic_rd_region rd_regions[KVM_LUO_ARM64_MAX_RD_REGIONS];
+	struct kvm_luo_vgic_irq_state spis[KVM_LUO_ARM64_MAX_SPIS];
+};
+
+static_assert(sizeof(struct kvm_luo_vm_arm64_state) == 24632);
+
+#endif /* CONFIG_ARM64 */
+
 #endif /* _LINUX_KHO_ABI_KVM_H */

@@ -436,7 +436,7 @@ int kvm_vgic_v4_set_forwarding(struct kvm *kvm, int virq,
 	unsigned long flags;
 	int ret = 0;
 
-	if (!vgic_supports_direct_msis(kvm))
+	if (!vgic_supports_direct_msis(kvm) || !kvm->arch.vgic.its_vm.vpes)
 		return 0;
 
 	/*

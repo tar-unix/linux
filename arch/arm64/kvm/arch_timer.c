@@ -1126,6 +1126,7 @@ void kvm_timer_vcpu_init(struct kvm_vcpu *vcpu)
 	 * Realm counter offsets are fixed at zero by the RMM architecture.
 	 */
 	if (!vcpu_is_protected(vcpu) && !vcpu_is_rec(vcpu) &&
+	    !vcpu->kvm->arch.timer_data.from_liveupdate &&
 	    !test_bit(KVM_ARCH_FLAG_VM_COUNTER_OFFSET, &vcpu->kvm->arch.flags)) {
 		timer_set_offset(vcpu_vtimer(vcpu), kvm_phys_timer_read());
 		timer_set_offset(vcpu_ptimer(vcpu), 0);

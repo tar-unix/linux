@@ -85,6 +85,8 @@ static void iter_init(struct kvm *kvm, struct vgic_state_iter *iter,
 
 	iter->nr_cpus = nr_cpus;
 	iter->nr_spis = kvm->arch.vgic.nr_spis;
+	if (!nr_cpus)
+		iter->intid = VGIC_NR_PRIVATE_IRQS;
 
 	/* Fast forward to the right position if needed */
 	while (pos--)
