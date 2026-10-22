@@ -173,6 +173,7 @@ TEST_GEN_PROGS_x86 += rseq_test
 TEST_GEN_PROGS_x86 += steal_time
 TEST_GEN_PROGS_x86 += system_counter_offset_test
 TEST_GEN_PROGS_x86 += pre_fault_memory_test
+TEST_GEN_PROGS_x86 += vcpu_luo_test
 
 # Compiled outputs used by test targets
 TEST_GEN_PROGS_EXTENDED_x86 += x86/nx_huge_pages_test
@@ -216,6 +217,7 @@ TEST_GEN_PROGS_arm64 += guest_memfd_luo_test
 TEST_GEN_PROGS_arm64 += mmu_stress_test
 TEST_GEN_PROGS_arm64 += rseq_test
 TEST_GEN_PROGS_arm64 += steal_time
+TEST_GEN_PROGS_arm64 += vcpu_luo_test
 
 # Live update tests that need a kexec reboot, see kvm_luo_vmtest.sh
 TEST_GEN_PROGS_EXTENDED_arm64 += kvm_luo_kexec_test
