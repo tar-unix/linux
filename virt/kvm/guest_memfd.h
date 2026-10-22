@@ -44,9 +44,18 @@ static inline void kvm_gmem_unbind(struct kvm_memory_slot *slot)
 #endif /* CONFIG_KVM_GUEST_MEMFD */
 
 #if defined(CONFIG_KVM_GUEST_MEMFD) && defined(CONFIG_LIVEUPDATE)
+struct inode;
+struct kvm_gmem_luo_attr_range;
+
 void kvm_gmem_freeze(struct file *file, bool freeze);
 struct kvm *kvm_gmem_file_kvm(struct file *file);
 u64 kvm_gmem_file_flags(struct file *file);
+int kvm_gmem_preserve_attributes(struct inode *inode,
+				 struct kvm_gmem_luo_attr_range **ranges_out,
+				 u64 *nr_ranges_out);
+int kvm_gmem_restore_attributes(struct file *file,
+				const struct kvm_gmem_luo_attr_range *ranges,
+				u64 nr_ranges);
 int kvm_gmem_luo_init(struct module *module);
 void kvm_gmem_luo_exit(void);
 #else

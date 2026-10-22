@@ -1682,6 +1682,8 @@ int kvm_arch_luo_vm_freeze(struct kvm *kvm, u64 arch_state_pa);
 void kvm_arch_luo_vm_unpreserve(struct kvm *kvm, u64 arch_state_pa);
 int kvm_arch_luo_vm_retrieve(struct kvm *kvm, u64 arch_state_pa);
 void kvm_arch_luo_vm_finish(struct kvm *kvm, u64 arch_state_pa);
+int kvm_arch_gmem_luo_get_vm_id(struct kvm *kvm, u64 *vm_id);
+bool kvm_arch_gmem_luo_validate_vm_id(struct kvm *kvm, u64 vm_id);
 
 /* Called with vcpu->mutex held and vcpu loaded, except unpreserve/finish. */
 int kvm_arch_luo_vcpu_preserve(struct kvm_vcpu *vcpu, u64 *arch_state_pa);
@@ -2618,6 +2620,20 @@ static inline u64 kvm_gmem_get_supported_flags(struct kvm *kvm)
 
 int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 		     gfn_t gfn, kvm_pfn_t *pfn, int *max_order);
+#ifdef CONFIG_LIVEUPDATE
+bool kvm_gmem_file_is_frozen(struct file *file);
+bool kvm_gmem_pfn_is_frozen(struct kvm *kvm, kvm_pfn_t pfn);
+#else
+static inline bool kvm_gmem_file_is_frozen(struct file *file)
+{
+	return false;
+}
+
+static inline bool kvm_gmem_pfn_is_frozen(struct kvm *kvm, kvm_pfn_t pfn)
+{
+	return false;
+}
+#endif
 #else
 static inline int kvm_gmem_get_pfn(struct kvm *kvm,
 				   struct kvm_memory_slot *slot, gfn_t gfn,
@@ -2625,6 +2641,16 @@ static inline int kvm_gmem_get_pfn(struct kvm *kvm,
 {
 	KVM_BUG_ON(1, kvm);
 	return -EIO;
+}
+
+static inline bool kvm_gmem_file_is_frozen(struct file *file)
+{
+	return false;
+}
+
+static inline bool kvm_gmem_pfn_is_frozen(struct kvm *kvm, kvm_pfn_t pfn)
+{
+	return false;
 }
 #endif /* CONFIG_KVM_GUEST_MEMFD */
 

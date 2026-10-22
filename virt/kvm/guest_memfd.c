@@ -3,12 +3,15 @@
 #include <linux/backing-dev.h>
 #include <linux/falloc.h>
 #include <linux/fs.h>
+#include <linux/kho/abi/kvm.h>
 #include <linux/kvm_host.h>
 #include <linux/maple_tree.h>
+#include <linux/memory_hotplug.h>
 #include <linux/mempolicy.h>
 #include <linux/pseudo_fs.h>
 #include <linux/pagemap.h>
 #include <linux/swap.h>
+#include <linux/vmalloc.h>
 
 #include "kvm_mm.h"
 #include "guest_memfd.h"
@@ -1057,9 +1060,73 @@ void kvm_gmem_freeze(struct file *file, bool freeze)
 		return;
 
 	filemap_invalidate_lock(inode->i_mapping);
-	GMEM_I(inode)->frozen = freeze;
+	WRITE_ONCE(GMEM_I(inode)->frozen, freeze);
 	filemap_invalidate_unlock(inode->i_mapping);
 }
+
+bool kvm_gmem_file_is_frozen(struct file *file)
+{
+	if (!file || file->f_op != &kvm_gmem_fops)
+		return false;
+
+	return READ_ONCE(GMEM_I(file_inode(file))->frozen);
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_gmem_file_is_frozen);
+
+bool kvm_gmem_pfn_is_frozen(struct kvm *kvm, kvm_pfn_t pfn)
+{
+	struct address_space *mapping;
+	struct gmem_file *f;
+	struct inode *inode = NULL;
+	struct folio *folio;
+	struct page *page;
+	bool ret = false;
+
+	lockdep_assert_held(&kvm->slots_lock);
+
+	page = pfn_to_online_page(pfn);
+	if (!page)
+		return false;
+
+	rcu_read_lock();
+	folio = page_folio(page);
+	if (!folio_try_get(folio))
+		folio = NULL;
+	rcu_read_unlock();
+	if (!folio)
+		return false;
+
+	if (unlikely(page_folio(page) != folio || folio_test_slab(folio))) {
+		folio_put(folio);
+		return false;
+	}
+
+	folio_lock(folio);
+	mapping = folio_mapping(folio);
+	if (mapping && mapping->host &&
+	    mapping->host->i_sb->s_magic == GUEST_MEMFD_MAGIC)
+		inode = igrab(mapping->host);
+	folio_unlock(folio);
+	folio_put(folio);
+
+	if (!inode)
+		return false;
+
+	filemap_invalidate_lock_shared(inode->i_mapping);
+	if (READ_ONCE(GMEM_I(inode)->frozen)) {
+		kvm_gmem_for_each_file(f, inode) {
+			if (f->kvm == kvm) {
+				ret = true;
+				break;
+			}
+		}
+	}
+	filemap_invalidate_unlock_shared(inode->i_mapping);
+
+	iput(inode);
+	return ret;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_gmem_pfn_is_frozen);
 
 struct kvm *kvm_gmem_file_kvm(struct file *file)
 {
@@ -1071,6 +1138,110 @@ struct kvm *kvm_gmem_file_kvm(struct file *file)
 u64 kvm_gmem_file_flags(struct file *file)
 {
 	return GMEM_I(file_inode(file))->flags;
+}
+
+int kvm_gmem_preserve_attributes(struct inode *inode,
+				 struct kvm_gmem_luo_attr_range **ranges_out,
+				 u64 *nr_ranges_out)
+{
+	struct gmem_inode *gi = GMEM_I(inode);
+	u64 default_attrs = kvm_gmem_get_default_attributes(inode);
+	pgoff_t max_pgoff = (i_size_read(inode) >> PAGE_SHIFT) - 1;
+	struct kvm_gmem_luo_attr_range *ranges;
+	u64 nr_ranges = 0, idx = 0;
+	struct ma_state mas;
+	void *entry;
+
+	*ranges_out = NULL;
+	*nr_ranges_out = 0;
+
+	if (!gmem_in_place_conversion)
+		return -EOPNOTSUPP;
+
+	filemap_invalidate_lock_shared(inode->i_mapping);
+
+	mas_init(&mas, &gi->attributes, 0);
+	mas_for_each(&mas, entry, max_pgoff) {
+		if (kvm_gmem_get_attributes(inode, entry) != default_attrs)
+			nr_ranges++;
+	}
+
+	if (!nr_ranges) {
+		filemap_invalidate_unlock_shared(inode->i_mapping);
+		return 0;
+	}
+
+	ranges = vcalloc(nr_ranges, sizeof(*ranges));
+	if (!ranges) {
+		filemap_invalidate_unlock_shared(inode->i_mapping);
+		return -ENOMEM;
+	}
+
+	mas_set(&mas, 0);
+	mas_for_each(&mas, entry, max_pgoff) {
+		u64 attrs = kvm_gmem_get_attributes(inode, entry);
+
+		if (attrs == default_attrs)
+			continue;
+		if (WARN_ON_ONCE(idx >= nr_ranges)) {
+			filemap_invalidate_unlock_shared(inode->i_mapping);
+			vfree(ranges);
+			return -EINVAL;
+		}
+		ranges[idx].pgoff = mas.index;
+		ranges[idx].nr_pages = mas.last - mas.index + 1;
+		ranges[idx].attributes = attrs;
+		idx++;
+	}
+
+	filemap_invalidate_unlock_shared(inode->i_mapping);
+
+	*ranges_out = ranges;
+	*nr_ranges_out = idx;
+	return 0;
+}
+
+int kvm_gmem_restore_attributes(struct file *file,
+				const struct kvm_gmem_luo_attr_range *ranges,
+				u64 nr_ranges)
+{
+	struct inode *inode = file_inode(file);
+	struct gmem_inode *gi = GMEM_I(inode);
+	pgoff_t total_pages = i_size_read(inode) >> PAGE_SHIFT;
+	struct ma_state mas;
+	u64 i, prev_end = 0;
+	int ret = 0;
+
+	if (!gmem_in_place_conversion)
+		return -EINVAL;
+
+	if (!nr_ranges)
+		return 0;
+
+	filemap_invalidate_lock(inode->i_mapping);
+	for (i = 0; i < nr_ranges; i++) {
+		const struct kvm_gmem_luo_attr_range *r = &ranges[i];
+
+		if (r->reserved ||
+		    (r->attributes & ~KVM_MEMORY_ATTRIBUTE_PRIVATE) ||
+		    !r->nr_pages ||
+		    r->pgoff < prev_end ||
+		    r->pgoff >= total_pages ||
+		    r->nr_pages > total_pages - r->pgoff) {
+			ret = -EINVAL;
+			break;
+		}
+		prev_end = r->pgoff + r->nr_pages;
+
+		mas_init(&mas, &gi->attributes, r->pgoff);
+		ret = kvm_gmem_mas_preallocate(&mas, r->attributes,
+					       r->pgoff, r->nr_pages);
+		if (ret)
+			break;
+		mas_store_prealloc(&mas, xa_mk_value(r->attributes));
+	}
+	filemap_invalidate_unlock(inode->i_mapping);
+	return ret;
 }
 #endif /* CONFIG_LIVEUPDATE */
 
@@ -1284,6 +1455,10 @@ static long __kvm_gmem_populate(struct kvm *kvm, struct kvm_memory_slot *slot,
 	int ret;
 
 	filemap_invalidate_lock(file->f_mapping);
+	if (kvm_gmem_is_frozen(file_inode(file))) {
+		ret = -EPERM;
+		goto out_unlock;
+	}
 
 	folio = __kvm_gmem_get_pfn(file, slot, index, &pfn, NULL);
 	if (IS_ERR(folio)) {
